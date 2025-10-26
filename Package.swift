@@ -6,9 +6,9 @@ import PackageDescription
 let package = Package(
     name: "ArkavoMediaKit",
     platforms: [
-        .iOS(.v18),
-        .macOS(.v15),
-        .tvOS(.v18),
+        .iOS(.v26),
+        .macOS(.v26),
+        .tvOS(.v26),
     ],
     products: [
         .library(

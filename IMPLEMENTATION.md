@@ -114,7 +114,7 @@ Target performance: <50ms P95 key delivery latency
 3. Use `TDF3StreamingPlayer` for playback
 4. Integrate session management
 
-### For ArkavoCreator macOS App
+### For Arkavo Creator macOS App
 1. Same package dependency process
 2. Use `HLSSegmentEncryptor` for content creation
 3. Use `HLSPlaylistGenerator` for manifest creation
@@ -147,7 +147,7 @@ Target performance: <50ms P95 key delivery latency
 ## Architecture Alignment
 
 This implementation follows the TDF3 Media DRM architecture outlined in:
-- `FairPlay_Streaming_Server_SDK_5.1/TDF3_MEDIA_DRM_TESTING_PLAN.md`
+- `vendor/FairPlay_Streaming_Server_SDK_26/TDF3_MEDIA_DRM_TESTING_PLAN.md`
 - arkavo-rs issue #21
 
 It replaces FairPlay's SPC/CKC flow with TDF3 NanoTDF while maintaining compatibility with Apple's AVFoundation framework.

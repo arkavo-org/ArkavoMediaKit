@@ -170,7 +170,7 @@ Add package dependency:
 2. Enter path: `../ArkavoMediaKit`
 3. Add to target: Arkavo
 
-### macOS App (ArkavoCreator.xcodeproj)
+### Arkavo Creator (ArkavoCreator.xcodeproj)
 
 Same steps as iOS app.
 
@@ -289,5 +289,5 @@ Same as parent Arkavo project.
 - [Integration Guide](INTEGRATION_GUIDE.md) - Step-by-step integration
 - [Security Guide](SECURITY.md) - Security best practices
 - [Implementation Details](IMPLEMENTATION.md) - Technical architecture
-- [TDF3 Media DRM Testing Plan](../FairPlay_Streaming_Server_SDK_5.1/TDF3_MEDIA_DRM_TESTING_PLAN.md)
+- [TDF3 Media DRM Testing Plan](../vendor/FairPlay_Streaming_Server_SDK_26/TDF3_MEDIA_DRM_TESTING_PLAN.md)
 - [arkavo-rs KAS Implementation](https://github.com/arkavo-org/arkavo-rs/issues/21)

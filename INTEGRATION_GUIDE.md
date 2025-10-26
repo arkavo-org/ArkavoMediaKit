@@ -152,7 +152,7 @@ player.stop()
 try await sessionManager.endSession(sessionID: session.sessionID)
 ```
 
-## macOS App Integration (ArkavoCreator)
+## macOS App Integration (Arkavo Creator)
 
 ### Content Creation Flow
 
