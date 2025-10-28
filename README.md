@@ -1,5 +1,94 @@
 # ArkavoMediaKit
 
+A Swift package providing comprehensive media DRM capabilities including:
+- **FairPlay Streaming DRM**: Secure playback of DRM-protected HLS content on Apple platforms
+- **TDF3-based HLS Streaming**: Open alternative to proprietary DRM systems
+
+## FairPlay Streaming Certificate Requirements
+
+### IMPORTANT: You Must Provide Your Own Certificate
+
+ArkavoMediaKit **does not** include a FairPlay Streaming certificate. You must obtain your own certificate from Apple.
+
+### How to Obtain a FairPlay Certificate
+
+1. **Enroll in the Apple Developer Program** if you haven't already
+2. **Request FairPlay Streaming Deployment Package**:
+   - Go to [Apple Developer Portal](https://developer.apple.com/)
+   - Navigate to Certificates, Identifiers & Profiles
+   - Request FairPlay Streaming credentials
+3. **Complete the FPS Deployment Package** request form
+4. **Receive your certificate** from Apple (typically `.cer` or `.der` format)
+
+### Loading Your FairPlay Certificate
+
+```swift
+import ArkavoMediaKit
+import Foundation
+
+// Load certificate from your app bundle or secure location
+guard let certURL = Bundle.main.url(forResource: "fairplay_cert", withExtension: "cer"),
+      let certData = try? Data(contentsOf: certURL) else {
+    fatalError("FairPlay certificate not found")
+}
+
+// Create DRM configuration with your certificate
+let configuration = try DRMConfiguration(
+    serverURL: URL(string: "https://your-drm-server.com")!,
+    fpsCertificateData: certData
+)
+
+// Initialize player with configuration
+let player = try DRMMediaPlayer(configuration: configuration)
+```
+
+### Security Best Practices for FairPlay Certificates
+
+1. **NEVER commit certificates to source control**
+   - Certificates are tied to your Apple Developer account
+   - Keep them secure and private
+2. **Store certificates securely**:
+   - Use encrypted storage for production certificates
+   - Consider loading from Keychain on iOS/macOS
+   - Use environment-specific certificates (dev/staging/prod)
+3. **Use HTTPS only**:
+   - DRMConfiguration enforces HTTPS for server URLs
+   - Never transmit keys over unencrypted connections
+
+### Example: Secure Certificate Loading from Keychain
+
+```swift
+// Load from Keychain (recommended for production)
+func loadCertificateFromKeychain() throws -> Data {
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrAccount as String: "fairplay-certificate",
+        kSecReturnData as String: true
+    ]
+
+    var result: AnyObject?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+    guard status == errSecSuccess,
+          let certData = result as? Data else {
+        throw NSError(domain: "FairPlay", code: -1)
+    }
+
+    return certData
+}
+
+// Use in configuration
+let certData = try loadCertificateFromKeychain()
+let config = try DRMConfiguration(
+    serverURL: URL(string: "https://drm.example.com")!,
+    fpsCertificateData: certData
+)
+```
+
+---
+
+# TDF3-Based HLS Streaming
+
 A Swift package for TDF3-based HLS streaming with DRM protection, providing an open alternative to proprietary DRM systems like FairPlay, Widevine, and PlayReady.
 
 ## Overview

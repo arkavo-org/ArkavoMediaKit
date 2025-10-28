@@ -12,6 +12,12 @@ public enum ValidationError: Error, LocalizedError, Sendable {
     case inputEmpty(field: String)
     case invalidCharacters(field: String)
 
+    // FairPlay-specific errors
+    case missingContentKeyIdentifier
+    case invalidContentKeyIdentifier(String)
+    case contentKeyRequestFailed(Error)
+    case persistableKeyNotSupported
+
     public var errorDescription: String? {
         switch self {
         case let .invalidAssetID(id):
@@ -32,6 +38,14 @@ public enum ValidationError: Error, LocalizedError, Sendable {
             "\(field) cannot be empty"
         case let .invalidCharacters(field):
             "\(field) contains invalid characters"
+        case .missingContentKeyIdentifier:
+            "Content key identifier is missing"
+        case let .invalidContentKeyIdentifier(identifier):
+            "Invalid content key identifier: \(identifier)"
+        case let .contentKeyRequestFailed(error):
+            "Content key request failed: \(error.localizedDescription)"
+        case .persistableKeyNotSupported:
+            "Persistable content keys are not supported on this platform"
         }
     }
 }
