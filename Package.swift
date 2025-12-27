@@ -3,6 +3,14 @@
 
 import PackageDescription
 
+// Shared Swift settings for all targets - enables unused code warnings
+let sharedSwiftSettings: [SwiftSetting] = [
+    .unsafeFlags([
+        "-Xfrontend", "-warn-long-function-bodies=200",
+        "-Xfrontend", "-warn-long-expression-type-checking=100"
+    ], .when(configuration: .debug))
+]
+
 let package = Package(
     name: "ArkavoMediaKit",
     platforms: [
@@ -22,11 +30,13 @@ let package = Package(
     targets: [
         .target(
             name: "ArkavoMediaKit",
-            dependencies: ["OpenTDFKit"]
+            dependencies: ["OpenTDFKit"],
+            swiftSettings: sharedSwiftSettings
         ),
         .testTarget(
             name: "ArkavoMediaKitTests",
-            dependencies: ["ArkavoMediaKit"]
+            dependencies: ["ArkavoMediaKit"],
+            swiftSettings: sharedSwiftSettings
         ),
     ]
 )

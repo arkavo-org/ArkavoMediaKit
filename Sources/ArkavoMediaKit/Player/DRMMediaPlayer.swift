@@ -92,7 +92,7 @@ public final class DRMMediaPlayer {
         contentKeySession?.invalidateAllPersistableContentKeys(
             forApp: configuration.fpsCertificate,
             options: nil
-        ) { _, _ in }
+        ) { _, _ in /* Completion handler ignored: invalidation is best-effort */ }
         contentKeySession = nil
         contentKeyDelegate = nil
         self.sessionId = nil
