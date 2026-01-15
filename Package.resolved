@@ -1,5 +1,5 @@
 {
-  "originHash" : "09c82ee86cdfcc27a94214f3e15866a018d9670b10fe7bd177585006879389d0",
+  "originHash" : "a2117a18000b4e4140b2522479c43778b528beb3f19907bc5dc04ba64dd9efe6",
   "pins" : [
     {
       "identity" : "cryptoswift",
@@ -15,8 +15,17 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/arkavo-org/OpenTDFKit",
       "state" : {
-        "branch" : "main",
-        "revision" : "c211d3b05f801ea5fb37d9ac1fc7c1e42015c362"
+        "branch" : "d8ffeff",
+        "revision" : "d8ffeff99e00ec3334aa57b1fe5f9e1c7f38d2a9"
+      }
+    },
+    {
+      "identity" : "swift-argument-parser",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-argument-parser",
+      "state" : {
+        "revision" : "c5d11a805e765f52ba34ec7284bd4fcd6ba68615",
+        "version" : "1.7.0"
       }
     },
     {

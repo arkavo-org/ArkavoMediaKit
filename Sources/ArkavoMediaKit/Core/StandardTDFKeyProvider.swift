@@ -122,16 +122,16 @@ public actor StandardTDFKeyProvider {
         try InputValidator.validateAssetID(assetID)
 
         // Generate symmetric key for manifest
-        let symmetricKey = try StandardTDFCrypto.generateSymmetricKey()
+        let symmetricKey = try TDFCrypto.generateSymmetricKey()
 
         // Wrap the key
-        let wrappedKey = try StandardTDFCrypto.wrapSymmetricKeyWithRSA(
+        let wrappedKey = try TDFCrypto.wrapSymmetricKeyWithRSA(
             publicKeyPEM: kasPublicKeyPEM,
             symmetricKey: symmetricKey
         )
 
         // Create minimal TDF manifest with wrapped key
-        let policyBinding = StandardTDFCrypto.policyBinding(
+        let policyBinding = TDFCrypto.policyBinding(
             policy: policyJSON,
             symmetricKey: symmetricKey
         )
@@ -170,7 +170,7 @@ public actor StandardTDFKeyProvider {
             keyAccess: [keyAccessObj],
             method: method,
             integrityInformation: integrityInfo,
-            policy: try StandardTDFPolicy(json: policyJSON).base64String
+            policy: try TDFPolicy(json: policyJSON).base64String
         )
 
         let payloadDescriptor = TDFPayloadDescriptor(
@@ -230,7 +230,7 @@ public actor StandardTDFKeyProvider {
                 throw KeyProviderError.noPrivateKey
             }
 
-            return try StandardTDFCrypto.unwrapSymmetricKeyWithRSA(
+            return try TDFCrypto.unwrapSymmetricKeyWithRSA(
                 privateKeyPEM: privateKeyPEM,
                 wrappedKey: wrappedKey
             )

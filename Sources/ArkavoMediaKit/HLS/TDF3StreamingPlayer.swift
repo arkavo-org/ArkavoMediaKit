@@ -1,5 +1,6 @@
 import AVFoundation
 import Combine
+import CryptoKit
 import Foundation
 import OpenTDFKit
 
@@ -32,6 +33,12 @@ public class TDF3StreamingPlayer: ObservableObject {
 
     private var timeObserver: Any?
     private var cancellables = Set<AnyCancellable>()
+
+    /// Resource loader delegate for TDF-packaged HLS
+    private var resourceLoaderDelegate: HLSResourceLoaderDelegate?
+
+    /// Extracted local HLS asset
+    private var localAsset: LocalHLSAsset?
 
     public enum PlayerStatus: Sendable {
         case idle
@@ -96,6 +103,65 @@ public class TDF3StreamingPlayer: ObservableObject {
         status = .ready
     }
 
+    /// Load TDF-packaged HLS stream for local playback
+    ///
+    /// Extracts HLS content from TDF archive and plays using custom resource loader.
+    /// This enables offline playback of TDF-protected video.
+    ///
+    /// - Parameters:
+    ///   - tdfData: TDF archive containing HLS content
+    ///   - session: Media session for playback
+    ///   - keyProvider: Callback to obtain decryption key from KAS
+    public func loadFromTDF(
+        tdfData: Data,
+        session: MediaSession,
+        keyProvider: @escaping (HLSManifest) async throws -> SymmetricKey
+    ) async throws {
+        self.session = session
+        status = .loading
+
+        // Create temp directory for extracted content
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tdf-hls-\(UUID().uuidString)")
+
+        // Extract HLS from TDF
+        let extractor = HLSTDFExtractor(
+            kasURL: URL(string: "https://100.arkavo.net")! // Default KAS
+        )
+        let localAsset = try await extractor.extract(
+            tdfData: tdfData,
+            outputDirectory: tempDir
+        )
+        self.localAsset = localAsset
+
+        // Create asset with custom resource loader
+        let playlistURL = URL(string: "\(tdfHLSScheme)://playlist.m3u8")!
+        let asset = AVURLAsset(url: playlistURL)
+
+        // Create and configure resource loader delegate
+        let delegate = HLSResourceLoaderDelegate(
+            localAsset: localAsset,
+            extractor: extractor
+        )
+        delegate.onKeyRequest = keyProvider
+        self.resourceLoaderDelegate = delegate
+
+        // Set delegate on resource loader
+        let loaderQueue = DispatchQueue(label: "com.arkavo.hlsResourceLoader.player")
+        asset.resourceLoader.setDelegate(delegate, queue: loaderQueue)
+
+        // Create player item
+        let playerItem = AVPlayerItem(asset: asset)
+
+        // Replace current item
+        player.replaceCurrentItem(with: playerItem)
+
+        // Wait for ready to play
+        try await waitForReadyToPlay(playerItem: playerItem)
+
+        status = .ready
+    }
+
     /// Play the current stream
     public func play() {
         player.play()
@@ -120,6 +186,13 @@ public class TDF3StreamingPlayer: ObservableObject {
         player.replaceCurrentItem(with: nil)
         session = nil
         status = .idle
+
+        // Clean up TDF resources
+        if let localAsset {
+            try? FileManager.default.removeItem(at: localAsset.outputDirectory)
+            self.localAsset = nil
+        }
+        resourceLoaderDelegate = nil
     }
 
     // MARK: - Private

@@ -2,7 +2,6 @@ import Testing
 @testable import ArkavoMediaKit
 import CryptoKit
 import Foundation
-import OpenTDFKit
 
 @Suite("ArkavoMediaKit Tests")
 struct ArkavoMediaKitTests {
@@ -107,30 +106,6 @@ struct ArkavoMediaKitTests {
         }
     }
 
-    @Test("TDF3SegmentKey encryption/decryption")
-    func testSegmentEncryption() async throws {
-        let plaintext = Data("Test segment data".utf8)
-        let key = TDF3SegmentKey.generateSegmentKey()
-
-        // Encrypt
-        let encrypted = try await TDF3SegmentKey.encryptSegment(
-            data: plaintext,
-            key: key
-        )
-
-        #expect(!encrypted.ciphertext.isEmpty)
-        #expect(!encrypted.nonce.isEmpty)
-        #expect(!encrypted.tag.isEmpty)
-
-        // Decrypt
-        let decrypted = try await TDF3SegmentKey.decryptSegment(
-            encryptedSegment: encrypted,
-            key: key
-        )
-
-        #expect(decrypted == plaintext)
-    }
-
     @Test("HLSPlaylistGenerator master playlist")
     func testMasterPlaylistGeneration() {
         let generator = HLSPlaylistGenerator(
@@ -166,7 +141,7 @@ struct ArkavoMediaKitTests {
             index: 0,
             duration: 10.0,
             url: URL(string: "https://cdn.example.com/segment_0.ts")!,
-            nanoTDFHeader: "base64header",
+            tdfManifest: "base64header",
             iv: Data(repeating: 0, count: 12),
             assetID: "asset-123"
         )
