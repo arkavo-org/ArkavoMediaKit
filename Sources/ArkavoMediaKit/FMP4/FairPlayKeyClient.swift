@@ -57,8 +57,12 @@ public final class FairPlayKeyClient {
         self.manifestBuilder = TDFManifestBuilder(kasURL: serverURL)
     }
 
-    /// Add authorization header to request if auth token is available
-    private func addAuthHeader(to request: inout URLRequest) {
+    /// Prepare a request for the KAS/media server: opt into HTTP/3 and add auth.
+    ///
+    /// The KAS advertises `alt-svc: h3`; `assumesHTTP3Capable` lets the first hop
+    /// negotiate HTTP/3, falling back to HTTP/2 automatically for non-h3 servers.
+    private func prepareRequest(_ request: inout URLRequest) {
+        request.assumesHTTP3Capable = true
         if let token = authToken {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
@@ -75,7 +79,7 @@ public final class FairPlayKeyClient {
         let url = serverURL.appendingPathComponent("media/v1/certificate")
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        addAuthHeader(to: &request)
+        prepareRequest(&request)
 
         let (data, response) = try await URLSession.shared.data(for: request)
 
@@ -95,7 +99,7 @@ public final class FairPlayKeyClient {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        addAuthHeader(to: &request)
+        prepareRequest(&request)
 
         let body: [String: Any] = [
             "userId": userId,
@@ -131,7 +135,7 @@ public final class FairPlayKeyClient {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        addAuthHeader(to: &request)
+        prepareRequest(&request)
 
         let body: [String: Any] = [
             "userId": session.userId,
@@ -156,7 +160,7 @@ public final class FairPlayKeyClient {
         var request = URLRequest(url: url)
         request.httpMethod = "DELETE"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        addAuthHeader(to: &request)
+        prepareRequest(&request)
 
         let body: [String: Any] = ["userId": session.userId]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -198,7 +202,7 @@ public final class FairPlayKeyClient {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        addAuthHeader(to: &request)
+        prepareRequest(&request)
 
         let body: [String: Any] = [
             "sessionId": session.sessionId,
@@ -236,7 +240,7 @@ public final class FairPlayKeyClient {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        addAuthHeader(to: &request)
+        prepareRequest(&request)
 
         let body: [String: Any] = [
             "sessionId": session.sessionId,

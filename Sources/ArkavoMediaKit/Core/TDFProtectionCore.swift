@@ -158,7 +158,10 @@ public enum TDFProtectionCore {
             throw TDFProtectionCoreError.invalidKASURL
         }
 
-        let (data, response) = try await URLSession.shared.data(from: url)
+        // KAS advertises `alt-svc: h3`; opt the first hop into HTTP/3 (falls back to HTTP/2).
+        var request = URLRequest(url: url)
+        request.assumesHTTP3Capable = true
+        let (data, response) = try await URLSession.shared.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode == 200
