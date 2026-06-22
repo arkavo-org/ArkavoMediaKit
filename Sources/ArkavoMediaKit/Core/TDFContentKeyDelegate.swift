@@ -384,17 +384,24 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
 
     // MARK: - Server Communication
 
+    /// Prepare a request for the KAS/media server: opt into HTTP/3 and add auth.
+    ///
+    /// The KAS advertises `alt-svc: h3`; `assumesHTTP3Capable` lets the first hop
+    /// negotiate HTTP/3, falling back to HTTP/2 automatically for non-h3 servers.
+    private func prepareRequest(_ request: inout URLRequest) {
+        request.assumesHTTP3Capable = true
+        if let token = authToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+    }
+
     /// Start a FairPlay playback session
     private func startSession() async throws -> String {
         let url = serverURL.appendingPathComponent("media/v1/session/start")
         var request = URLRequest(url: url)
-        // KAS advertises `alt-svc: h3`; opt the first hop into HTTP/3 (falls back to HTTP/2).
-        request.assumesHTTP3Capable = true
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if let token = authToken {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
+        prepareRequest(&request)
 
         let body: [String: Any] = [
             "userId": userId,
@@ -430,11 +437,8 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
     private func fetchCertificate() async throws -> Data {
         let url = serverURL.appendingPathComponent("media/v1/certificate")
         var request = URLRequest(url: url)
-        request.assumesHTTP3Capable = true
         request.httpMethod = "GET"
-        if let token = authToken {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
+        prepareRequest(&request)
 
         FairPlayDebug.logRequest("GET", url: url, body: nil)
 
@@ -461,12 +465,9 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
     private func requestCKC(spcData: Data, sessionId: String) async throws -> Data {
         let url = serverURL.appendingPathComponent("media/v1/key-request")
         var request = URLRequest(url: url)
-        request.assumesHTTP3Capable = true
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if let token = authToken {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
+        prepareRequest(&request)
 
         // Encode manifest as base64 JSON
         let manifestJSON: [String: Any] = [
