@@ -388,6 +388,8 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
     private func startSession() async throws -> String {
         let url = serverURL.appendingPathComponent("media/v1/session/start")
         var request = URLRequest(url: url)
+        // KAS advertises `alt-svc: h3`; opt the first hop into HTTP/3 (falls back to HTTP/2).
+        request.assumesHTTP3Capable = true
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let token = authToken {
@@ -428,6 +430,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
     private func fetchCertificate() async throws -> Data {
         let url = serverURL.appendingPathComponent("media/v1/certificate")
         var request = URLRequest(url: url)
+        request.assumesHTTP3Capable = true
         request.httpMethod = "GET"
         if let token = authToken {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -458,6 +461,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
     private func requestCKC(spcData: Data, sessionId: String) async throws -> Data {
         let url = serverURL.appendingPathComponent("media/v1/key-request")
         var request = URLRequest(url: url)
+        request.assumesHTTP3Capable = true
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let token = authToken {

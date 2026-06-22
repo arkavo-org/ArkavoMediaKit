@@ -174,6 +174,8 @@ public final class TDFManifestBuilder {
         components.queryItems = [URLQueryItem(name: "algorithm", value: "rsa:2048")]
 
         var request = URLRequest(url: components.url!)
+        // KAS advertises `alt-svc: h3`; opt the first hop into HTTP/3 (falls back to HTTP/2).
+        request.assumesHTTP3Capable = true
         request.httpMethod = "GET"
 
         let (data, response) = try await URLSession.shared.data(for: request)
