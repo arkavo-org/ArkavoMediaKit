@@ -1,5 +1,5 @@
 {
-  "originHash" : "24da81f2dcafe8e494a0c3f8e9e989dd1b71631e6b225fa9ee315f282edf3a30",
+  "originHash" : "422db9c3e4e910afb1340be9029bb7c461825ca0ef72bfb90f35a241b0d998b5",
   "pins" : [
     {
       "identity" : "cryptoswift",
@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/arkavo-org/OpenTDFKit",
       "state" : {
-        "revision" : "d8ffeff99e00ec3334aa57b1fe5f9e1c7f38d2a9",
-        "version" : "4.0.0-beta.1"
+        "revision" : "5e68ccb2e41744ab73506f3d250e0a7f44a6fc80",
+        "version" : "4.0.1"
       }
     },
     {
@@ -26,6 +26,15 @@
       "state" : {
         "revision" : "c5d11a805e765f52ba34ec7284bd4fcd6ba68615",
         "version" : "1.7.0"
+      }
+    },
+    {
+      "identity" : "swiftcbor",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/valpackett/SwiftCBOR",
+      "state" : {
+        "revision" : "fd929a6d8f7651ce0f63fc99397fd5762358cc29",
+        "version" : "0.6.0"
       }
     },
     {
