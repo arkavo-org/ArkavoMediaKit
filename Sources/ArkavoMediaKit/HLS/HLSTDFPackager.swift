@@ -42,9 +42,10 @@ public actor HLSTDFPackager {
     ///   - policyJSON: Optional caller-supplied TDF policy (data attributes) as
     ///     raw JSON bytes embedded as `encryptionInformation.policy` (base64).
     ///     When `nil`, a minimal placeholder policy `{"uuid":"<assetID>","body":{}}`
-    ///     is embedded. In both cases the policy binding is the spec form
-    ///     (`Base64(HMAC)` over the base64-policy string, via the OpenTDF SDK) —
-    ///     the convention the deployed opentdf-platform KAS verifies.
+    ///     is embedded. In both cases the policy binding is the OpenTDF wire
+    ///     form the opentdf-platform KAS verifies: `base64(hex(HMAC-SHA256(DEK,
+    ///     base64(policyJSON))))`, computed by `TDFCrypto.policyBinding` from
+    ///     the raw policy JSON (OpenTDFKit >= 4.0.1).
     /// - Returns: TDF archive data
     /// - Throws: HLSTDFPackagerError if packaging fails
     public func package(
@@ -150,22 +151,24 @@ public actor HLSTDFPackager {
         totalDuration: Double
     ) throws -> Data {
         // Resolve the policy: caller-supplied (data attributes) or a minimal
-        // placeholder when nil. The binding is computed identically for both via
-        // the OpenTDF SDK over the base64-encoded policy string — which is what
-        // the KAS verifies (rewrap.go HMACs req.Policy.Body, the base64 policy)
-        // and what the spec defines (Base64(HMAC), opentdf >= 4.3.0;
-        // opentdf/platform#3597). NOTE: this corrects the prior placeholder path,
-        // which HMAC'd the RAW policy bytes — the KAS would reject that regardless
-        // of digest encoding.
-        let policyBase64: String
+        // placeholder when nil. `policyData` is the RAW policy JSON; it is passed
+        // as-is to `TDFCrypto.policyBinding`, which (OpenTDFKit >= 4.0.1)
+        // base64-encodes it internally, HMAC-SHA256s the base64 string with the
+        // DEK, and emits hash = base64(hex(digest)) — the wire format the KAS
+        // verifies (opentdf/platform rewrap.go verifyPolicyBinding HMACs the
+        // base64 policy body, then base64- and hex-decodes the manifest hash).
+        // Passing the pre-base64'd string here would HMAC base64(base64(json))
+        // and fail rewrap binding verification. The manifest `policy` field is
+        // base64(policyData), i.e. the same string the KAS HMACs.
+        let policyData: Data
         if let policyJSON {
-            policyBase64 = policyJSON.base64EncodedString()
+            policyData = policyJSON
         } else {
-            let placeholderJSON = "{\"uuid\":\"\(assetID)\",\"body\":{}}"
-            policyBase64 = Data(placeholderJSON.utf8).base64EncodedString()
+            policyData = Data("{\"uuid\":\"\(assetID)\",\"body\":{}}".utf8)
         }
+        let policyBase64 = policyData.base64EncodedString()
         let binding = TDFCrypto.policyBinding(
-            policy: Data(policyBase64.utf8),
+            policy: policyData,
             symmetricKey: symmetricKey
         )
         let policyBinding = (alg: binding.alg, hash: binding.hash)
