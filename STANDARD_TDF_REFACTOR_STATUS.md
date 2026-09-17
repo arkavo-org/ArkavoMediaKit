@@ -193,7 +193,7 @@ let payload = TDFPayload(type: "reference", ...)
 3. ✅ .tdf ZIP archives per segment (structured, cross-platform compatible)
 4. ✅ DEK caching in ContentKeyDelegate (performance optimization)
 5. ⚠️ Placeholder for segment URL fetching (implementation required)
-6. ⚠️ KAS rewrap protocol not yet implemented (use offline decryption)
+6. ✅ KAS rewrap via `StandardTDFKASKeyClient` (well-known → Connect route, standard-TDF session salt); offline RSA path retained
 
 ## Blockers
 
