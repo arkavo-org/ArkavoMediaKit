@@ -11,6 +11,8 @@ public actor StandardTDFKeyProvider {
     private let kasPublicKeyPEM: String
     private let sessionManager: TDF3MediaSession
     private let rsaPrivateKeyPEM: String?
+    private let authTokenProvider: (@Sendable () async -> String?)?
+    private let kasKeyClient: StandardTDFKASKeyClient
 
     /// Initialize with KAS configuration
     ///
@@ -19,16 +21,25 @@ public actor StandardTDFKeyProvider {
     ///   - kasPublicKeyPEM: KAS RSA public key (2048+ bit) for key wrapping
     ///   - sessionManager: Session manager for tracking playback sessions
     ///   - rsaPrivateKeyPEM: Optional RSA private key for offline decryption
+    ///   - authTokenProvider: Supplies the bearer token sent to the KAS on
+    ///     rewrap. Required for `unwrapSegmentKey(useKASRewrap: true)`; a nil
+    ///     provider or a nil token throws `KeyProviderError.notAuthenticated`.
+    ///   - kasKeyClient: Performs the KAS rewrap; inject one with a stubbed
+    ///     `URLSession` in tests.
     public init(
         kasURL: URL,
         kasPublicKeyPEM: String,
         sessionManager: TDF3MediaSession,
-        rsaPrivateKeyPEM: String? = nil
+        rsaPrivateKeyPEM: String? = nil,
+        authTokenProvider: (@Sendable () async -> String?)? = nil,
+        kasKeyClient: StandardTDFKASKeyClient = StandardTDFKASKeyClient()
     ) {
         self.kasURL = kasURL
         self.kasPublicKeyPEM = kasPublicKeyPEM
         self.sessionManager = sessionManager
         self.rsaPrivateKeyPEM = rsaPrivateKeyPEM
+        self.authTokenProvider = authTokenProvider
+        self.kasKeyClient = kasKeyClient
     }
 
     /// Request a key for a specific segment from KAS
@@ -201,7 +212,9 @@ public actor StandardTDFKeyProvider {
     ///   - tdfData: Standard TDF archive data
     ///   - useKASRewrap: Whether to use KAS rewrap (true) or local RSA key (false)
     /// - Returns: Unwrapped symmetric key
-    /// - Throws: KeyProviderError if unwrapping fails
+    /// - Throws: `KeyProviderError.notAuthenticated` when KAS rewrap is requested
+    ///   without a bearer token; `StandardTDFKASKeyClientError`, `KASRewrapError`
+    ///   and `KASDiscoveryError` from the rewrap; `KeyProviderError` otherwise.
     public func unwrapSegmentKey(
         tdfData: Data,
         useKASRewrap: Bool = true
@@ -218,12 +231,10 @@ public actor StandardTDFKeyProvider {
         let wrappedKey = keyAccess.wrappedKey
 
         if useKASRewrap {
-            // TODO: Implement KAS rewrap protocol
-            // 1. Generate ephemeral RSA key pair
-            // 2. Send manifest + ephemeral public key to KAS
-            // 3. KAS validates policy and rewraps DEK with ephemeral key
-            // 4. Decrypt rewrapped DEK with ephemeral private key
-            throw KeyProviderError.kasRewrapNotImplemented
+            guard let authToken = await authTokenProvider?(), !authToken.isEmpty else {
+                throw KeyProviderError.notAuthenticated
+            }
+            return try await kasKeyClient.unwrapKey(manifest: manifest, authToken: authToken)
         } else {
             // Offline decryption with local RSA private key
             guard let privateKeyPEM = rsaPrivateKeyPEM else {
@@ -250,13 +261,14 @@ public actor StandardTDFKeyProvider {
 }
 
 /// Key provider errors
-public enum KeyProviderError: Error, LocalizedError {
+public enum KeyProviderError: Error, LocalizedError, Equatable {
     case invalidTDFManifest
     case missingWrappedKey
     case keyDerivationFailed
     case policyValidationFailed(String)
     case sessionInvalid
-    case kasRewrapNotImplemented
+    /// KAS rewrap was requested but no bearer token is available.
+    case notAuthenticated
     case noPrivateKey
 
     public var errorDescription: String? {
@@ -271,8 +283,8 @@ public enum KeyProviderError: Error, LocalizedError {
             "Policy validation failed: \(reason)"
         case .sessionInvalid:
             "Invalid or expired session"
-        case .kasRewrapNotImplemented:
-            "KAS rewrap protocol not yet implemented - use offline decryption"
+        case .notAuthenticated:
+            "Not authenticated - a bearer token is required for KAS rewrap"
         case .noPrivateKey:
             "No RSA private key available for offline decryption"
         }
