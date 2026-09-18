@@ -198,11 +198,66 @@ struct HLSTDFPackagerPolicyTests {
         #expect(binding.hash == Data(expectedHex.utf8).base64EncodedString())
     }
 
-    // MARK: - (a) nil policyJSON: legacy structural invariants preserved
+    // MARK: - (a) nil policyJSON: generated-UUID placeholder policy
+
+    /// Reads the manifest's `meta.hls.assetId`.
+    private func hlsAssetID(_ manifest: [String: Any]) throws -> String {
+        let meta = try #require(manifest["meta"] as? [String: Any])
+        let hls = try #require(meta["hls"] as? [String: Any])
+        return try #require(hls["assetId"] as? String)
+    }
+
+    /// Asserts the placeholder policy shape the opentdf-platform KAS accepts:
+    /// `uuid` must parse as a UUID (the KAS unmarshals it into `uuid.UUID`,
+    /// service/kas/access/policy.go) and `body` is empty. Returns the uuid.
+    @discardableResult
+    private func expectPlaceholderPolicy(_ policyJSON: Data, assetID: String) throws -> String {
+        let policy = try #require(try JSONSerialization.jsonObject(with: policyJSON) as? [String: Any])
+        #expect(policy.count == 2, "placeholder policy should carry only uuid and body: \(policy)")
+        let uuid = try #require(policy["uuid"] as? String)
+        #expect(UUID(uuidString: uuid) != nil, "policy uuid is not a UUID: \(uuid)")
+        #expect(uuid == uuid.lowercased(), "policy uuid should be lowercase like the Go side emits: \(uuid)")
+        #expect(uuid != assetID, "policy uuid must not be the asset id")
+        let body = try #require(policy["body"] as? [String: Any])
+        #expect(body.isEmpty, "placeholder body should be empty: \(body)")
+        return uuid
+    }
+
+    @Test("nil policyJSON with a non-UUID asset id embeds a generated-UUID placeholder policy")
+    func nilPolicyNonUUIDAssetIDGeneratesUUIDPolicy() async throws {
+        // Live evidence (platform.arkavo.net): the KAS parses the policy into
+        // `Policy{UUID uuid.UUID}`; a non-UUID `uuid` fails json.Unmarshal and
+        // every key-access object is rejected with "bad request" before any
+        // decryption. The asset id therefore must never be used as the uuid.
+        let assetID = "diag-hls-not-a-uuid"
+        let (fixture, cleanup) = try makeFixture(segmentBytes: [Data(repeating: 0x33, count: 1024)])
+        defer { cleanup() }
+
+        let kasKeyPair = try TestKASKeyPair()
+        let packager = HLSTDFPackager(
+            kasURL: URL(string: "https://kas.example.com")!,
+            kasPublicKeyPEM: kasKeyPair.publicKeyPEM
+        )
+
+        let tdf = try await packager.package(hlsResult: fixture, assetID: assetID)
+        let manifest = try readManifest(fromTDF: tdf)
+        let encInfo = try encryptionInfo(manifest)
+
+        let policyB64 = try #require(encInfo["policy"] as? String)
+        let policyData = try #require(Data(base64Encoded: policyB64))
+        try expectPlaceholderPolicy(policyData, assetID: assetID)
+
+        // The asset id still travels in the HLS metadata, not the policy.
+        #expect(try hlsAssetID(manifest) == assetID)
+
+        // Binding verifies against the real DEK over the generated policy.
+        let verified = try kasVerifyBinding(encInfo, kasKeyPair: kasKeyPair)
+        #expect(verified.policyJSON == policyData)
+    }
 
     @Test("nil policyJSON embeds placeholder policy with a KAS-verifiable binding")
-    func nilPolicyPreservesLegacyManifest() async throws {
-        let assetID = "asset-legacy-001"
+    func nilPolicyPlaceholderManifest() async throws {
+        let assetID = "asset-placeholder-001"
         let (fixture, cleanup) = try makeFixture(segmentBytes: [Data(repeating: 0x11, count: 1024)])
         defer { cleanup() }
 
@@ -216,15 +271,15 @@ struct HLSTDFPackagerPolicyTests {
         let manifest = try readManifest(fromTDF: tdf)
         let encInfo = try encryptionInfo(manifest)
 
-        // policy field decodes to the placeholder {"uuid":"<assetID>","body":{}}
+        // policy field decodes to the placeholder {"uuid":"<generated UUID>","body":{}}
         let policyB64 = try #require(encInfo["policy"] as? String)
         let policyData = try #require(Data(base64Encoded: policyB64))
-        let policyString = try #require(String(data: policyData, encoding: .utf8))
-        #expect(policyString == "{\"uuid\":\"\(assetID)\",\"body\":{}}")
+        try expectPlaceholderPolicy(policyData, assetID: assetID)
+        #expect(try hlsAssetID(manifest) == assetID)
 
         // Binding verifies against the real DEK the way the KAS checks it.
         let verified = try kasVerifyBinding(encInfo, kasKeyPair: kasKeyPair)
-        #expect(verified.policyJSON == Data("{\"uuid\":\"\(assetID)\",\"body\":{}}".utf8))
+        #expect(verified.policyJSON == policyData)
     }
 
     // MARK: - (c) policyJSON through package(): real policy + KAS binding
