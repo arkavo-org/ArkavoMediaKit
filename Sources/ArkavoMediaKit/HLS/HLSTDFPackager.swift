@@ -41,8 +41,13 @@ public actor HLSTDFPackager {
     ///   - assetID: Unique asset identifier
     ///   - policyJSON: Optional caller-supplied TDF policy (data attributes) as
     ///     raw JSON bytes embedded as `encryptionInformation.policy` (base64).
-    ///     When `nil`, a minimal placeholder policy `{"uuid":"<assetID>","body":{}}`
-    ///     is embedded. In both cases the policy binding is the OpenTDF wire
+    ///     Its `uuid` must be a UUID string: the opentdf-platform KAS parses it
+    ///     as `uuid.UUID` and rejects every key-access object with "bad request"
+    ///     otherwise. When `nil`, a minimal placeholder policy
+    ///     `{"uuid":"<generated UUID>","body":{}}` is embedded; the uuid is
+    ///     freshly generated (lowercase, as the Go side emits) and is NOT the
+    ///     asset id, which lives in `meta.hls.assetId`. In both cases the
+    ///     policy binding is the OpenTDF wire
     ///     form the opentdf-platform KAS verifies: `base64(hex(HMAC-SHA256(DEK,
     ///     base64(policyJSON))))`, computed by `TDFCrypto.policyBinding` from
     ///     the raw policy JSON (OpenTDFKit >= 4.0.1).
@@ -160,11 +165,19 @@ public actor HLSTDFPackager {
         // Passing the pre-base64'd string here would HMAC base64(base64(json))
         // and fail rewrap binding verification. The manifest `policy` field is
         // base64(policyData), i.e. the same string the KAS HMACs.
+        //
+        // The placeholder uuid is a freshly generated UUID, never `assetID`:
+        // the KAS unmarshals `uuid` into a Go `uuid.UUID`
+        // (service/kas/access/policy.go), so any non-UUID string fails
+        // json.Unmarshal and every key-access object is rejected with
+        // "bad request" before decryption. The asset id is carried in
+        // `meta.hls.assetId` instead.
         let policyData: Data
         if let policyJSON {
             policyData = policyJSON
         } else {
-            policyData = Data("{\"uuid\":\"\(assetID)\",\"body\":{}}".utf8)
+            let policyUUID = UUID().uuidString.lowercased()
+            policyData = Data("{\"uuid\":\"\(policyUUID)\",\"body\":{}}".utf8)
         }
         let policyBase64 = policyData.base64EncodedString()
         let binding = TDFCrypto.policyBinding(
