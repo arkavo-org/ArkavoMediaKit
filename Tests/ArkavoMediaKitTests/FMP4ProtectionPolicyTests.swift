@@ -86,14 +86,19 @@ struct FMP4ProtectionPolicyTests {
         }
     }
 
-    @Test("the protect path never prints the content key")
+    /// No log line on the protect path may reference the key or IV values,
+    /// however they are formatted. A source scan, since the logs are `print`s.
+    @Test("the protect path never logs the content key or IV")
     func serviceSourceHasNoKeyPrint() throws {
         let source = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("Sources/ArkavoMediaKit/FMP4/FMP4RecordingProtectionService.swift")
-        let text = try String(contentsOf: source, encoding: .utf8)
-        #expect(!text.contains("contentKey (hex)"))
-        #expect(!text.contains("constantIV (hex)"))
-        #expect(!text.contains("contentKey.map"))
+        let lines = try String(contentsOf: source, encoding: .utf8).components(separatedBy: .newlines)
+        let logLines = lines.filter { $0.contains("print(") || $0.contains("FairPlayDebug.") || $0.contains("os_log") }
+        #expect(!logLines.isEmpty, "the scan must see the service's progress logs")
+        // Simple (ASCII) word boundaries: Unicode ones treat `contentKey.base64…` as one word.
+        let keyIdentifier = /\b(contentKey|constantIV|encryptor)\b/.wordBoundaryKind(.simple)
+        let leaking = logLines.filter { $0.contains(keyIdentifier) }
+        #expect(leaking.isEmpty, "log lines referencing key material: \(leaking)")
     }
 }
