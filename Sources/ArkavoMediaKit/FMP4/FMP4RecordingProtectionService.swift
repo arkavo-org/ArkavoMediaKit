@@ -12,11 +12,15 @@ import Foundation
 /// - HLS Version 7 compatible streaming
 public actor FMP4RecordingProtectionService {
     private let kasURL: URL
+    private let kasPublicKeyPEM: String?
 
-    /// Initialize with KAS URL for key fetching and wrapping
-    /// - Parameter kasURL: KAS server URL (e.g., https://kas.arkavo.net)
-    public init(kasURL: URL) {
+    /// - Parameters:
+    ///   - kasURL: KAS server URL; the key access object names it and, when
+    ///     `kasPublicKeyPEM` is nil, its RSA public key is fetched from it.
+    ///   - kasPublicKeyPEM: The KAS RSA public key, when the caller already has it.
+    public init(kasURL: URL, kasPublicKeyPEM: String? = nil) {
         self.kasURL = kasURL
+        self.kasPublicKeyPEM = kasPublicKeyPEM
     }
 
     /// Protect video content with fMP4/CBCS encryption for FairPlay streaming
@@ -29,12 +33,20 @@ public actor FMP4RecordingProtectionService {
     ///
     /// - Parameters:
     ///   - videoURL: URL to the source video file
-    ///   - assetID: Unique asset identifier for the manifest and skd:// URI
+    ///   - assetID: Unique asset identifier, recorded in the fMP4 metadata and `meta`
+    ///   - policyJSON: TDF policy JSON (`{"uuid", "body": {"dataAttributes", "dissem"}}`).
+    ///     Its `uuid` must be a UUID: it becomes the FairPlay content-key id
+    ///     (`skd://<uuid>` in the playlist). Nil embeds `FairPlayPolicy.placeholderJSON()`,
+    ///     which the post-#75 license service refuses (no data attributes).
     /// - Returns: TDF ZIP archive data containing manifest, playlist, init.mp4, and encrypted segments
     public func protectVideo(
         videoURL: URL,
-        assetID: String
+        assetID: String,
+        policyJSON: Data? = nil
     ) async throws -> Data {
+        let policy = policyJSON ?? FairPlayPolicy.placeholderJSON()
+        let contentKeyID = try FairPlayPolicy.uuid(ofPolicyJSON: policy)
+
         // Create temporary directory for fMP4 conversion
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -52,17 +64,20 @@ public actor FMP4RecordingProtectionService {
         // KID is CENC bookkeeping only; keep stable until playback works
         let keyID = Data(repeating: 0, count: 16)
 
-        // Debug: Log key bytes for verification during playback troubleshooting
-        print("🔑 DEBUG contentKey (hex): \(contentKey.map { String(format: "%02x", $0) }.joined())")
-        print("🔑 DEBUG constantIV (hex): \(constantIV.map { String(format: "%02x", $0) }.joined())")
-
         // 2. Fetch KAS public key and wrap content key
         print("🔐 Wrapping content key with KAS public key...")
         let manifestBuilder = TDFManifestBuilder(kasURL: kasURL)
-        let manifest = try await manifestBuilder.buildManifest(
+        let kasKey: SecKey
+        if let pem = kasPublicKeyPEM {
+            kasKey = try manifestBuilder.publicKey(fromPEM: pem)
+        } else {
+            kasKey = try await manifestBuilder.fetchKASPublicKey()
+        }
+        let manifest = try manifestBuilder.buildManifest(
             contentKey: contentKey,
             iv: constantIV,
-            assetID: assetID
+            policyJSON: policy,
+            publicKey: kasKey
         )
         let manifestData = try manifestBuilder.serializeManifest(manifest)
 
@@ -246,8 +261,9 @@ public actor FMP4RecordingProtectionService {
             initSegmentURI: "init.mp4"
         )
 
+        // The key URI is skd://<policy uuid>: the license service matches the SPC against it.
         let fairPlayConfig = FMP4HLSGenerator.FairPlayConfig.fairPlay(
-            assetID: assetID,
+            assetID: contentKeyID,
             keyID: keyID,
             iv: constantIV
         )
