@@ -235,6 +235,11 @@ public final class TDFManifestBuilder {
         return secKey
     }
 
+    /// Parse a KAS RSA public key from PEM (`PUBLIC KEY` or `RSA PUBLIC KEY` armor).
+    public func publicKey(fromPEM pem: String) throws -> SecKey {
+        try pemToSecKey(pem)
+    }
+
     // MARK: - Key Wrapping
 
     /// Wrap content key with RSA-OAEP using KAS public key
@@ -300,6 +305,37 @@ public final class TDFManifestBuilder {
         )
 
         return Manifest(encryptionInformation: encryptionInfo)
+    }
+
+    /// Build a FairPlay TDF manifest that the arks license service accepts:
+    /// one wrapped key (RSA-OAEP-SHA1) for this KAS, `policy` = base64(policyJSON),
+    /// and the spec binding `base64(HMAC-SHA256(DEK, utf8(policy)))`.
+    public func buildManifest(
+        contentKey: Data,
+        iv: Data,
+        policyJSON: Data,
+        publicKey: SecKey
+    ) throws -> Manifest {
+        let wrappedKey = try wrapKey(contentKey, with: publicKey)
+        let policyBase64 = policyJSON.base64EncodedString()
+        let keyAccess = KeyAccess(
+            url: kasURL.absoluteString,
+            wrappedKey: wrappedKey.base64EncodedString(),
+            policyBinding: PolicyBinding(
+                hash: FairPlayPolicy.binding(policyBase64: policyBase64, dek: contentKey))
+        )
+        let encryptionInfo = EncryptionInformation(
+            keyAccess: [keyAccess],
+            method: .aes128CBC(iv: iv),
+            policy: policyBase64
+        )
+        return Manifest(encryptionInformation: encryptionInfo)
+    }
+
+    /// As `buildManifest(contentKey:iv:policyJSON:publicKey:)`, fetching the KAS key first.
+    public func buildManifest(contentKey: Data, iv: Data, policyJSON: Data) async throws -> Manifest {
+        let publicKey = try await fetchKASPublicKey()
+        return try buildManifest(contentKey: contentKey, iv: iv, policyJSON: policyJSON, publicKey: publicKey)
     }
 
     /// Serialize manifest to JSON data

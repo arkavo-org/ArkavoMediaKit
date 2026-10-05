@@ -25,45 +25,6 @@ import ZIPFoundation
 /// the already-base64'd string double-encodes and fails KAS rewrap.
 @Suite("HLSTDFPackager policy injection")
 struct HLSTDFPackagerPolicyTests {
-    /// A per-test 2048-bit RSA keypair standing in for the KAS key. The
-    /// packager RSA-wraps the DEK with `publicKeyPEM` (OAEP-SHA1, as the KAS
-    /// does); the tests unwrap it with `privateKeyPEM` so the manifest binding
-    /// can be verified against the real DEK exactly the way KAS rewrap does.
-    ///
-    /// Generated at runtime with `SecKeyCreateRandomKey` so no key material
-    /// lives in source. `SecKeyCopyExternalRepresentation` yields PKCS#1 DER for
-    /// RSA keys, which is what OpenTDFKit's `loadRSAPublicKey` /
-    /// `loadRSAPrivateKey` hand to `SecKeyCreateWithData` after stripping the
-    /// `PUBLIC KEY` / `RSA PRIVATE KEY` PEM armor.
-    struct TestKASKeyPair {
-        let publicKeyPEM: String
-        let privateKeyPEM: String
-
-        init() throws {
-            let attributes: [String: Any] = [
-                kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
-                kSecAttrKeySizeInBits as String: 2048,
-                kSecAttrIsPermanent as String: false,
-            ]
-            var error: Unmanaged<CFError>?
-            guard let privateKey = SecKeyCreateRandomKey(attributes as CFDictionary, &error) else {
-                throw error!.takeRetainedValue() as Error
-            }
-            let publicKey = try #require(SecKeyCopyPublicKey(privateKey))
-            privateKeyPEM = try Self.pem(privateKey, label: "RSA PRIVATE KEY")
-            publicKeyPEM = try Self.pem(publicKey, label: "PUBLIC KEY")
-        }
-
-        private static func pem(_ key: SecKey, label: String) throws -> String {
-            var error: Unmanaged<CFError>?
-            guard let der = SecKeyCopyExternalRepresentation(key, &error) as Data? else {
-                throw error!.takeRetainedValue() as Error
-            }
-            let body = der.base64EncodedString(options: [.lineLength64Characters])
-            return "-----BEGIN \(label)-----\n\(body)\n-----END \(label)-----"
-        }
-    }
-
     /// Builds an `HLSConversionResult` backed by a real on-disk segment file of
     /// arbitrary bytes. `package()` reads each segment via `Data(contentsOf:)`
     /// and encrypts with AES-CBC, neither of which require actual video data, so
