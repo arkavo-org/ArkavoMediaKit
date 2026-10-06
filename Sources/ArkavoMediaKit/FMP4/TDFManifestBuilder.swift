@@ -206,25 +206,14 @@ public final class TDFManifestBuilder {
     }
 
     private func pemToSecKey(_ pem: String) throws -> SecKey {
-        // Remove PEM headers
-        let keyString = pem
-            .replacingOccurrences(of: "-----BEGIN PUBLIC KEY-----", with: "")
-            .replacingOccurrences(of: "-----END PUBLIC KEY-----", with: "")
-            .replacingOccurrences(of: "-----BEGIN RSA PUBLIC KEY-----", with: "")
-            .replacingOccurrences(of: "-----END RSA PUBLIC KEY-----", with: "")
-            .replacingOccurrences(of: "\n", with: "")
-            .replacingOccurrences(of: "\r", with: "")
-            .trimmingCharacters(in: .whitespaces)
-
-        guard let keyData = Data(base64Encoded: keyString) else {
+        guard let keyData = Data(base64Encoded: Self.pemBody(pem), options: .ignoreUnknownCharacters) else {
             throw TDFError.invalidPublicKeyFormat
         }
 
-        // Create SecKey from DER data
+        // Create SecKey from DER data (SPKI or PKCS#1)
         let attributes: [String: Any] = [
             kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
             kSecAttrKeyClass as String: kSecAttrKeyClassPublic,
-            kSecAttrKeySizeInBits as String: 2048
         ]
 
         var error: Unmanaged<CFError>?
@@ -232,7 +221,27 @@ public final class TDFManifestBuilder {
             throw TDFError.invalidPublicKeyFormat
         }
 
+        // SecKeyCreateWithData takes the size from the key, whatever the attributes say.
+        let bits = (SecKeyCopyAttributes(secKey) as? [String: Any])?[kSecAttrKeySizeInBits as String] as? Int
+            ?? SecKeyGetBlockSize(secKey) * 8
+        guard bits >= 2048 else {
+            throw TDFError.weakPublicKey(bits: bits)
+        }
+
         return secKey
+    }
+
+    /// The base64 between a `PUBLIC KEY` or `RSA PUBLIC KEY` BEGIN line and its
+    /// END line (or the end of the text, when the END line is missing). RFC 7468
+    /// lets text surround the block and whitespace sit in the body. Text with
+    /// no BEGIN line is taken as bare base64.
+    private static func pemBody(_ pem: String) -> String {
+        guard let begin = pem.range(of: "-----BEGIN ") else { return pem }
+        guard let labelEnd = pem.range(of: "-----", range: begin.upperBound ..< pem.endIndex),
+              ["PUBLIC KEY", "RSA PUBLIC KEY"].contains(pem[begin.upperBound ..< labelEnd.lowerBound])
+        else { return "" }
+        let end = pem.range(of: "-----END ", range: labelEnd.upperBound ..< pem.endIndex)?.lowerBound ?? pem.endIndex
+        return String(pem[labelEnd.upperBound ..< end])
     }
 
     /// Parse a KAS RSA public key from PEM (`PUBLIC KEY` or `RSA PUBLIC KEY` armor).
@@ -272,6 +281,7 @@ public final class TDFManifestBuilder {
     // MARK: - Manifest Building
 
     /// Build TDF manifest for FairPlay content key delivery
+    @available(*, deprecated, message: "Sends a manifest with no policy, which arks refuses since PR #75. Package with FMP4RecordingProtectionService and play with TDFContentKeyDelegate given the archive manifest.")
     public func buildManifest(contentKey: Data, iv: Data, assetID: String) async throws -> Manifest {
         let wrappedKey = try await wrapKey(contentKey)
 
@@ -291,6 +301,7 @@ public final class TDFManifestBuilder {
     }
 
     /// Build TDF manifest with pre-wrapped key
+    @available(*, deprecated, message: "Sends a manifest with no policy, which arks refuses since PR #75. Package with FMP4RecordingProtectionService and play with TDFContentKeyDelegate given the archive manifest.")
     public func buildManifest(wrappedKey: Data, iv: Data) -> Manifest {
         let keyAccess = KeyAccess(
             url: kasURL.absoluteString,
@@ -332,12 +343,6 @@ public final class TDFManifestBuilder {
         return Manifest(encryptionInformation: encryptionInfo)
     }
 
-    /// As `buildManifest(contentKey:iv:policyJSON:publicKey:)`, fetching the KAS key first.
-    public func buildManifest(contentKey: Data, iv: Data, policyJSON: Data) async throws -> Manifest {
-        let publicKey = try await fetchKASPublicKey()
-        return try buildManifest(contentKey: contentKey, iv: iv, policyJSON: policyJSON, publicKey: publicKey)
-    }
-
     /// Serialize manifest to JSON data
     public func serializeManifest(_ manifest: Manifest) throws -> Data {
         let encoder = JSONEncoder()
@@ -354,6 +359,7 @@ public final class TDFManifestBuilder {
         case unsupportedAlgorithm
         case keyWrappingFailed
         case manifestSerializationFailed
+        case weakPublicKey(bits: Int)
 
         public var errorDescription: String? {
             switch self {
@@ -369,6 +375,8 @@ public final class TDFManifestBuilder {
                 return "Failed to wrap content key"
             case .manifestSerializationFailed:
                 return "Failed to serialize TDF manifest"
+            case let .weakPublicKey(bits):
+                return "KAS RSA public key is \(bits) bits; at least 2048 required"
             }
         }
     }
@@ -381,8 +389,9 @@ extension TDFManifestBuilder {
     /// - Parameters:
     ///   - contentKey: 16-byte AES-128 content encryption key
     ///   - iv: 16-byte initialization vector
-    ///   - assetID: Asset identifier (used in skd:// URI)
+    ///   - assetID: Unused; the manifest carries no policy and so no key id
     /// - Returns: JSON data ready to send to /media/v1/key-request
+    @available(*, deprecated, message: "Sends a manifest with no policy, which arks refuses since PR #75. Package with FMP4RecordingProtectionService and play with TDFContentKeyDelegate given the archive manifest.")
     public func buildFairPlayKeyRequest(
         contentKey: Data,
         iv: Data,
@@ -393,6 +402,7 @@ extension TDFManifestBuilder {
     }
 
     /// Create manifest data from wrapped key (when key is already wrapped)
+    @available(*, deprecated, message: "Sends a manifest with no policy, which arks refuses since PR #75. Package with FMP4RecordingProtectionService and play with TDFContentKeyDelegate given the archive manifest.")
     public func buildFairPlayKeyRequestFromWrappedKey(
         wrappedKey: Data,
         iv: Data

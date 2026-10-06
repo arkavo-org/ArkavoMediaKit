@@ -407,13 +407,62 @@ struct TDFContentKeyDelegateIntegrationTests {
 /// caller supplies it, so the policy and binding reach the license service.
 @Suite("Key-request manifest")
 struct KeyRequestManifestTests {
-    @Test("an archive manifest is sent verbatim")
-    func verbatim() throws {
-        let raw = Data(#"{"encryptionInformation":{"policy":"eyJ9","keyAccess":[{"type":"wrapped"}]}}"#.utf8)
-        let manifest = FairPlayManifest(
+    private static func archiveManifest(_ raw: Data) -> FairPlayManifest {
+        FairPlayManifest(
             assetID: "6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d", kasURL: "https://platform.arkavo.net",
             wrappedKey: "d2s=", algorithm: "AES-128-CBC", iv: "aXY=", tdfManifestJSON: raw)
-        #expect(try TDFContentKeyDelegate<FairPlayManifest>.keyRequestManifestData(for: manifest) == raw)
+    }
+
+    /// arks reads only the policy and the key access object's type, url,
+    /// wrappedKey and policyBinding; the per-segment metadata grows with the
+    /// recording (~32 B a segment) and stays home.
+    @Test("an archive manifest is sent without meta or encryptedMetadata, the rest unchanged")
+    func trimmed() throws {
+        let segments = (0 ..< 1200).map { "segment\($0).m4s" }
+        let metadata = try JSONSerialization.data(withJSONObject: ["segmentFilenames": segments]).base64EncodedString()
+        let raw = try JSONSerialization.data(withJSONObject: [
+            "encryptionInformation": [
+                "type": "split",
+                "policy": "eyJ1dWlkIjoiYSJ9/+==",
+                "method": ["algorithm": "AES-128-CBC", "iv": "aXY=", "isStreamable": true],
+                "keyAccess": [[
+                    "type": "wrapped", "url": "https://platform.arkavo.net", "protocol": "kas",
+                    "wrappedKey": "ab/c+d==", "policyBinding": ["alg": "HS256", "hash": "x/y+z="],
+                    "encryptedMetadata": metadata,
+                ]],
+            ],
+            "meta": ["assetId": "recording-1", "contentKeyId": "a"],
+        ] as [String: Any])
+        let sent = try TDFContentKeyDelegate<FairPlayManifest>.keyRequestManifestData(for: Self.archiveManifest(raw))
+
+        let json = try #require(JSONSerialization.jsonObject(with: sent) as? [String: Any])
+        #expect(json["meta"] == nil)
+        let info = try #require(json["encryptionInformation"] as? [String: Any])
+        #expect(info["policy"] as? String == "eyJ1dWlkIjoiYSJ9/+==")
+        #expect(info["type"] as? String == "split")
+        #expect((info["method"] as? [String: Any])?["iv"] as? String == "aXY=")
+        let kao = try #require((info["keyAccess"] as? [[String: Any]])?.first)
+        #expect(kao["encryptedMetadata"] == nil)
+        #expect(kao["type"] as? String == "wrapped")
+        #expect(kao["url"] as? String == "https://platform.arkavo.net")
+        #expect(kao["wrappedKey"] as? String == "ab/c+d==")
+        #expect((kao["policyBinding"] as? [String: Any])?["hash"] as? String == "x/y+z=")
+        #expect(!String(decoding: sent, as: UTF8.self).contains(#"\/"#), "slashes stay unescaped")
+        #expect(sent.count < 1024, "\(sent.count) bytes sent for a 1200-segment archive")
+    }
+
+    /// JSONSerialization reads -1e400 as -inf, and writing -inf raises an
+    /// Objective-C exception `try?` cannot catch: the player would abort.
+    @Test("an archive manifest that cannot be re-serialized is sent as is")
+    func unwritableSentAsIs() throws {
+        let raw = Data(#"{"encryptionInformation":{"policy":"eyJ9","keyAccess":[{"type":"wrapped","encryptedMetadata":"bQ=="}]},"payload":{"length":-1e400}}"#.utf8)
+        #expect(try TDFContentKeyDelegate<FairPlayManifest>.keyRequestManifestData(for: Self.archiveManifest(raw)) == raw)
+    }
+
+    @Test("an archive manifest that is not a JSON object is sent as is")
+    func unparseableSentAsIs() throws {
+        let raw = Data("not json".utf8)
+        #expect(try TDFContentKeyDelegate<FairPlayManifest>.keyRequestManifestData(for: Self.archiveManifest(raw)) == raw)
     }
 
     @Test("without an archive manifest the legacy reconstruction is sent")
@@ -435,5 +484,43 @@ struct KeyRequestManifestTests {
             let assetID = "a", kasURL = "k", wrappedKey = "w", algorithm = "x", iv = "i"
         }
         #expect(Legacy().tdfManifestJSON == nil)
+    }
+}
+
+// MARK: - Key-request content id
+
+/// arks matches the SPC's content id against the uuid of the policy in the
+/// `tdfManifest` sent with it, so the delegate takes the id from that policy.
+@Suite("Key-request content id")
+struct KeyRequestContentIDTests {
+    private static func manifest(policyJSON: String?, assetID: String = "recording-1") -> FairPlayManifest {
+        var info: [String: Any] = ["keyAccess": [["type": "wrapped", "wrappedKey": "d2s="]]]
+        if let policyJSON { info["policy"] = Data(policyJSON.utf8).base64EncodedString() }
+        let raw = try! JSONSerialization.data(withJSONObject: ["encryptionInformation": info])
+        return FairPlayManifest(
+            assetID: assetID, kasURL: "https://platform.arkavo.net",
+            wrappedKey: "d2s=", algorithm: "AES-128-CBC", iv: "aXY=", tdfManifestJSON: raw)
+    }
+
+    @Test("the archive manifest's policy uuid is the content id")
+    func policyUUID() {
+        let manifest = Self.manifest(policyJSON: #"{"uuid":"6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d","body":{}}"#)
+        #expect(TDFContentKeyDelegate<FairPlayManifest>.contentID(for: manifest) == "6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d")
+    }
+
+    @Test("the uuid is taken as written, as arks reads it")
+    func policyUUIDVerbatim() {
+        let manifest = Self.manifest(policyJSON: #"{"uuid":"Legacy-Asset-7","body":{}}"#)
+        #expect(TDFContentKeyDelegate<FairPlayManifest>.contentID(for: manifest) == "Legacy-Asset-7")
+    }
+
+    @Test("with no archive manifest, or no policy uuid in it, the asset id is used")
+    func fallsBackToAssetID() {
+        let bare = FairPlayManifest(
+            assetID: "recording-1", kasURL: "k", wrappedKey: "w", algorithm: "a", iv: "i")
+        #expect(TDFContentKeyDelegate<FairPlayManifest>.contentID(for: bare) == "recording-1")
+        #expect(TDFContentKeyDelegate<FairPlayManifest>.contentID(for: Self.manifest(policyJSON: nil)) == "recording-1")
+        #expect(TDFContentKeyDelegate<FairPlayManifest>.contentID(for: Self.manifest(policyJSON: #"{"body":{}}"#)) == "recording-1")
+        #expect(TDFContentKeyDelegate<FairPlayManifest>.contentID(for: Self.manifest(policyJSON: #"{"uuid":""}"#)) == "recording-1")
     }
 }

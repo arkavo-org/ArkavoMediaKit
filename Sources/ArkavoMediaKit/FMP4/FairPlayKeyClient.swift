@@ -23,6 +23,7 @@ public final class FairPlayKeyClient {
     }
 
     /// Key request configuration
+    @available(*, deprecated, message: "Sends a manifest with no policy, which arks refuses since PR #75. Package with FMP4RecordingProtectionService and play with TDFContentKeyDelegate given the archive manifest.")
     public struct KeyRequestConfig {
         public let contentKey: Data      // 16-byte AES-128 key
         public let contentIV: Data       // 16-byte IV
@@ -181,6 +182,7 @@ public final class FairPlayKeyClient {
     ///   - spcData: Server Playback Context from AVContentKeyRequest
     ///   - config: Key request configuration with content key and IV
     /// - Returns: Content Key Context (CKC) data for AVContentKeyResponse
+    @available(*, deprecated, message: "Sends a manifest with no policy, which arks refuses since PR #75. Package with FMP4RecordingProtectionService and play with TDFContentKeyDelegate given the archive manifest.")
     public func requestCKC(spcData: Data, config: KeyRequestConfig) async throws -> Data {
         // Ensure we have a session
         let session: Session
@@ -306,6 +308,7 @@ public final class FairPlayKeyClient {
 
 extension FairPlayKeyClient {
     /// Create AVContentKeySession delegate for FairPlay playback
+    @available(*, deprecated, message: "Sends a manifest with no policy, which arks refuses since PR #75. Package with FMP4RecordingProtectionService and play with TDFContentKeyDelegate given the archive manifest.")
     public func createContentKeyDelegate() -> FMP4ContentKeyDelegate {
         FMP4ContentKeyDelegate(keyClient: self)
     }
@@ -314,6 +317,7 @@ extension FairPlayKeyClient {
 // MARK: - FMP4 Content Key Delegate
 
 /// AVContentKeySessionDelegate implementation for fMP4 FairPlay playback
+@available(*, deprecated, message: "Sends a manifest with no policy, which arks refuses since PR #75. Package with FMP4RecordingProtectionService and play with TDFContentKeyDelegate given the archive manifest.")
 public final class FMP4ContentKeyDelegate: NSObject, AVContentKeySessionDelegate {
     private let keyClient: FairPlayKeyClient
     private var keyConfig: FairPlayKeyClient.KeyRequestConfig?

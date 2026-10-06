@@ -35,7 +35,8 @@ public actor FMP4RecordingProtectionService {
     ///   - videoURL: URL to the source video file
     ///   - assetID: Unique asset identifier, recorded in the fMP4 metadata and `meta`
     ///   - policyJSON: TDF policy JSON (`{"uuid", "body": {"dataAttributes", "dissem"}}`).
-    ///     Its `uuid` must be a UUID: it becomes the FairPlay content-key id
+    ///     BOM-less UTF-8 without duplicate keys; its `uuid` must be a lower-case
+    ///     UUID: it becomes the FairPlay content-key id
     ///     (`skd://<uuid>` in the playlist). Nil embeds `FairPlayPolicy.placeholderJSON()`,
     ///     which the post-#75 license service refuses (no data attributes).
     /// - Returns: TDF ZIP archive data containing manifest, playlist, init.mp4, and encrypted segments
@@ -60,8 +61,8 @@ public actor FMP4RecordingProtectionService {
         print("🔑 Generating content encryption key...")
         let contentKey = CBCSEncryptor.generateKeyID()  // 16-byte AES-128 key
         let constantIV = CBCSEncryptor.generateIV()     // 16-byte constant IV
-        // Use all-zero KID - FairPlay uses Asset ID for key lookup, not KID
-        // KID is CENC bookkeeping only; keep stable until playback works
+        // All-zero KID: FairPlay keys off the skd:// content-key id (the policy
+        // uuid), not the KID, which is CENC bookkeeping only
         let keyID = Data(repeating: 0, count: 16)
 
         // 2. Fetch KAS public key and wrap content key
@@ -97,6 +98,7 @@ public actor FMP4RecordingProtectionService {
 
         let dimensions = try await videoTrack.load(.naturalSize)
         let timescale = try await videoTrack.load(.naturalTimeScale)
+        let (trackSegments, totalSampleBytes) = try await videoTrack.load(.segments, .totalSampleDataLength)
 
         // Extract SPS/PPS and NAL length size from format description
         guard let h264Params = extractParameterSets(from: formatDesc) else {
@@ -133,10 +135,13 @@ public actor FMP4RecordingProtectionService {
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
         reader.add(output)
-        reader.startReading()
+        guard reader.startReading() else {
+            throw FMP4ProtectionError.readFailed(reader.error?.localizedDescription ?? "reader did not start")
+        }
 
         var samples: [FMP4Writer.Sample] = []
-        var totalDuration: UInt64 = 0
+        var bytesRead: Int64 = 0
+        var readEnd = CMTime.zero  // latest presentation end among the samples read
 
         while let sampleBuffer = output.copyNextSampleBuffer() {
             guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
@@ -147,6 +152,7 @@ public actor FMP4RecordingProtectionService {
 
             guard let pointer = dataPointer else { continue }
             let sampleData = Data(bytes: pointer, count: length)
+            bytesRead += Int64(length)
 
             // Encrypt the sample using the actual NAL length size from the source video
             let encryptedResult = encryptor.encryptVideoSample(sampleData, nalLengthSize: nalLengthSize)
@@ -180,6 +186,9 @@ public actor FMP4RecordingProtectionService {
             // Calculate Composition Time Offset (CTS) for B-frame support
             // CTS = PTS - DTS (tells decoder when to display the frame relative to decode time)
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            if pts.isNumeric, duration.isNumeric {
+                readEnd = max(readEnd, pts + duration)
+            }
             let dts = CMSampleBufferGetDecodeTimeStamp(sampleBuffer)
             var compositionTimeOffset: Int32 = 0
 
@@ -207,63 +216,65 @@ public actor FMP4RecordingProtectionService {
                 compositionTimeOffset: compositionTimeOffset,
                 subsamples: encryptedResult.subsamples
             ))
-
-            totalDuration += UInt64(durationValue)
+        }
+        // copyNextSampleBuffer() returns nil on failure as well as at the end.
+        guard reader.status == .completed else {
+            throw FMP4ProtectionError.readFailed(reader.error?.localizedDescription ?? "reader status \(reader.status.rawValue)")
+        }
+        guard !samples.isEmpty else {
+            throw FMP4ProtectionError.readFailed("no video samples")
+        }
+        // On a truncated file the reader can also finish .completed short of the end.
+        // A whole read took every sample byte, or reached the end of the last edit's
+        // media (an edit that trims the tail leaves bytes unread). Not the track's
+        // duration: empty and dwell edits make that differ from the samples'.
+        let mediaEnd = trackSegments.last { !$0.isEmpty }?.timeMapping.source.end ?? .zero
+        guard bytesRead == totalSampleBytes || readEnd >= mediaEnd else {
+            throw FMP4ProtectionError.readFailed(
+                "read \(bytesRead) of \(totalSampleBytes) sample bytes, to \(readEnd.seconds) s of \(mediaEnd.seconds) s")
         }
 
-        // 7. Generate media segments (6 second chunks)
+        // 7. Generate media segments (about 6 seconds each)
         print("📼 Generating media segments...")
-        let segmentDuration: UInt64 = UInt64(6 * timescale)  // 6 seconds
+        let ranges = Self.segmentRanges(
+            for: samples.map { SegmentSample(duration: $0.duration, isSync: $0.isSync) },
+            targetDuration: UInt64(timescale) * 6  // not Int32 6 * timescale: overflows past 357,913,941
+        )
         var segments: [FMP4HLSGenerator.Segment] = []
-        var segmentIndex = 0
-        var sampleIndex = 0
-        var currentSegmentSamples: [FMP4Writer.Sample] = []
-        var currentSegmentDuration: UInt64 = 0
         var baseDecodeTime: UInt64 = 0
 
-        while sampleIndex < samples.count {
-            let sample = samples[sampleIndex]
-            currentSegmentSamples.append(sample)
-            currentSegmentDuration += UInt64(sample.duration)
-            sampleIndex += 1
+        for (segmentIndex, range) in ranges.enumerated() {
+            let segmentSamples = Array(samples[range])
+            let segmentDuration = segmentSamples.reduce(UInt64(0)) { $0 + UInt64($1.duration) }
+            let segmentData = writer.generateMediaSegment(
+                trackID: 1,
+                samples: segmentSamples,
+                baseDecodeTime: baseDecodeTime
+            )
 
-            // Check if we should end this segment
-            let shouldEndSegment = currentSegmentDuration >= segmentDuration || sampleIndex == samples.count
+            let segmentFilename = "segment\(segmentIndex).m4s"
+            let segmentURL = tempDir.appendingPathComponent(segmentFilename)
+            try segmentData.write(to: segmentURL)
 
-            if shouldEndSegment && !currentSegmentSamples.isEmpty {
-                let segmentData = writer.generateMediaSegment(
-                    trackID: 1,
-                    samples: currentSegmentSamples,
-                    baseDecodeTime: baseDecodeTime
-                )
+            let duration = Double(segmentDuration) / Double(timescale)
+            segments.append(FMP4HLSGenerator.Segment(uri: segmentFilename, duration: duration))
 
-                let segmentFilename = "segment\(segmentIndex).m4s"
-                let segmentURL = tempDir.appendingPathComponent(segmentFilename)
-                try segmentData.write(to: segmentURL)
-
-                let duration = Double(currentSegmentDuration) / Double(timescale)
-                segments.append(FMP4HLSGenerator.Segment(uri: segmentFilename, duration: duration))
-
-                baseDecodeTime += currentSegmentDuration
-                currentSegmentSamples = []
-                currentSegmentDuration = 0
-                segmentIndex += 1
-            }
+            baseDecodeTime += segmentDuration
         }
 
-        print("   Created \(segmentIndex) segments")
+        print("   Created \(segments.count) segments")
 
         // 8. Generate HLS playlist
         print("📋 Generating HLS playlist...")
         let playlistConfig = FMP4HLSGenerator.PlaylistConfig(
-            targetDuration: 6,
+            targetDuration: Self.targetDuration(forSegmentDurations: segments.map(\.duration)),
             playlistType: .vod,
             initSegmentURI: "init.mp4"
         )
 
-        // The key URI is skd://<policy uuid>: the license service matches the SPC against it.
-        let fairPlayConfig = FMP4HLSGenerator.FairPlayConfig.fairPlay(
-            assetID: contentKeyID,
+        // The license service matches the SPC against the policy uuid.
+        let fairPlayConfig = FMP4HLSGenerator.FairPlayConfig(
+            keyURI: "skd://\(contentKeyID)",
             keyID: keyID,
             iv: constantIV
         )
@@ -277,14 +288,13 @@ public actor FMP4RecordingProtectionService {
         // 9. Package into TDF archive (ZIP)
         print("📦 Packaging into TDF archive...")
 
-        // Add fMP4-specific metadata to manifest
-        let segmentFilenames = segments.map { $0.uri }
+        // Add fMP4-specific metadata to manifest (the segments are listed in the playlist)
         let enhancedManifestData = try addFMP4Metadata(
             to: manifestData,
             assetID: assetID,
+            contentKeyID: contentKeyID,
             playlistFilename: "playlist.m3u8",
-            initFilename: "init.mp4",
-            segmentFilenames: segmentFilenames
+            initFilename: "init.mp4"
         )
 
         let archive = try createTDFArchive(
@@ -295,6 +305,59 @@ public actor FMP4RecordingProtectionService {
 
         print("✅ fMP4 FairPlay protection complete: \(archive.count) bytes")
         return archive
+    }
+
+    // MARK: - Segmentation
+
+    /// A sample's duration (in the track timescale) and whether it is a sync sample.
+    struct SegmentSample: Equatable {
+        let duration: UInt32
+        let isSync: Bool
+    }
+
+    /// Sample index ranges for the media segments. Each opens on a sync
+    /// sample, as `#EXT-X-INDEPENDENT-SEGMENTS` promises: a segment closes at
+    /// whichever sync sample lands nearer `targetDuration`, the first at or
+    /// past it or the last short of it (if at least half way), so a keyframe
+    /// a few ticks early does not stretch the segment a whole GOP.
+    static func segmentRanges(for samples: [SegmentSample], targetDuration: UInt64) -> [Range<Int>] {
+        var ranges: [Range<Int>] = []
+        var start = 0
+        var accumulated: UInt64 = 0  // duration of samples[start ..< index]
+        var shortOfTarget: (index: Int, accumulated: UInt64)?  // last sync sample before the target
+        for (index, sample) in samples.enumerated() {
+            while index > start, sample.isSync {
+                if accumulated < targetDuration {
+                    shortOfTarget = (index, accumulated)
+                    break
+                }
+                if let earlier = shortOfTarget, earlier.accumulated * 2 >= targetDuration,
+                   targetDuration - earlier.accumulated < accumulated - targetDuration {
+                    // Close at the earlier one, then weigh this sample again in the new segment.
+                    ranges.append(start ..< earlier.index)
+                    start = earlier.index
+                    accumulated -= earlier.accumulated
+                    shortOfTarget = nil
+                    continue
+                }
+                ranges.append(start ..< index)
+                start = index
+                accumulated = 0
+                shortOfTarget = nil
+            }
+            accumulated += UInt64(sample.duration)
+        }
+        if start < samples.count {
+            ranges.append(start ..< samples.count)
+        }
+        return ranges
+    }
+
+    /// `#EXT-X-TARGETDURATION` for segments that end at sync samples, not at
+    /// 6 s. RFC 8216: every EXTINF, rounded to the nearest integer, at most the
+    /// target; at least 1.
+    static func targetDuration(forSegmentDurations durations: [Double]) -> Int {
+        max(1, Int((durations.max() ?? 0).rounded()))
     }
 
     // MARK: - Private Helpers
@@ -366,9 +429,9 @@ public actor FMP4RecordingProtectionService {
     private func addFMP4Metadata(
         to manifestData: Data,
         assetID: String,
+        contentKeyID: String,
         playlistFilename: String,
-        initFilename: String,
-        segmentFilenames: [String]
+        initFilename: String
     ) throws -> Data {
         // Parse existing manifest
         guard var manifest = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any] else {
@@ -381,9 +444,9 @@ public actor FMP4RecordingProtectionService {
         let fmp4Meta: [String: Any] = [
             "type": "fmp4-fairplay",
             "assetId": assetID,
+            "contentKeyId": contentKeyID,
             "playlistFilename": playlistFilename,
             "initFilename": initFilename,
-            "segmentFilenames": segmentFilenames,
             "encryption": "cbcs-1-9",
             "protectedAt": protectedAtTimestamp
         ]
@@ -401,9 +464,11 @@ public actor FMP4RecordingProtectionService {
             manifest["encryptionInformation"] = encInfo
         }
 
-        // Add top-level meta section (required by IrohContentService)
+        // Add top-level meta section (required by IrohContentService). contentKeyId
+        // is the skd:// id (the policy uuid); assetId is the recording's id.
         manifest["meta"] = [
             "assetId": assetID,
+            "contentKeyId": contentKeyID,
             "protectedAt": protectedAtTimestamp
         ]
 
@@ -580,6 +645,7 @@ public enum FMP4ProtectionError: Error, LocalizedError {
     case encodingFailed(String)
     case packagingFailed(String)
     case manifestParsingFailed
+    case readFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -595,6 +661,8 @@ public enum FMP4ProtectionError: Error, LocalizedError {
             "TDF packaging failed: \(reason)"
         case .manifestParsingFailed:
             "Failed to parse manifest JSON"
+        case let .readFailed(reason):
+            "Reading the source video failed: \(reason)"
         }
     }
 }

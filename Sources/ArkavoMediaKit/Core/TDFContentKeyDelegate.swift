@@ -93,14 +93,17 @@ public enum FairPlayError: Error, LocalizedError, Sendable {
 
 /// Protocol for manifest types that can be used with FairPlay key exchange
 public protocol FairPlayManifestProtocol: Sendable {
+    /// The SPC content id when `tdfManifestJSON` is nil or its policy has no
+    /// uuid; otherwise the policy uuid is used.
     var assetID: String { get }
     var kasURL: String { get }
     var wrappedKey: String { get }
     var algorithm: String { get }
     var iv: String { get }
     /// The archive's own `manifest.json` bytes. When present they are sent as
-    /// the key request's `tdfManifest` verbatim, so the full policy and its
-    /// binding reach the license service (required by arks after PR #75).
+    /// the key request's `tdfManifest`, less `meta` and `encryptedMetadata`, so
+    /// the policy and its binding reach the license service (required by arks
+    /// after PR #75), and its policy uuid is the SPC content id.
     var tdfManifestJSON: Data? { get }
 }
 
@@ -171,6 +174,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
     @unchecked Sendable
 {
     private let manifest: Manifest
+    private let contentID: String
     private let serverURL: URL
     private let userId: String
     private let authToken: String?
@@ -195,6 +199,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         serverURL: URL = URL(string: "https://100.arkavo.net")!
     ) {
         self.manifest = manifest
+        self.contentID = Self.contentID(for: manifest)
         self.authToken = authToken
         self.userId = userId
         self.serverURL = serverURL
@@ -204,6 +209,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         FairPlayDebug.log("TDFContentKeyDelegate initialized")
         FairPlayDebug.log("  Server URL: \(serverURL.absoluteString)")
         FairPlayDebug.log("  Asset ID: \(manifest.assetID)")
+        FairPlayDebug.log("  Content ID: \(contentID)")
         FairPlayDebug.log("  KAS URL: \(manifest.kasURL)")
         FairPlayDebug.log("  Algorithm: \(manifest.algorithm)")
         FairPlayDebug.log("  Auth: \(authToken != nil ? "provided" : "none")")
@@ -317,8 +323,8 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
 
                 // 3. Generate SPC with content identifier
                 FairPlayDebug.log("Step 3: Generate SPC...")
-                let contentId = manifest.assetID.data(using: .utf8) ?? Data()
-                FairPlayDebug.log("  Content ID: \(manifest.assetID)")
+                let contentId = Data(contentID.utf8)
+                FairPlayDebug.log("  Content ID: \(contentID)")
                 FairPlayDebug.logData("  Content ID bytes", data: contentId)
 
                 let spcStartTime = CFAbsoluteTimeGetCurrent()
@@ -416,7 +422,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
 
         let body: [String: Any] = [
             "userId": userId,
-            "assetId": manifest.assetID,
+            "assetId": contentID,
             "protocol": "fairplay",
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -486,14 +492,14 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         FairPlayDebug.log("  Building key-request payload:")
         FairPlayDebug.log("    Session ID: \(sessionId)")
         FairPlayDebug.log("    User ID: \(userId)")
-        FairPlayDebug.log("    Asset ID: \(manifest.assetID)")
+        FairPlayDebug.log("    Content ID: \(contentID)")
         FairPlayDebug.log("    SPC size: \(spcData.count) bytes")
         FairPlayDebug.log("    TDF manifest size: \(manifestData.count) bytes")
 
         let body: [String: Any] = [
             "sessionId": sessionId,
             "userId": userId,
-            "assetId": manifest.assetID,
+            "assetId": contentID,
             "spcData": spcData.base64EncodedString(),
             "tdfManifest": manifestBase64,
         ]
@@ -540,11 +546,18 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         return ckcData
     }
 
+    /// The SPC content id and the requests' `assetId`: the uuid of the policy
+    /// in the archive manifest when there is one, since arks matches the SPC
+    /// against the policy it is sent, else `manifest.assetID`.
+    static func contentID(for manifest: Manifest) -> String {
+        manifest.tdfManifestJSON.flatMap(FairPlayPolicy.uuid(ofManifestJSON:)) ?? manifest.assetID
+    }
+
     /// The `tdfManifest` sent with a key request: the archive's own manifest
     /// when the caller supplied it, else the legacy reconstruction (no policy,
     /// which the post-#75 license service refuses).
     static func keyRequestManifestData(for manifest: Manifest) throws -> Data {
-        if let raw = manifest.tdfManifestJSON { return raw }
+        if let raw = manifest.tdfManifestJSON { return trimmedForKeyRequest(raw) }
         let manifestJSON: [String: Any] = [
             "encryptionInformation": [
                 "type": "split",
@@ -564,6 +577,25 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
             throw FairPlayError.manifestEncodingFailed("Failed to serialize manifest")
         }
         return data
+    }
+
+    /// The archive manifest without what no license service reads: top-level
+    /// `meta` and each key access object's `encryptedMetadata` (in archives
+    /// before 0.1.7, the fMP4 per-segment file list, ~32 B a segment). The policy, wrapped key and
+    /// binding strings are carried over unchanged. Bytes that are not a JSON
+    /// object, or that JSONSerialization could not write back, are returned as
+    /// they are.
+    private static func trimmedForKeyRequest(_ raw: Data) -> Data {
+        guard var json = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else { return raw }
+        json["meta"] = nil
+        if var info = json["encryptionInformation"] as? [String: Any],
+           let keyAccess = info["keyAccess"] as? [[String: Any]] {
+            info["keyAccess"] = keyAccess.map { $0.filter { $0.key != "encryptedMetadata" } }
+            json["encryptionInformation"] = info
+        }
+        // Writing a non-finite number (-1e400 parses as -inf) raises an exception `try?` cannot catch.
+        guard JSONSerialization.isValidJSONObject(json) else { return raw }
+        return (try? JSONSerialization.data(withJSONObject: json, options: [.withoutEscapingSlashes])) ?? raw
     }
 }
 

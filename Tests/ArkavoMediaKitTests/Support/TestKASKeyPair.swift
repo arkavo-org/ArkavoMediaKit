@@ -4,8 +4,9 @@ import Testing
 
 /// A per-test 2048-bit RSA keypair standing in for the KAS key. Packagers
 /// RSA-wrap the DEK with `publicKeyPEM` (OAEP-SHA1, as the KAS does); tests
-/// unwrap it with `unwrap(_:)` so a manifest binding can be verified against
-/// the real DEK exactly the way KAS rewrap and the arks license service do.
+/// unwrap it from `privateKeyPEM` with OpenTDFKit's
+/// `TDFCrypto.unwrapSymmetricKeyWithRSA` so a manifest binding can be verified
+/// against the real DEK exactly the way KAS rewrap and the arks license service do.
 ///
 /// Generated at runtime with `SecKeyCreateRandomKey` so no key material
 /// lives in source. `SecKeyCopyExternalRepresentation` yields PKCS#1 DER for
@@ -15,14 +16,13 @@ import Testing
 struct TestKASKeyPair {
     let publicKeyPEM: String
     let privateKeyPEM: String
-    let privateKey: SecKey
     /// The same public key as a SubjectPublicKeyInfo PEM — the form a real KAS serves.
     let spkiPublicKeyPEM: String
 
-    init() throws {
+    init(bits: Int = 2048) throws {
         let attributes: [String: Any] = [
             kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
-            kSecAttrKeySizeInBits as String: 2048,
+            kSecAttrKeySizeInBits as String: bits,
             kSecAttrIsPermanent as String: false,
         ]
         var error: Unmanaged<CFError>?
@@ -30,7 +30,6 @@ struct TestKASKeyPair {
             throw error!.takeRetainedValue() as Error
         }
         let publicKey = try #require(SecKeyCopyPublicKey(privateKey))
-        self.privateKey = privateKey
         privateKeyPEM = try Self.pem(privateKey, label: "RSA PRIVATE KEY")
         publicKeyPEM = try Self.pem(publicKey, label: "PUBLIC KEY")
         guard let pkcs1 = SecKeyCopyExternalRepresentation(publicKey, &error) as Data? else {
@@ -41,17 +40,6 @@ struct TestKASKeyPair {
         let bitString = Self.der(tag: 0x03, Data([0x00]) + pkcs1)
         let spki = Self.der(tag: 0x30, algorithm + bitString)
         spkiPublicKeyPEM = "-----BEGIN PUBLIC KEY-----\n\(spki.base64EncodedString(options: [.lineLength64Characters]))\n-----END PUBLIC KEY-----"
-    }
-
-    /// RSA-OAEP-SHA1 unwrap, exactly as the KAS and arks do.
-    func unwrap(_ wrapped: Data) throws -> Data {
-        var error: Unmanaged<CFError>?
-        guard let dek = SecKeyCreateDecryptedData(
-            privateKey, .rsaEncryptionOAEPSHA1, wrapped as CFData, &error
-        ) as Data? else {
-            throw error!.takeRetainedValue() as Error
-        }
-        return dek
     }
 
     private static func pem(_ key: SecKey, label: String) throws -> String {
