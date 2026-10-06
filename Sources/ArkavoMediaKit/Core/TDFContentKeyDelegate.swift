@@ -93,6 +93,8 @@ public enum FairPlayError: Error, LocalizedError, Sendable {
 
 /// Protocol for manifest types that can be used with FairPlay key exchange
 public protocol FairPlayManifestProtocol: Sendable {
+    /// The SPC content id when `tdfManifestJSON` is nil or its policy has no
+    /// uuid; otherwise the policy uuid is used.
     var assetID: String { get }
     var kasURL: String { get }
     var wrappedKey: String { get }
@@ -171,6 +173,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
     @unchecked Sendable
 {
     private let manifest: Manifest
+    private let contentID: String
     private let serverURL: URL
     private let userId: String
     private let authToken: String?
@@ -195,6 +198,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         serverURL: URL = URL(string: "https://100.arkavo.net")!
     ) {
         self.manifest = manifest
+        self.contentID = Self.contentID(for: manifest)
         self.authToken = authToken
         self.userId = userId
         self.serverURL = serverURL
@@ -204,6 +208,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         FairPlayDebug.log("TDFContentKeyDelegate initialized")
         FairPlayDebug.log("  Server URL: \(serverURL.absoluteString)")
         FairPlayDebug.log("  Asset ID: \(manifest.assetID)")
+        FairPlayDebug.log("  Content ID: \(contentID)")
         FairPlayDebug.log("  KAS URL: \(manifest.kasURL)")
         FairPlayDebug.log("  Algorithm: \(manifest.algorithm)")
         FairPlayDebug.log("  Auth: \(authToken != nil ? "provided" : "none")")
@@ -317,8 +322,8 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
 
                 // 3. Generate SPC with content identifier
                 FairPlayDebug.log("Step 3: Generate SPC...")
-                let contentId = manifest.assetID.data(using: .utf8) ?? Data()
-                FairPlayDebug.log("  Content ID: \(manifest.assetID)")
+                let contentId = Data(contentID.utf8)
+                FairPlayDebug.log("  Content ID: \(contentID)")
                 FairPlayDebug.logData("  Content ID bytes", data: contentId)
 
                 let spcStartTime = CFAbsoluteTimeGetCurrent()
@@ -416,7 +421,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
 
         let body: [String: Any] = [
             "userId": userId,
-            "assetId": manifest.assetID,
+            "assetId": contentID,
             "protocol": "fairplay",
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -486,14 +491,14 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         FairPlayDebug.log("  Building key-request payload:")
         FairPlayDebug.log("    Session ID: \(sessionId)")
         FairPlayDebug.log("    User ID: \(userId)")
-        FairPlayDebug.log("    Asset ID: \(manifest.assetID)")
+        FairPlayDebug.log("    Asset ID: \(contentID)")
         FairPlayDebug.log("    SPC size: \(spcData.count) bytes")
         FairPlayDebug.log("    TDF manifest size: \(manifestData.count) bytes")
 
         let body: [String: Any] = [
             "sessionId": sessionId,
             "userId": userId,
-            "assetId": manifest.assetID,
+            "assetId": contentID,
             "spcData": spcData.base64EncodedString(),
             "tdfManifest": manifestBase64,
         ]
@@ -538,6 +543,13 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
 
         FairPlayDebug.log("  ✅ CKC decoded: \(ckcData.count) bytes")
         return ckcData
+    }
+
+    /// The SPC content id and the requests' `assetId`: the uuid of the policy
+    /// in the archive manifest when there is one, since arks matches the SPC
+    /// against the policy it is sent, else `manifest.assetID`.
+    static func contentID(for manifest: Manifest) -> String {
+        manifest.tdfManifestJSON.flatMap(FairPlayPolicy.uuid(ofManifestJSON:)) ?? manifest.assetID
     }
 
     /// The `tdfManifest` sent with a key request: the archive's own manifest

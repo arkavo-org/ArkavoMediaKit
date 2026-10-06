@@ -49,6 +49,21 @@ public enum FairPlayPolicy {
         return raw
     }
 
+    /// The `uuid` of the policy in a TDF manifest's `encryptionInformation.policy`,
+    /// read as arks reads it: any non-empty string, verbatim. Unlike
+    /// `uuid(ofPolicyJSON:)` this does not judge the policy (it reads archives
+    /// already made, which arks decides on); nil when there is none.
+    static func uuid(ofManifestJSON json: Data) -> String? {
+        guard let manifest = try? JSONSerialization.jsonObject(with: json) as? [String: Any],
+              let info = manifest["encryptionInformation"] as? [String: Any],
+              let policyBase64 = info["policy"] as? String,
+              let policyData = Data(base64Encoded: policyBase64),
+              let policy = try? JSONSerialization.jsonObject(with: policyData) as? [String: Any],
+              let uuid = policy["uuid"] as? String, !uuid.isEmpty
+        else { return nil }
+        return uuid
+    }
+
     /// BOM-less UTF-8, no NUL bytes (so not UTF-16 or UTF-32), opening with `{`.
     private static func isPlainUTF8Object(_ json: Data) -> Bool {
         guard !json.contains(0), String(data: json, encoding: .utf8) != nil else { return false }

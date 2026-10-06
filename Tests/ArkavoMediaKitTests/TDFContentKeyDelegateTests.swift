@@ -437,3 +437,41 @@ struct KeyRequestManifestTests {
         #expect(Legacy().tdfManifestJSON == nil)
     }
 }
+
+// MARK: - Key-request content id
+
+/// arks matches the SPC's content id against the uuid of the policy in the
+/// `tdfManifest` sent with it, so the delegate takes the id from that policy.
+@Suite("Key-request content id")
+struct KeyRequestContentIDTests {
+    private static func manifest(policyJSON: String?, assetID: String = "recording-1") -> FairPlayManifest {
+        var info: [String: Any] = ["keyAccess": [["type": "wrapped", "wrappedKey": "d2s="]]]
+        if let policyJSON { info["policy"] = Data(policyJSON.utf8).base64EncodedString() }
+        let raw = try! JSONSerialization.data(withJSONObject: ["encryptionInformation": info])
+        return FairPlayManifest(
+            assetID: assetID, kasURL: "https://platform.arkavo.net",
+            wrappedKey: "d2s=", algorithm: "AES-128-CBC", iv: "aXY=", tdfManifestJSON: raw)
+    }
+
+    @Test("the archive manifest's policy uuid is the content id")
+    func policyUUID() {
+        let manifest = Self.manifest(policyJSON: #"{"uuid":"6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d","body":{}}"#)
+        #expect(TDFContentKeyDelegate<FairPlayManifest>.contentID(for: manifest) == "6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d")
+    }
+
+    @Test("the uuid is taken as written, as arks reads it")
+    func policyUUIDVerbatim() {
+        let manifest = Self.manifest(policyJSON: #"{"uuid":"Legacy-Asset-7","body":{}}"#)
+        #expect(TDFContentKeyDelegate<FairPlayManifest>.contentID(for: manifest) == "Legacy-Asset-7")
+    }
+
+    @Test("with no archive manifest, or no policy uuid in it, the asset id is used")
+    func fallsBackToAssetID() {
+        let bare = FairPlayManifest(
+            assetID: "recording-1", kasURL: "k", wrappedKey: "w", algorithm: "a", iv: "i")
+        #expect(TDFContentKeyDelegate<FairPlayManifest>.contentID(for: bare) == "recording-1")
+        #expect(TDFContentKeyDelegate<FairPlayManifest>.contentID(for: Self.manifest(policyJSON: nil)) == "recording-1")
+        #expect(TDFContentKeyDelegate<FairPlayManifest>.contentID(for: Self.manifest(policyJSON: #"{"body":{}}"#)) == "recording-1")
+        #expect(TDFContentKeyDelegate<FairPlayManifest>.contentID(for: Self.manifest(policyJSON: #"{"uuid":""}"#)) == "recording-1")
+    }
+}
