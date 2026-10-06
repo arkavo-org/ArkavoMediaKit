@@ -16,15 +16,26 @@ enum SyntheticMovie {
     }
 
     /// A 320x180, 30 fps H.264 `.mov` of `frames` solid-colour frames.
-    static func make(in dir: URL, frames: Int = 60) async throws -> URL {
+    /// - Parameters:
+    ///   - keyFrameInterval: The most frames between sync samples, when set.
+    ///   - moovFirst: Writes the movie header before the media data, so the
+    ///     tracks still load after the file is truncated.
+    static func make(
+        in dir: URL, frames: Int = 30, keyFrameInterval: Int? = nil, moovFirst: Bool = false
+    ) async throws -> URL {
         let url = dir.appendingPathComponent("synthetic-\(UUID().uuidString).mov")
         let width = 320, height = 180, fps: Int32 = 30
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+        writer.shouldOptimizeForNetworkUse = moovFirst
+        var settings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
-        ])
+        ]
+        if let keyFrameInterval {
+            settings[AVVideoCompressionPropertiesKey] = [AVVideoMaxKeyFrameIntervalKey: keyFrameInterval]
+        }
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
         input.expectsMediaDataInRealTime = false
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: input,
@@ -53,14 +64,9 @@ enum SyntheticMovie {
 
             CVPixelBufferLockBaseAddress(buffer, [])
             if let base = CVPixelBufferGetBaseAddress(buffer) {
-                let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
-                let pixel: [UInt8] = [UInt8(frame * 4 % 256), 0x60, UInt8(255 - frame * 4 % 256), 0xFF] // BGRA
-                for row in 0 ..< height {
-                    let rowPointer = base.advanced(by: row * bytesPerRow).assumingMemoryBound(to: UInt8.self)
-                    for x in 0 ..< width {
-                        for channel in 0 ..< 4 { rowPointer[x * 4 + channel] = pixel[channel] }
-                    }
-                }
+                // One BGRA pixel, repeated over the whole buffer (row padding included).
+                var pixel: [UInt8] = [UInt8(frame * 4 % 256), 0x60, UInt8(255 - frame * 4 % 256), 0xFF]
+                memset_pattern4(base, &pixel, CVPixelBufferGetBytesPerRow(buffer) * height)
             }
             CVPixelBufferUnlockBaseAddress(buffer, [])
 
