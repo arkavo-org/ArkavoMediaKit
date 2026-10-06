@@ -97,6 +97,7 @@ public actor FMP4RecordingProtectionService {
 
         let dimensions = try await videoTrack.load(.naturalSize)
         let timescale = try await videoTrack.load(.naturalTimeScale)
+        let trackTimeRange = try await videoTrack.load(.timeRange)
 
         // Extract SPS/PPS and NAL length size from format description
         guard let h264Params = extractParameterSets(from: formatDesc) else {
@@ -139,6 +140,8 @@ public actor FMP4RecordingProtectionService {
 
         var samples: [FMP4Writer.Sample] = []
         var totalDuration: UInt64 = 0
+        var readDuration = CMTime.zero
+        var longestSample = CMTime.zero
 
         while let sampleBuffer = output.copyNextSampleBuffer() {
             guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
@@ -178,6 +181,8 @@ public actor FMP4RecordingProtectionService {
             // Get timing info
             let duration = CMSampleBufferGetDuration(sampleBuffer)
             let durationValue = UInt32(duration.value * Int64(timescale) / Int64(duration.timescale))
+            readDuration = readDuration + duration
+            longestSample = max(longestSample, duration)
 
             // Calculate Composition Time Offset (CTS) for B-frame support
             // CTS = PTS - DTS (tells decoder when to display the frame relative to decode time)
@@ -218,6 +223,11 @@ public actor FMP4RecordingProtectionService {
         }
         guard !samples.isEmpty else {
             throw FMP4ProtectionError.readFailed("no video samples")
+        }
+        // On a truncated file the reader can also finish .completed short of the end.
+        guard readDuration + longestSample >= trackTimeRange.duration else {
+            throw FMP4ProtectionError.readFailed(
+                "read \(readDuration.seconds) s of a \(trackTimeRange.duration.seconds) s track")
         }
 
         // 7. Generate media segments (6 second chunks)
