@@ -266,11 +266,8 @@ public actor FMP4RecordingProtectionService {
 
         // 8. Generate HLS playlist
         print("📋 Generating HLS playlist...")
-        // Segments end at sync samples, not at 6 s. RFC 8216: every EXTINF, rounded
-        // to the nearest integer, at most the target.
-        let longestSegment = segments.map(\.duration).max() ?? 6
         let playlistConfig = FMP4HLSGenerator.PlaylistConfig(
-            targetDuration: max(1, Int(longestSegment.rounded())),
+            targetDuration: Self.targetDuration(forSegmentDurations: segments.map(\.duration)),
             playlistType: .vod,
             initSegmentURI: "init.mp4"
         )
@@ -356,6 +353,13 @@ public actor FMP4RecordingProtectionService {
             ranges.append(start ..< samples.count)
         }
         return ranges
+    }
+
+    /// `#EXT-X-TARGETDURATION` for segments that end at sync samples, not at
+    /// 6 s. RFC 8216: every EXTINF, rounded to the nearest integer, at most the
+    /// target; at least 1.
+    static func targetDuration(forSegmentDurations durations: [Double]) -> Int {
+        max(1, Int((durations.max() ?? 0).rounded()))
     }
 
     // MARK: - Private Helpers

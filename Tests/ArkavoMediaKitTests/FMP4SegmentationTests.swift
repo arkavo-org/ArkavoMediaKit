@@ -143,29 +143,13 @@ struct FMP4SegmentationTests {
         }
     }
 
-    /// A segment of 6.03 s needs a target of 6, not 7.
-    @Test("the target duration is the longest segment rounded to the nearest second")
-    func targetDurationRoundsToNearest() async throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("fmp4-target-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let movie = try await SyntheticMovie.make(in: dir, frames: 400, keyFrameInterval: 181)
-        let service = FMP4RecordingProtectionService(
-            kasURL: URL(string: "https://platform.arkavo.net")!, kasPublicKeyPEM: try TestKASKeyPair().spkiPublicKeyPEM)
-        let archive = try await service.protectVideo(videoURL: movie, assetID: "target")
-        let zip = try Archive(data: archive, accessMode: .read)
-        var playlistData = Data()
-        _ = try zip.extract(try #require(zip["playlist.m3u8"])) { playlistData.append($0) }
-        let lines = String(decoding: playlistData, as: UTF8.self).components(separatedBy: .newlines)
-        let target = try #require(lines.lazy.compactMap { line in
-            line.hasPrefix("#EXT-X-TARGETDURATION:") ? Int(line.dropFirst("#EXT-X-TARGETDURATION:".count)) : nil
-        }.first)
-        let longest = try #require(lines.compactMap { line -> Double? in
-            guard line.hasPrefix("#EXTINF:") else { return nil }
-            return Double(line.dropFirst("#EXTINF:".count).prefix { $0 != "," })
-        }.max())
-        #expect(longest.rounded() != longest.rounded(.up), "the source must give a segment just over a whole second (\(longest))")
-        #expect(target == Int(longest.rounded()), "target \(target) for a longest segment of \(longest) s")
+    @Test("the target duration is the longest segment rounded to the nearest second, at least 1")
+    func targetDurationRoundsToNearest() {
+        #expect(FMP4RecordingProtectionService.targetDuration(forSegmentDurations: [6.0, 6.033, 4.2]) == 6)
+        #expect(FMP4RecordingProtectionService.targetDuration(forSegmentDurations: [6.5, 2]) == 7)
+        #expect(FMP4RecordingProtectionService.targetDuration(forSegmentDurations: [7.972]) == 8)
+        #expect(FMP4RecordingProtectionService.targetDuration(forSegmentDurations: [0.33]) == 1)
+        #expect(FMP4RecordingProtectionService.targetDuration(forSegmentDurations: []) == 1)
     }
 
     @Test("a clip under half a second still declares a target duration of 1")
