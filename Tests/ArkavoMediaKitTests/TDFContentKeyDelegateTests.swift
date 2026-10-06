@@ -400,3 +400,40 @@ struct TDFContentKeyDelegateIntegrationTests {
         #expect(delegateWithoutAuth != nil)
     }
 }
+
+// MARK: - Key-request manifest
+
+/// The key request's `tdfManifest` is the archive's own manifest when the
+/// caller supplies it, so the policy and binding reach the license service.
+@Suite("Key-request manifest")
+struct KeyRequestManifestTests {
+    @Test("an archive manifest is sent verbatim")
+    func verbatim() throws {
+        let raw = Data(#"{"encryptionInformation":{"policy":"eyJ9","keyAccess":[{"type":"wrapped"}]}}"#.utf8)
+        let manifest = FairPlayManifest(
+            assetID: "6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d", kasURL: "https://platform.arkavo.net",
+            wrappedKey: "d2s=", algorithm: "AES-128-CBC", iv: "aXY=", tdfManifestJSON: raw)
+        #expect(try TDFContentKeyDelegate<FairPlayManifest>.keyRequestManifestData(for: manifest) == raw)
+    }
+
+    @Test("without an archive manifest the legacy reconstruction is sent")
+    func reconstructed() throws {
+        let manifest = FairPlayManifest(
+            assetID: "a", kasURL: "https://platform.arkavo.net",
+            wrappedKey: "d2s=", algorithm: "AES-128-CBC", iv: "aXY=")
+        let data = try TDFContentKeyDelegate<FairPlayManifest>.keyRequestManifestData(for: manifest)
+        let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let info = try #require(json["encryptionInformation"] as? [String: Any])
+        let kao = try #require((info["keyAccess"] as? [[String: Any]])?.first)
+        #expect(kao["wrappedKey"] as? String == "d2s=")
+        #expect(kao["url"] as? String == "https://platform.arkavo.net")
+    }
+
+    @Test("conformers that predate tdfManifestJSON default to nil")
+    func defaultNil() {
+        struct Legacy: FairPlayManifestProtocol {
+            let assetID = "a", kasURL = "k", wrappedKey = "w", algorithm = "x", iv = "i"
+        }
+        #expect(Legacy().tdfManifestJSON == nil)
+    }
+}

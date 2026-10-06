@@ -57,12 +57,6 @@ public final class CBCSEncryptor {
         self.iv = iv
         self.cryptBlocks = cryptBlocks
         self.skipBlocks = skipBlocks
-
-        // Debug: Log encryption key for verification
-        if CBCSDebugConfig.isVerboseLoggingEnabled {
-            print("🔐 CBCSEncryptor initialized with key (hex): \(key.map { String(format: "%02x", $0) }.joined())")
-            print("🔐 CBCSEncryptor IV (hex): \(iv.map { String(format: "%02x", $0) }.joined())")
-        }
     }
 
     // MARK: - Video Encryption (H.264/H.265)

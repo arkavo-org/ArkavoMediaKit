@@ -98,6 +98,14 @@ public protocol FairPlayManifestProtocol: Sendable {
     var wrappedKey: String { get }
     var algorithm: String { get }
     var iv: String { get }
+    /// The archive's own `manifest.json` bytes. When present they are sent as
+    /// the key request's `tdfManifest` verbatim, so the full policy and its
+    /// binding reach the license service (required by arks after PR #75).
+    var tdfManifestJSON: Data? { get }
+}
+
+public extension FairPlayManifestProtocol {
+    var tdfManifestJSON: Data? { nil }
 }
 
 // MARK: - Default FairPlay Manifest Implementation
@@ -109,19 +117,22 @@ public struct FairPlayManifest: FairPlayManifestProtocol, Sendable {
     public let wrappedKey: String
     public let algorithm: String
     public let iv: String
+    public let tdfManifestJSON: Data?
 
     public init(
         assetID: String,
         kasURL: String,
         wrappedKey: String,
         algorithm: String,
-        iv: String
+        iv: String,
+        tdfManifestJSON: Data? = nil
     ) {
         self.assetID = assetID
         self.kasURL = kasURL
         self.wrappedKey = wrappedKey
         self.algorithm = algorithm
         self.iv = iv
+        self.tdfManifestJSON = tdfManifestJSON
     }
 }
 
@@ -469,26 +480,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         prepareRequest(&request)
 
-        // Encode manifest as base64 JSON
-        let manifestJSON: [String: Any] = [
-            "encryptionInformation": [
-                "type": "split",
-                "keyAccess": [[
-                    "type": "wrapped",
-                    "url": manifest.kasURL,
-                    "protocol": "kas",
-                    "wrappedKey": manifest.wrappedKey,
-                ]],
-                "method": [
-                    "algorithm": manifest.algorithm,
-                    "iv": manifest.iv,
-                ],
-            ],
-        ]
-
-        guard let manifestData = try? JSONSerialization.data(withJSONObject: manifestJSON) else {
-            throw FairPlayError.manifestEncodingFailed("Failed to serialize manifest")
-        }
+        let manifestData = try Self.keyRequestManifestData(for: manifest)
         let manifestBase64 = manifestData.base64EncodedString()
 
         FairPlayDebug.log("  Building key-request payload:")
@@ -546,6 +538,32 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
 
         FairPlayDebug.log("  ✅ CKC decoded: \(ckcData.count) bytes")
         return ckcData
+    }
+
+    /// The `tdfManifest` sent with a key request: the archive's own manifest
+    /// when the caller supplied it, else the legacy reconstruction (no policy,
+    /// which the post-#75 license service refuses).
+    static func keyRequestManifestData(for manifest: Manifest) throws -> Data {
+        if let raw = manifest.tdfManifestJSON { return raw }
+        let manifestJSON: [String: Any] = [
+            "encryptionInformation": [
+                "type": "split",
+                "keyAccess": [[
+                    "type": "wrapped",
+                    "url": manifest.kasURL,
+                    "protocol": "kas",
+                    "wrappedKey": manifest.wrappedKey,
+                ]],
+                "method": [
+                    "algorithm": manifest.algorithm,
+                    "iv": manifest.iv,
+                ],
+            ],
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: manifestJSON) else {
+            throw FairPlayError.manifestEncodingFailed("Failed to serialize manifest")
+        }
+        return data
     }
 }
 
