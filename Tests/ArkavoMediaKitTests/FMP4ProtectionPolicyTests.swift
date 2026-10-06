@@ -89,6 +89,29 @@ struct FMP4ProtectionPolicyTests {
         }
     }
 
+    /// A source that stops yielding samples part-way (a truncated file, a read
+    /// error) must fail the protect, not produce a short archive.
+    @Test("a source that fails part-way through reading is refused")
+    func truncatedSourceIsRefused() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("fmp4-truncated-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let movie = try await SyntheticMovie.make(in: dir, frames: 90, moovFirst: true)
+        let handle = try FileHandle(forWritingTo: movie)
+        try handle.truncate(atOffset: try handle.seekToEnd() * 6 / 10)
+        try handle.close()
+
+        let service = FMP4RecordingProtectionService(
+            kasURL: Self.kasURL, kasPublicKeyPEM: try TestKASKeyPair().spkiPublicKeyPEM)
+        let error = await #expect(throws: FMP4ProtectionError.self) {
+            _ = try await service.protectVideo(videoURL: movie, assetID: "a", policyJSON: Data(Self.tierPolicy.utf8))
+        }
+        guard case .readFailed = error else {
+            Issue.record("expected readFailed, got \(String(describing: error))")
+            return
+        }
+    }
+
     /// Nothing the protect path prints, from the service or anything it calls,
     /// may carry the content key or IV, however formatted. Runs in a Debug
     /// build, where the verbose logging is on.

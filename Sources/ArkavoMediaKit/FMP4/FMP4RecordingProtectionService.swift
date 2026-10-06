@@ -133,7 +133,9 @@ public actor FMP4RecordingProtectionService {
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
         reader.add(output)
-        reader.startReading()
+        guard reader.startReading() else {
+            throw FMP4ProtectionError.readFailed(reader.error?.localizedDescription ?? "reader did not start")
+        }
 
         var samples: [FMP4Writer.Sample] = []
         var totalDuration: UInt64 = 0
@@ -209,6 +211,13 @@ public actor FMP4RecordingProtectionService {
             ))
 
             totalDuration += UInt64(durationValue)
+        }
+        // copyNextSampleBuffer() returns nil on failure as well as at the end.
+        guard reader.status == .completed else {
+            throw FMP4ProtectionError.readFailed(reader.error?.localizedDescription ?? "reader status \(reader.status.rawValue)")
+        }
+        guard !samples.isEmpty else {
+            throw FMP4ProtectionError.readFailed("no video samples")
         }
 
         // 7. Generate media segments (6 second chunks)
@@ -580,6 +589,7 @@ public enum FMP4ProtectionError: Error, LocalizedError {
     case encodingFailed(String)
     case packagingFailed(String)
     case manifestParsingFailed
+    case readFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -595,6 +605,8 @@ public enum FMP4ProtectionError: Error, LocalizedError {
             "TDF packaging failed: \(reason)"
         case .manifestParsingFailed:
             "Failed to parse manifest JSON"
+        case let .readFailed(reason):
+            "Reading the source video failed: \(reason)"
         }
     }
 }
