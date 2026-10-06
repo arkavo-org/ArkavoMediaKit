@@ -37,10 +37,49 @@ struct FairPlayPolicyTests {
         #expect((object["body"] as? [String: Any])?.isEmpty == true)
     }
 
-    @Test("uuid(ofPolicyJSON:) returns the uuid verbatim — arks compares it as written")
-    func policyUUIDVerbatim() throws {
-        let json = Data(#"{"uuid":"3F1C9E2A-7B4D-4E8F-9A21-5C6D7E8F9A0B","body":{}}"#.utf8)
-        #expect(try FairPlayPolicy.uuid(ofPolicyJSON: json) == "3F1C9E2A-7B4D-4E8F-9A21-5C6D7E8F9A0B")
+    @Test("uuid(ofPolicyJSON:) returns a lower-case uuid verbatim and refuses upper case")
+    func policyUUIDLowerCaseOnly() throws {
+        let lower = Data(#"{"uuid":"3f1c9e2a-7b4d-4e8f-9a21-5c6d7e8f9a0b","body":{}}"#.utf8)
+        #expect(try FairPlayPolicy.uuid(ofPolicyJSON: lower) == "3f1c9e2a-7b4d-4e8f-9a21-5c6d7e8f9a0b")
+        // arks compares the key URI with the uuid verbatim; package profile v1 wants lower case.
+        #expect(throws: FairPlayPolicy.Error.invalidUUID("3F1C9E2A-7B4D-4E8F-9A21-5C6D7E8F9A0B")) {
+            try FairPlayPolicy.uuid(ofPolicyJSON: Data(#"{"uuid":"3F1C9E2A-7B4D-4E8F-9A21-5C6D7E8F9A0B","body":{}}"#.utf8))
+        }
+    }
+
+    /// arks parses the policy with serde_json: BOM-less UTF-8 only, and the
+    /// last of duplicate keys wins. Anything it would read differently from
+    /// JSONSerialization is refused before it is bound into an archive.
+    @Test("uuid(ofPolicyJSON:) refuses a BOM and UTF-16")
+    func policyUUIDRequiresPlainUTF8() throws {
+        let policy = #"{"uuid":"3f1c9e2a-7b4d-4e8f-9a21-5c6d7e8f9a0b","body":{}}"#
+        #expect(throws: FairPlayPolicy.Error.notJSONObject) {
+            try FairPlayPolicy.uuid(ofPolicyJSON: Data([0xEF, 0xBB, 0xBF]) + Data(policy.utf8))
+        }
+        for encoding in [String.Encoding.utf16, .utf16LittleEndian, .utf16BigEndian, .utf32] {
+            let data = try #require(policy.data(using: encoding))
+            #expect(throws: FairPlayPolicy.Error.notJSONObject, "\(encoding)") {
+                try FairPlayPolicy.uuid(ofPolicyJSON: data)
+            }
+        }
+        #expect(try FairPlayPolicy.uuid(ofPolicyJSON: Data((" \n" + policy).utf8)) == "3f1c9e2a-7b4d-4e8f-9a21-5c6d7e8f9a0b")
+    }
+
+    @Test("uuid(ofPolicyJSON:) refuses duplicate keys at any depth, however escaped")
+    func policyUUIDRefusesDuplicateKeys() throws {
+        let a = "3f1c9e2a-7b4d-4e8f-9a21-5c6d7e8f9a0b", b = "6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+        #expect(throws: FairPlayPolicy.Error.duplicateKey("uuid")) {
+            try FairPlayPolicy.uuid(ofPolicyJSON: Data(#"{"uuid":"\#(a)","body":{},"uuid":"\#(b)"}"#.utf8))
+        }
+        #expect(throws: FairPlayPolicy.Error.duplicateKey("uuid")) {
+            try FairPlayPolicy.uuid(ofPolicyJSON: Data(#"{"uuid":"\#(a)","uuid":"\#(b)","body":{}}"#.utf8))
+        }
+        #expect(throws: FairPlayPolicy.Error.duplicateKey("dissem")) {
+            try FairPlayPolicy.uuid(ofPolicyJSON: Data(#"{"uuid":"\#(a)","body":{"dissem":[],"dissem":["x"]}}"#.utf8))
+        }
+        // The same key in sibling objects, and key-like strings in values, are fine.
+        let siblings = #"{"uuid":"\#(a)","body":{"dataAttributes":[{"attribute":"uuid"},{"attribute":"b\",\"uuid"}],"dissem":[]}}"#
+        #expect(try FairPlayPolicy.uuid(ofPolicyJSON: Data(siblings.utf8)) == a)
     }
 
     @Test("uuid(ofPolicyJSON:) rejects missing, non-UUID and non-object policies")

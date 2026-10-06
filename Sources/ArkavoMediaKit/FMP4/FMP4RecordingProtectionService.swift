@@ -35,7 +35,8 @@ public actor FMP4RecordingProtectionService {
     ///   - videoURL: URL to the source video file
     ///   - assetID: Unique asset identifier, recorded in the fMP4 metadata and `meta`
     ///   - policyJSON: TDF policy JSON (`{"uuid", "body": {"dataAttributes", "dissem"}}`).
-    ///     Its `uuid` must be a UUID: it becomes the FairPlay content-key id
+    ///     BOM-less UTF-8 without duplicate keys; its `uuid` must be a lower-case
+    ///     UUID: it becomes the FairPlay content-key id
     ///     (`skd://<uuid>` in the playlist). Nil embeds `FairPlayPolicy.placeholderJSON()`,
     ///     which the post-#75 license service refuses (no data attributes).
     /// - Returns: TDF ZIP archive data containing manifest, playlist, init.mp4, and encrypted segments
