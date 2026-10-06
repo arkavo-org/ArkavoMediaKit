@@ -280,6 +280,7 @@ public final class TDFManifestBuilder {
     // MARK: - Manifest Building
 
     /// Build TDF manifest for FairPlay content key delivery
+    @available(*, deprecated, message: "Sends a manifest with no policy, which arks refuses since PR #75. Package with FMP4RecordingProtectionService and play with TDFContentKeyDelegate given the archive manifest.")
     public func buildManifest(contentKey: Data, iv: Data, assetID: String) async throws -> Manifest {
         let wrappedKey = try await wrapKey(contentKey)
 
@@ -299,6 +300,7 @@ public final class TDFManifestBuilder {
     }
 
     /// Build TDF manifest with pre-wrapped key
+    @available(*, deprecated, message: "Sends a manifest with no policy, which arks refuses since PR #75. Package with FMP4RecordingProtectionService and play with TDFContentKeyDelegate given the archive manifest.")
     public func buildManifest(wrappedKey: Data, iv: Data) -> Manifest {
         let keyAccess = KeyAccess(
             url: kasURL.absoluteString,
@@ -392,8 +394,9 @@ extension TDFManifestBuilder {
     /// - Parameters:
     ///   - contentKey: 16-byte AES-128 content encryption key
     ///   - iv: 16-byte initialization vector
-    ///   - assetID: Asset identifier (used in skd:// URI)
+    ///   - assetID: Unused; the manifest carries no policy and so no key id
     /// - Returns: JSON data ready to send to /media/v1/key-request
+    @available(*, deprecated, message: "Sends a manifest with no policy, which arks refuses since PR #75. Package with FMP4RecordingProtectionService and play with TDFContentKeyDelegate given the archive manifest.")
     public func buildFairPlayKeyRequest(
         contentKey: Data,
         iv: Data,
@@ -404,6 +407,7 @@ extension TDFManifestBuilder {
     }
 
     /// Create manifest data from wrapped key (when key is already wrapped)
+    @available(*, deprecated, message: "Sends a manifest with no policy, which arks refuses since PR #75. Package with FMP4RecordingProtectionService and play with TDFContentKeyDelegate given the archive manifest.")
     public func buildFairPlayKeyRequestFromWrappedKey(
         wrappedKey: Data,
         iv: Data
