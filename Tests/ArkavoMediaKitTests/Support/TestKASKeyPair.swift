@@ -19,10 +19,10 @@ struct TestKASKeyPair {
     /// The same public key as a SubjectPublicKeyInfo PEM — the form a real KAS serves.
     let spkiPublicKeyPEM: String
 
-    init() throws {
+    init(bits: Int = 2048) throws {
         let attributes: [String: Any] = [
             kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
-            kSecAttrKeySizeInBits as String: 2048,
+            kSecAttrKeySizeInBits as String: bits,
             kSecAttrIsPermanent as String: false,
         ]
         var error: Unmanaged<CFError>?

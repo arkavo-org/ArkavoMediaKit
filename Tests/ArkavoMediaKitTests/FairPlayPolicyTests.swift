@@ -103,6 +103,36 @@ struct FairPlayPolicyTests {
         _ = try builder.publicKey(fromPEM: kas.spkiPublicKeyPEM)
     }
 
+    @Test("publicKey(fromPEM:) refuses an RSA key under 2048 bits, as the other loaders do")
+    func publicKeyRefusesWeakKey() throws {
+        let weak = try TestKASKeyPair(bits: 1024)
+        let builder = TDFManifestBuilder(kasURL: URL(string: "https://platform.arkavo.net")!)
+        for pem in [weak.publicKeyPEM, weak.spkiPublicKeyPEM] {
+            let error = #expect(throws: TDFManifestBuilder.TDFError.self) {
+                _ = try builder.publicKey(fromPEM: pem)
+            }
+            guard case .weakPublicKey(bits: 1024) = error else {
+                Issue.record("expected weakPublicKey(bits: 1024), got \(String(describing: error))")
+                continue
+            }
+        }
+    }
+
+    /// RFC 7468 lets text surround the block and whitespace sit in the body;
+    /// `openssl pkey -pubin -text` output is one example.
+    @Test("publicKey(fromPEM:) reads PEM inside other text, indented, with trailing spaces")
+    func publicKeyToleratesPEMLayout() throws {
+        let kas = try TestKASKeyPair()
+        let builder = TDFManifestBuilder(kasURL: URL(string: "https://platform.arkavo.net")!)
+        for pem in [kas.publicKeyPEM, kas.spkiPublicKeyPEM] {
+            let lines = pem.components(separatedBy: .newlines).filter { !$0.isEmpty }
+            let laidOut = "Public-Key: (2048 bit)\nModulus:\n    00:c3:5e\n"
+                + lines.map { "    \($0)  " }.joined(separator: "\n")
+                + "\nExponent: 65537 (0x10001)\n"
+            _ = try builder.publicKey(fromPEM: laidOut)
+        }
+    }
+
     @Test("manifest carries the policy, one wrapped key and a binding arks accepts")
     func manifestPassesArksCheck() throws {
         let kas = try TestKASKeyPair()

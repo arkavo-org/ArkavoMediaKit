@@ -206,25 +206,14 @@ public final class TDFManifestBuilder {
     }
 
     private func pemToSecKey(_ pem: String) throws -> SecKey {
-        // Remove PEM headers
-        let keyString = pem
-            .replacingOccurrences(of: "-----BEGIN PUBLIC KEY-----", with: "")
-            .replacingOccurrences(of: "-----END PUBLIC KEY-----", with: "")
-            .replacingOccurrences(of: "-----BEGIN RSA PUBLIC KEY-----", with: "")
-            .replacingOccurrences(of: "-----END RSA PUBLIC KEY-----", with: "")
-            .replacingOccurrences(of: "\n", with: "")
-            .replacingOccurrences(of: "\r", with: "")
-            .trimmingCharacters(in: .whitespaces)
-
-        guard let keyData = Data(base64Encoded: keyString) else {
+        guard let keyData = Data(base64Encoded: Self.pemBody(pem), options: .ignoreUnknownCharacters) else {
             throw TDFError.invalidPublicKeyFormat
         }
 
-        // Create SecKey from DER data
+        // Create SecKey from DER data (SPKI or PKCS#1)
         let attributes: [String: Any] = [
             kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
             kSecAttrKeyClass as String: kSecAttrKeyClassPublic,
-            kSecAttrKeySizeInBits as String: 2048
         ]
 
         var error: Unmanaged<CFError>?
@@ -232,7 +221,26 @@ public final class TDFManifestBuilder {
             throw TDFError.invalidPublicKeyFormat
         }
 
+        // SecKeyCreateWithData takes the size from the key, whatever the attributes say.
+        let bits = (SecKeyCopyAttributes(secKey) as? [String: Any])?[kSecAttrKeySizeInBits as String] as? Int
+            ?? SecKeyGetBlockSize(secKey) * 8
+        guard bits >= 2048 else {
+            throw TDFError.weakPublicKey(bits: bits)
+        }
+
         return secKey
+    }
+
+    /// The base64 between a `PUBLIC KEY` or `RSA PUBLIC KEY` BEGIN line and its
+    /// END line. RFC 7468 lets text surround the block and whitespace sit in
+    /// the body. Text with no BEGIN line is taken as bare base64.
+    private static func pemBody(_ pem: String) -> String {
+        guard let begin = pem.range(of: "-----BEGIN ") else { return pem }
+        guard let labelEnd = pem.range(of: "-----", range: begin.upperBound ..< pem.endIndex),
+              ["PUBLIC KEY", "RSA PUBLIC KEY"].contains(pem[begin.upperBound ..< labelEnd.lowerBound]),
+              let end = pem.range(of: "-----END ", range: labelEnd.upperBound ..< pem.endIndex)
+        else { return "" }
+        return String(pem[labelEnd.upperBound ..< end.lowerBound])
     }
 
     /// Parse a KAS RSA public key from PEM (`PUBLIC KEY` or `RSA PUBLIC KEY` armor).
@@ -354,6 +362,7 @@ public final class TDFManifestBuilder {
         case unsupportedAlgorithm
         case keyWrappingFailed
         case manifestSerializationFailed
+        case weakPublicKey(bits: Int)
 
         public var errorDescription: String? {
             switch self {
@@ -369,6 +378,8 @@ public final class TDFManifestBuilder {
                 return "Failed to wrap content key"
             case .manifestSerializationFailed:
                 return "Failed to serialize TDF manifest"
+            case let .weakPublicKey(bits):
+                return "KAS RSA public key is \(bits) bits; at least 2048 required"
             }
         }
     }
