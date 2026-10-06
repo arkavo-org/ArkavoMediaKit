@@ -22,15 +22,18 @@ struct FMP4ProtectionPolicyTests {
         return out
     }
 
-    private func protect(policyJSON: Data?) async throws -> (files: [String: Data], kas: TestKASKeyPair) {
+    /// Protects a synthetic movie; `output` is everything printed to stdout meanwhile.
+    private func protect(policyJSON: Data?) async throws -> (files: [String: Data], kas: TestKASKeyPair, output: String) {
         let kas = try TestKASKeyPair()
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("fmp4-policy-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let movie = try await SyntheticMovie.make(in: dir)
         let service = FMP4RecordingProtectionService(kasURL: Self.kasURL, kasPublicKeyPEM: kas.spkiPublicKeyPEM)
-        let archive = try await service.protectVideo(videoURL: movie, assetID: "recording-asset-1", policyJSON: policyJSON)
-        return (try entries(archive), kas)
+        let (archive, output) = try await StdoutCapture.capture {
+            try await service.protectVideo(videoURL: movie, assetID: "recording-asset-1", policyJSON: policyJSON)
+        }
+        return (try entries(archive), kas, output)
     }
 
     private func encryptionInformation(_ files: [String: Data]) throws -> [String: Any] {
@@ -41,7 +44,7 @@ struct FMP4ProtectionPolicyTests {
 
     @Test("tier policy is embedded, bound, and names the skd:// key URI")
     func tierPolicyArchive() async throws {
-        let (files, kas) = try await protect(policyJSON: Data(Self.tierPolicy.utf8))
+        let (files, kas, _) = try await protect(policyJSON: Data(Self.tierPolicy.utf8))
         let info = try encryptionInformation(files)
         let policy = try #require(info["policy"] as? String)
         #expect(Data(base64Encoded: policy) == Data(Self.tierPolicy.utf8))
@@ -65,7 +68,7 @@ struct FMP4ProtectionPolicyTests {
 
     @Test("no policy → placeholder policy whose uuid is the key URI")
     func placeholderArchive() async throws {
-        let (files, _) = try await protect(policyJSON: nil)
+        let (files, _, _) = try await protect(policyJSON: nil)
         let info = try encryptionInformation(files)
         let policyBase64 = try #require(info["policy"] as? String)
         let policyJSON = try #require(Data(base64Encoded: policyBase64))
@@ -86,19 +89,35 @@ struct FMP4ProtectionPolicyTests {
         }
     }
 
-    /// No log line on the protect path may reference the key or IV values,
-    /// however they are formatted. A source scan, since the logs are `print`s.
-    @Test("the protect path never logs the content key or IV")
-    func serviceSourceHasNoKeyPrint() throws {
-        let source = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("Sources/ArkavoMediaKit/FMP4/FMP4RecordingProtectionService.swift")
-        let lines = try String(contentsOf: source, encoding: .utf8).components(separatedBy: .newlines)
-        let logLines = lines.filter { $0.contains("print(") || $0.contains("FairPlayDebug.") || $0.contains("os_log") }
-        #expect(!logLines.isEmpty, "the scan must see the service's progress logs")
-        // Simple (ASCII) word boundaries: Unicode ones treat `contentKey.base64…` as one word.
-        let keyIdentifier = /\b(contentKey|constantIV|encryptor)\b/.wordBoundaryKind(.simple)
-        let leaking = logLines.filter { $0.contains(keyIdentifier) }
-        #expect(leaking.isEmpty, "log lines referencing key material: \(leaking)")
+    /// Nothing the protect path prints, from the service or anything it calls,
+    /// may carry the content key or IV, however formatted. Runs in a Debug
+    /// build, where the verbose logging is on.
+    @Test("the protect path never prints the content key or IV")
+    func protectPathPrintsNoKeyMaterial() async throws {
+        let (files, kas, output) = try await protect(policyJSON: Data(Self.tierPolicy.utf8))
+        #expect(output.contains("Wrapping content key"), "the capture must see the service's progress logs")
+        let info = try encryptionInformation(files)
+        let kao = try #require((info["keyAccess"] as? [[String: Any]])?.first)
+        let wrappedBase64 = try #require(kao["wrappedKey"] as? String)
+        let dek = try kas.unwrap(try #require(Data(base64Encoded: wrappedBase64)))
+        let ivBase64 = try #require((info["method"] as? [String: Any])?["iv"] as? String)
+        let iv = try #require(Data(base64Encoded: ivBase64))
+        for (name, secret) in [("content key", dek), ("IV", iv)] {
+            for (format, text) in Self.textForms(of: secret) {
+                #expect(!output.contains(text), "stdout carries the \(name) as \(format)")
+            }
+        }
+    }
+
+    /// The ways a log line could plausibly render `bytes`.
+    private static func textForms(of bytes: Data) -> [(format: String, text: String)] {
+        let hex = bytes.map { String(format: "%02x", $0) }
+        return [
+            ("hex", hex.joined()),
+            ("upper-case hex", hex.joined().uppercased()),
+            ("spaced hex", hex.joined(separator: " ")),
+            ("upper-case spaced hex", hex.joined(separator: " ").uppercased()),
+            ("base64", bytes.base64EncodedString()),
+        ]
     }
 }
