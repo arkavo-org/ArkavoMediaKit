@@ -407,13 +407,54 @@ struct TDFContentKeyDelegateIntegrationTests {
 /// caller supplies it, so the policy and binding reach the license service.
 @Suite("Key-request manifest")
 struct KeyRequestManifestTests {
-    @Test("an archive manifest is sent verbatim")
-    func verbatim() throws {
-        let raw = Data(#"{"encryptionInformation":{"policy":"eyJ9","keyAccess":[{"type":"wrapped"}]}}"#.utf8)
-        let manifest = FairPlayManifest(
+    private static func archiveManifest(_ raw: Data) -> FairPlayManifest {
+        FairPlayManifest(
             assetID: "6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d", kasURL: "https://platform.arkavo.net",
             wrappedKey: "d2s=", algorithm: "AES-128-CBC", iv: "aXY=", tdfManifestJSON: raw)
-        #expect(try TDFContentKeyDelegate<FairPlayManifest>.keyRequestManifestData(for: manifest) == raw)
+    }
+
+    /// arks reads only the policy and the key access object's type, url,
+    /// wrappedKey and policyBinding; the per-segment metadata grows with the
+    /// recording (~32 B a segment) and stays home.
+    @Test("an archive manifest is sent without meta or encryptedMetadata, the rest unchanged")
+    func trimmed() throws {
+        let segments = (0 ..< 1200).map { "segment\($0).m4s" }
+        let metadata = try JSONSerialization.data(withJSONObject: ["segmentFilenames": segments]).base64EncodedString()
+        let raw = try JSONSerialization.data(withJSONObject: [
+            "encryptionInformation": [
+                "type": "split",
+                "policy": "eyJ1dWlkIjoiYSJ9/+==",
+                "method": ["algorithm": "AES-128-CBC", "iv": "aXY=", "isStreamable": true],
+                "keyAccess": [[
+                    "type": "wrapped", "url": "https://platform.arkavo.net", "protocol": "kas",
+                    "wrappedKey": "ab/c+d==", "policyBinding": ["alg": "HS256", "hash": "x/y+z="],
+                    "encryptedMetadata": metadata,
+                ]],
+            ],
+            "meta": ["assetId": "recording-1", "contentKeyId": "a"],
+        ] as [String: Any])
+        let sent = try TDFContentKeyDelegate<FairPlayManifest>.keyRequestManifestData(for: Self.archiveManifest(raw))
+
+        let json = try #require(JSONSerialization.jsonObject(with: sent) as? [String: Any])
+        #expect(json["meta"] == nil)
+        let info = try #require(json["encryptionInformation"] as? [String: Any])
+        #expect(info["policy"] as? String == "eyJ1dWlkIjoiYSJ9/+==")
+        #expect(info["type"] as? String == "split")
+        #expect((info["method"] as? [String: Any])?["iv"] as? String == "aXY=")
+        let kao = try #require((info["keyAccess"] as? [[String: Any]])?.first)
+        #expect(kao["encryptedMetadata"] == nil)
+        #expect(kao["type"] as? String == "wrapped")
+        #expect(kao["url"] as? String == "https://platform.arkavo.net")
+        #expect(kao["wrappedKey"] as? String == "ab/c+d==")
+        #expect((kao["policyBinding"] as? [String: Any])?["hash"] as? String == "x/y+z=")
+        #expect(!String(decoding: sent, as: UTF8.self).contains(#"\/"#), "slashes stay unescaped")
+        #expect(sent.count < 1024, "\(sent.count) bytes sent for a 1200-segment archive")
+    }
+
+    @Test("an archive manifest that is not a JSON object is sent as is")
+    func unparseableSentAsIs() throws {
+        let raw = Data("not json".utf8)
+        #expect(try TDFContentKeyDelegate<FairPlayManifest>.keyRequestManifestData(for: Self.archiveManifest(raw)) == raw)
     }
 
     @Test("without an archive manifest the legacy reconstruction is sent")

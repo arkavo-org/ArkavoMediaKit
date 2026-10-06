@@ -101,8 +101,9 @@ public protocol FairPlayManifestProtocol: Sendable {
     var algorithm: String { get }
     var iv: String { get }
     /// The archive's own `manifest.json` bytes. When present they are sent as
-    /// the key request's `tdfManifest` verbatim, so the full policy and its
-    /// binding reach the license service (required by arks after PR #75).
+    /// the key request's `tdfManifest`, less `meta` and `encryptedMetadata`, so
+    /// the policy and its binding reach the license service (required by arks
+    /// after PR #75), and its policy uuid is the SPC content id.
     var tdfManifestJSON: Data? { get }
 }
 
@@ -556,7 +557,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
     /// when the caller supplied it, else the legacy reconstruction (no policy,
     /// which the post-#75 license service refuses).
     static func keyRequestManifestData(for manifest: Manifest) throws -> Data {
-        if let raw = manifest.tdfManifestJSON { return raw }
+        if let raw = manifest.tdfManifestJSON { return trimmedForKeyRequest(raw) }
         let manifestJSON: [String: Any] = [
             "encryptionInformation": [
                 "type": "split",
@@ -576,6 +577,22 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
             throw FairPlayError.manifestEncodingFailed("Failed to serialize manifest")
         }
         return data
+    }
+
+    /// The archive manifest without what no license service reads: top-level
+    /// `meta` and each key access object's `encryptedMetadata` (the fMP4
+    /// per-segment file list, ~32 B a segment). The policy, wrapped key and
+    /// binding strings are carried over unchanged. Bytes that are not a JSON
+    /// object are returned as they are.
+    private static func trimmedForKeyRequest(_ raw: Data) -> Data {
+        guard var json = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else { return raw }
+        json["meta"] = nil
+        if var info = json["encryptionInformation"] as? [String: Any],
+           let keyAccess = info["keyAccess"] as? [[String: Any]] {
+            info["keyAccess"] = keyAccess.map { $0.filter { $0.key != "encryptedMetadata" } }
+            json["encryptionInformation"] = info
+        }
+        return (try? JSONSerialization.data(withJSONObject: json, options: [.withoutEscapingSlashes])) ?? raw
     }
 }
 
