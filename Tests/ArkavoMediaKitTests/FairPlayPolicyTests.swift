@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OpenTDFKit
 import Testing
 @testable import ArkavoMediaKit
 
@@ -13,16 +14,11 @@ struct FairPlayPolicyTests {
     static let goldenPolicyBase64 = "eyJ1dWlkIjoiM2YxYzllMmEtN2I0ZC00ZThmLTlhMjEtNWM2ZDdlOGY5YTBiIiwiYm9keSI6eyJkYXRhQXR0cmlidXRlcyI6W3siYXR0cmlidXRlIjoiaHR0cHM6Ly9wYXRyZW9uLmFya2F2by5jb20vYXR0ci9jYW1wYWlnbi10aWVyL3ZhbHVlLzExMTExMTExX2dvbGQifV0sImRpc3NlbSI6W119fQ=="
     static let goldenBinding = "Ua5XgGqgNmxdle4TockmCZbQAIGzR5IY3mffTDh+47Y="
 
+    /// The golden binding is the raw 32-byte digest, not OpenTDFKit's base64(hex).
     @Test("binding matches the openssl-produced arks fixture")
     func bindingMatchesGolden() {
         #expect(Data(Self.goldenPolicy.utf8).base64EncodedString() == Self.goldenPolicyBase64)
         #expect(FairPlayPolicy.binding(policyBase64: Self.goldenPolicyBase64, dek: Self.goldenDEK) == Self.goldenBinding)
-    }
-
-    @Test("binding is the raw digest, not base64(hex)")
-    func bindingIsRawDigest() throws {
-        let binding = FairPlayPolicy.binding(policyBase64: Self.goldenPolicyBase64, dek: Self.goldenDEK)
-        #expect(try #require(Data(base64Encoded: binding)).count == 32)
     }
 
     @Test("placeholder policy is {uuid, body:{}} with a fresh lower-case UUID")
@@ -152,10 +148,11 @@ struct FairPlayPolicyTests {
         #expect(kao.type == "wrapped")
         #expect(kao.url == "https://platform.arkavo.net")
         // Independently recompute what arks checks: unwrap, then HMAC the base64 policy string.
-        let unwrapped = try kas.unwrap(try #require(Data(base64Encoded: kao.wrappedKey)))
-        #expect(unwrapped == dek)
+        let unwrapped = try TDFCrypto.unwrapSymmetricKeyWithRSA(
+            privateKeyPEM: kas.privateKeyPEM, wrappedKey: kao.wrappedKey)
+        #expect(TDFCrypto.data(from: unwrapped) == dek)
         let mac = HMAC<SHA256>.authenticationCode(
-            for: Data(try #require(info.policy).utf8), using: SymmetricKey(data: unwrapped))
+            for: Data(try #require(info.policy).utf8), using: unwrapped)
         #expect(kao.policyBinding?.hash == Data(mac).base64EncodedString())
         #expect(kao.policyBinding?.alg == "HS256")
     }

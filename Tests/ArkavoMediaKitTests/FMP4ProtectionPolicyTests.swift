@@ -1,5 +1,5 @@
-import CryptoKit
 import Foundation
+import OpenTDFKit
 import Testing
 import ZIPFoundation
 @testable import ArkavoMediaKit
@@ -50,8 +50,8 @@ struct FMP4ProtectionPolicyTests {
         #expect(Data(base64Encoded: policy) == Data(Self.tierPolicy.utf8))
         let kao = try #require((info["keyAccess"] as? [[String: Any]])?.first)
         let wrappedBase64 = try #require(kao["wrappedKey"] as? String)
-        let wrapped = try #require(Data(base64Encoded: wrappedBase64))
-        let dek = try kas.unwrap(wrapped)
+        let dek = TDFCrypto.data(from: try TDFCrypto.unwrapSymmetricKeyWithRSA(
+            privateKeyPEM: kas.privateKeyPEM, wrappedKey: wrappedBase64))
         let binding = try #require((kao["policyBinding"] as? [String: Any])?["hash"] as? String)
         #expect(binding == FairPlayPolicy.binding(policyBase64: policy, dek: dek))
         let playlistData = try #require(files["playlist.m3u8"])
@@ -85,10 +85,11 @@ struct FMP4ProtectionPolicyTests {
         #expect(playlist.contains("URI=\"skd://\(uuid)\""))
     }
 
+    /// The PEM is not a key: parsing it before the policy check would throw
+    /// invalidPublicKeyFormat instead.
     @Test("a policy without a uuid is refused before any work")
     func rejectsPolicyWithoutUUID() async throws {
-        let service = FMP4RecordingProtectionService(
-            kasURL: Self.kasURL, kasPublicKeyPEM: try TestKASKeyPair().spkiPublicKeyPEM)
+        let service = FMP4RecordingProtectionService(kasURL: Self.kasURL, kasPublicKeyPEM: "not a key")
         await #expect(throws: FairPlayPolicy.Error.missingUUID) {
             _ = try await service.protectVideo(
                 videoURL: URL(fileURLWithPath: "/nonexistent.mov"), assetID: "a",
@@ -129,7 +130,8 @@ struct FMP4ProtectionPolicyTests {
         let info = try encryptionInformation(files)
         let kao = try #require((info["keyAccess"] as? [[String: Any]])?.first)
         let wrappedBase64 = try #require(kao["wrappedKey"] as? String)
-        let dek = try kas.unwrap(try #require(Data(base64Encoded: wrappedBase64)))
+        let dek = TDFCrypto.data(from: try TDFCrypto.unwrapSymmetricKeyWithRSA(
+            privateKeyPEM: kas.privateKeyPEM, wrappedKey: wrappedBase64))
         let ivBase64 = try #require((info["method"] as? [String: Any])?["iv"] as? String)
         let iv = try #require(Data(base64Encoded: ivBase64))
         for (name, secret) in [("content key", dek), ("IV", iv)] {
