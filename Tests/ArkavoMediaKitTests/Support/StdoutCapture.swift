@@ -4,8 +4,14 @@ import Foundation
 /// returns what was written. The capture is replayed to the real stdout
 /// afterwards, so output from tests running in parallel is not lost. A file,
 /// not a pipe, so a chatty body cannot fill the pipe buffer and block.
+/// Captures run one at a time: stdout is process-wide, and two overlapping
+/// redirections would restore each other's descriptors.
 enum StdoutCapture {
+    private static let gate = Gate()
+
     static func capture<T>(_ body: () async throws -> T) async throws -> (value: T, output: String) {
+        await gate.acquire()
+        defer { Task { await gate.release() } }
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("stdout-\(UUID().uuidString).log")
         guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
@@ -29,5 +35,27 @@ enum StdoutCapture {
         let captured = try Data(contentsOf: url)
         FileHandle.standardOutput.write(captured)
         return (try result.get(), String(decoding: captured, as: UTF8.self))
+    }
+}
+
+/// An async mutex: `acquire` waits until no other holder remains.
+private actor Gate {
+    private var held = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func acquire() async {
+        guard held else {
+            held = true
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            held = false
+        } else {
+            waiters.removeFirst().resume()
+        }
     }
 }

@@ -143,7 +143,9 @@ struct FMP4ProtectionPolicyTests {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         // 3 s at 30 fps, a frame held 20 s, then 6 s at 30 fps.
-        let times = (0 ..< 90).map { Double($0) / 30 } + (0 ..< 180).map { 23 + Double($0) / 30 }
+        let before: [Double] = (0 ..< 90).map { Double($0) / 30 }
+        let after: [Double] = (0 ..< 180).map { 23 + Double($0) / 30 }
+        let times = before + after
         let movie = try await SyntheticMovie.make(in: dir, frameTimes: times, moovFirst: true)
         let handle = try FileHandle(forWritingTo: movie)
         try handle.truncate(atOffset: try handle.seekToEnd() * 85 / 100)
