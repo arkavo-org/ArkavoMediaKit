@@ -492,7 +492,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         FairPlayDebug.log("  Building key-request payload:")
         FairPlayDebug.log("    Session ID: \(sessionId)")
         FairPlayDebug.log("    User ID: \(userId)")
-        FairPlayDebug.log("    Asset ID: \(contentID)")
+        FairPlayDebug.log("    Content ID: \(contentID)")
         FairPlayDebug.log("    SPC size: \(spcData.count) bytes")
         FairPlayDebug.log("    TDF manifest size: \(manifestData.count) bytes")
 
@@ -580,8 +580,8 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
     }
 
     /// The archive manifest without what no license service reads: top-level
-    /// `meta` and each key access object's `encryptedMetadata` (the fMP4
-    /// per-segment file list, ~32 B a segment). The policy, wrapped key and
+    /// `meta` and each key access object's `encryptedMetadata` (in archives
+    /// before 0.1.7, the fMP4 per-segment file list, ~32 B a segment). The policy, wrapped key and
     /// binding strings are carried over unchanged. Bytes that are not a JSON
     /// object, or that JSONSerialization could not write back, are returned as
     /// they are.

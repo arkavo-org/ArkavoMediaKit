@@ -288,15 +288,13 @@ public actor FMP4RecordingProtectionService {
         // 9. Package into TDF archive (ZIP)
         print("📦 Packaging into TDF archive...")
 
-        // Add fMP4-specific metadata to manifest
-        let segmentFilenames = segments.map { $0.uri }
+        // Add fMP4-specific metadata to manifest (the segments are listed in the playlist)
         let enhancedManifestData = try addFMP4Metadata(
             to: manifestData,
             assetID: assetID,
             contentKeyID: contentKeyID,
             playlistFilename: "playlist.m3u8",
-            initFilename: "init.mp4",
-            segmentFilenames: segmentFilenames
+            initFilename: "init.mp4"
         )
 
         let archive = try createTDFArchive(
@@ -433,8 +431,7 @@ public actor FMP4RecordingProtectionService {
         assetID: String,
         contentKeyID: String,
         playlistFilename: String,
-        initFilename: String,
-        segmentFilenames: [String]
+        initFilename: String
     ) throws -> Data {
         // Parse existing manifest
         guard var manifest = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any] else {
@@ -450,7 +447,6 @@ public actor FMP4RecordingProtectionService {
             "contentKeyId": contentKeyID,
             "playlistFilename": playlistFilename,
             "initFilename": initFilename,
-            "segmentFilenames": segmentFilenames,
             "encryption": "cbcs-1-9",
             "protectedAt": protectedAtTimestamp
         ]

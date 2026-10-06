@@ -64,6 +64,8 @@ struct FMP4ProtectionPolicyTests {
         let meta = try #require(JSONSerialization.jsonObject(with: metaData) as? [String: Any])
         #expect(meta["type"] as? String == "fmp4-fairplay")
         #expect(meta["assetId"] as? String == "recording-asset-1")
+        // The segment list is in the playlist; in the KAO it only grew every key request.
+        #expect(meta["segmentFilenames"] == nil)
         // Readers find the key URI's id without decoding the policy.
         #expect(meta["contentKeyId"] as? String == "6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d")
         let manifestData = try #require(files["manifest.json"])
