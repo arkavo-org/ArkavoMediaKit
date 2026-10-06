@@ -159,6 +159,17 @@ struct FairPlayPolicyTests {
         }
     }
 
+    /// main accepted a PEM missing its END line; keep accepting it.
+    @Test("publicKey(fromPEM:) reads a PEM whose END line is missing")
+    func publicKeyWithoutEndLine() throws {
+        let kas = try TestKASKeyPair()
+        let builder = TDFManifestBuilder(kasURL: URL(string: "https://platform.arkavo.net")!)
+        for pem in [kas.publicKeyPEM, kas.spkiPublicKeyPEM] {
+            let truncated = String(pem[..<pem.range(of: "-----END ")!.lowerBound])
+            _ = try builder.publicKey(fromPEM: truncated)
+        }
+    }
+
     @Test("manifest carries the policy, one wrapped key and a binding arks accepts")
     func manifestPassesArksCheck() throws {
         let kas = try TestKASKeyPair()

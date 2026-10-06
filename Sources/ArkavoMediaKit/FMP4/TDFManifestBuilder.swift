@@ -232,15 +232,16 @@ public final class TDFManifestBuilder {
     }
 
     /// The base64 between a `PUBLIC KEY` or `RSA PUBLIC KEY` BEGIN line and its
-    /// END line. RFC 7468 lets text surround the block and whitespace sit in
-    /// the body. Text with no BEGIN line is taken as bare base64.
+    /// END line (or the end of the text, when the END line is missing). RFC 7468
+    /// lets text surround the block and whitespace sit in the body. Text with
+    /// no BEGIN line is taken as bare base64.
     private static func pemBody(_ pem: String) -> String {
         guard let begin = pem.range(of: "-----BEGIN ") else { return pem }
         guard let labelEnd = pem.range(of: "-----", range: begin.upperBound ..< pem.endIndex),
-              ["PUBLIC KEY", "RSA PUBLIC KEY"].contains(pem[begin.upperBound ..< labelEnd.lowerBound]),
-              let end = pem.range(of: "-----END ", range: labelEnd.upperBound ..< pem.endIndex)
+              ["PUBLIC KEY", "RSA PUBLIC KEY"].contains(pem[begin.upperBound ..< labelEnd.lowerBound])
         else { return "" }
-        return String(pem[labelEnd.upperBound ..< end.lowerBound])
+        let end = pem.range(of: "-----END ", range: labelEnd.upperBound ..< pem.endIndex)?.lowerBound ?? pem.endIndex
+        return String(pem[labelEnd.upperBound ..< end])
     }
 
     /// Parse a KAS RSA public key from PEM (`PUBLIC KEY` or `RSA PUBLIC KEY` armor).
