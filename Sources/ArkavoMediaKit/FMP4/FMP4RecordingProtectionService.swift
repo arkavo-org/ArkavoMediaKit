@@ -230,52 +230,42 @@ public actor FMP4RecordingProtectionService {
                 "read \(readDuration.seconds) s of a \(trackTimeRange.duration.seconds) s track")
         }
 
-        // 7. Generate media segments (6 second chunks)
+        // 7. Generate media segments (about 6 seconds each)
         print("📼 Generating media segments...")
-        let segmentDuration: UInt64 = UInt64(6 * timescale)  // 6 seconds
+        let ranges = Self.segmentRanges(
+            for: samples.map { SegmentSample(duration: $0.duration, isSync: $0.isSync) },
+            targetDuration: UInt64(6 * timescale)
+        )
         var segments: [FMP4HLSGenerator.Segment] = []
-        var segmentIndex = 0
-        var sampleIndex = 0
-        var currentSegmentSamples: [FMP4Writer.Sample] = []
-        var currentSegmentDuration: UInt64 = 0
         var baseDecodeTime: UInt64 = 0
 
-        while sampleIndex < samples.count {
-            let sample = samples[sampleIndex]
-            currentSegmentSamples.append(sample)
-            currentSegmentDuration += UInt64(sample.duration)
-            sampleIndex += 1
+        for (segmentIndex, range) in ranges.enumerated() {
+            let segmentSamples = Array(samples[range])
+            let segmentDuration = segmentSamples.reduce(UInt64(0)) { $0 + UInt64($1.duration) }
+            let segmentData = writer.generateMediaSegment(
+                trackID: 1,
+                samples: segmentSamples,
+                baseDecodeTime: baseDecodeTime
+            )
 
-            // Check if we should end this segment
-            let shouldEndSegment = currentSegmentDuration >= segmentDuration || sampleIndex == samples.count
+            let segmentFilename = "segment\(segmentIndex).m4s"
+            let segmentURL = tempDir.appendingPathComponent(segmentFilename)
+            try segmentData.write(to: segmentURL)
 
-            if shouldEndSegment && !currentSegmentSamples.isEmpty {
-                let segmentData = writer.generateMediaSegment(
-                    trackID: 1,
-                    samples: currentSegmentSamples,
-                    baseDecodeTime: baseDecodeTime
-                )
+            let duration = Double(segmentDuration) / Double(timescale)
+            segments.append(FMP4HLSGenerator.Segment(uri: segmentFilename, duration: duration))
 
-                let segmentFilename = "segment\(segmentIndex).m4s"
-                let segmentURL = tempDir.appendingPathComponent(segmentFilename)
-                try segmentData.write(to: segmentURL)
-
-                let duration = Double(currentSegmentDuration) / Double(timescale)
-                segments.append(FMP4HLSGenerator.Segment(uri: segmentFilename, duration: duration))
-
-                baseDecodeTime += currentSegmentDuration
-                currentSegmentSamples = []
-                currentSegmentDuration = 0
-                segmentIndex += 1
-            }
+            baseDecodeTime += segmentDuration
         }
 
-        print("   Created \(segmentIndex) segments")
+        print("   Created \(segments.count) segments")
 
         // 8. Generate HLS playlist
         print("📋 Generating HLS playlist...")
+        // Segments run past 6 s to reach a sync sample; the target must cover the longest.
+        let longestSegment = segments.map(\.duration).max() ?? 6
         let playlistConfig = FMP4HLSGenerator.PlaylistConfig(
-            targetDuration: 6,
+            targetDuration: Int(longestSegment.rounded(.up)),
             playlistType: .vod,
             initSegmentURI: "init.mp4"
         )
@@ -314,6 +304,35 @@ public actor FMP4RecordingProtectionService {
 
         print("✅ fMP4 FairPlay protection complete: \(archive.count) bytes")
         return archive
+    }
+
+    // MARK: - Segmentation
+
+    /// A sample's duration (in the track timescale) and whether it is a sync sample.
+    struct SegmentSample: Equatable {
+        let duration: UInt32
+        let isSync: Bool
+    }
+
+    /// Sample index ranges for the media segments. A segment closes at the
+    /// first sync sample once `targetDuration` has accumulated, so each one
+    /// opens on a sync sample, as `#EXT-X-INDEPENDENT-SEGMENTS` promises.
+    static func segmentRanges(for samples: [SegmentSample], targetDuration: UInt64) -> [Range<Int>] {
+        var ranges: [Range<Int>] = []
+        var start = 0
+        var accumulated: UInt64 = 0
+        for (index, sample) in samples.enumerated() {
+            if accumulated >= targetDuration, sample.isSync {
+                ranges.append(start ..< index)
+                start = index
+                accumulated = 0
+            }
+            accumulated += UInt64(sample.duration)
+        }
+        if start < samples.count {
+            ranges.append(start ..< samples.count)
+        }
+        return ranges
     }
 
     // MARK: - Private Helpers
