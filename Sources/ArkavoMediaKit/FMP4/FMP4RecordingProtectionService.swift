@@ -232,7 +232,7 @@ public actor FMP4RecordingProtectionService {
         print("📼 Generating media segments...")
         let ranges = Self.segmentRanges(
             for: samples.map { SegmentSample(duration: $0.duration, isSync: $0.isSync) },
-            targetDuration: UInt64(6 * timescale)
+            targetDuration: UInt64(timescale) * 6  // not Int32 6 * timescale: overflows past 357,913,941
         )
         var segments: [FMP4HLSGenerator.Segment] = []
         var baseDecodeTime: UInt64 = 0

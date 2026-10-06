@@ -114,6 +114,19 @@ struct FMP4SegmentationTests {
         }
     }
 
+    /// `6 * timescale` was Int32 arithmetic: a track timescale over 357,913,941
+    /// trapped the process instead of protecting.
+    @Test("a track with a nanosecond timescale protects")
+    func nanosecondTimescale() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("fmp4-ns-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let movie = try await SyntheticMovie.make(in: dir, frames: 30, mediaTimeScale: 1_000_000_000)
+        let service = FMP4RecordingProtectionService(
+            kasURL: URL(string: "https://platform.arkavo.net")!, kasPublicKeyPEM: try TestKASKeyPair().spkiPublicKeyPEM)
+        _ = try await service.protectVideo(videoURL: movie, assetID: "ns")
+    }
+
     /// The first sample's flags from a media segment's `trun` box.
     private static func firstSampleFlags(inSegment data: Data) -> UInt32? {
         let bytes = [UInt8](data)

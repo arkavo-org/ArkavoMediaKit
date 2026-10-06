@@ -22,9 +22,14 @@ enum SyntheticMovie {
     ///     tracks still load after the file is truncated.
     ///   - variableFrameRate: Jitters each timestamp by up to ±13 ms on a µs
     ///     timescale, as a real-time recorder's frames arrive.
+    ///   - frameTimes: Explicit presentation times in seconds, replacing `frames`
+    ///     and `variableFrameRate`. The session still starts at zero, so a first
+    ///     time above zero leaves the leading empty edit a recorder that drops
+    ///     its first captured frame writes.
+    ///   - mediaTimeScale: The video track's timescale, when set.
     static func make(
         in dir: URL, frames: Int = 30, keyFrameInterval: Int? = nil, moovFirst: Bool = false,
-        variableFrameRate: Bool = false
+        variableFrameRate: Bool = false, frameTimes: [Double]? = nil, mediaTimeScale: CMTimeScale? = nil
     ) async throws -> URL {
         let url = dir.appendingPathComponent("synthetic-\(UUID().uuidString).mov")
         let width = 320, height = 180, fps: Int32 = 30
@@ -39,6 +44,7 @@ enum SyntheticMovie {
             settings[AVVideoCompressionPropertiesKey] = [AVVideoMaxKeyFrameIntervalKey: keyFrameInterval]
         }
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        if let mediaTimeScale { input.mediaTimeScale = mediaTimeScale }
         input.expectsMediaDataInRealTime = false
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: input,
@@ -52,7 +58,7 @@ enum SyntheticMovie {
         guard writer.startWriting() else { throw writer.error ?? Failure.startFailed }
         writer.startSession(atSourceTime: .zero)
 
-        for frame in 0 ..< frames {
+        for frame in 0 ..< (frameTimes?.count ?? frames) {
             // Bounded wait: a failed writer never becomes ready.
             let deadline = Date().addingTimeInterval(5)
             while !input.isReadyForMoreMediaData {
@@ -73,11 +79,15 @@ enum SyntheticMovie {
             }
             CVPixelBufferUnlockBaseAddress(buffer, [])
 
-            let pts = variableFrameRate
+            let pts = if let frameTimes {
+                CMTime(seconds: frameTimes[frame], preferredTimescale: 1_000_000)
+            } else if variableFrameRate {
                 // 33,333 µs apart ± 13,000 µs (deterministic), so still strictly increasing.
-                ? CMTime(value: CMTimeValue(frame * 33_333 + (frame * 7_919) % 26_001 - 13_000).clamped(min: 0),
-                         timescale: 1_000_000)
-                : CMTime(value: CMTimeValue(frame), timescale: fps)
+                CMTime(value: CMTimeValue(frame * 33_333 + (frame * 7_919) % 26_001 - 13_000).clamped(min: 0),
+                       timescale: 1_000_000)
+            } else {
+                CMTime(value: CMTimeValue(frame), timescale: fps)
+            }
             guard adaptor.append(buffer, withPresentationTime: pts) else {
                 throw writer.error ?? Failure.append(frame)
             }
