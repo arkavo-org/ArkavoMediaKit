@@ -342,12 +342,6 @@ public final class TDFManifestBuilder {
         return Manifest(encryptionInformation: encryptionInfo)
     }
 
-    /// As `buildManifest(contentKey:iv:policyJSON:publicKey:)`, fetching the KAS key first.
-    public func buildManifest(contentKey: Data, iv: Data, policyJSON: Data) async throws -> Manifest {
-        let publicKey = try await fetchKASPublicKey()
-        return try buildManifest(contentKey: contentKey, iv: iv, policyJSON: policyJSON, publicKey: publicKey)
-    }
-
     /// Serialize manifest to JSON data
     public func serializeManifest(_ manifest: Manifest) throws -> Data {
         let encoder = JSONEncoder()
