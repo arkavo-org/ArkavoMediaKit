@@ -17,6 +17,7 @@ public enum FairPlayPolicy {
         case missingUUID
         case invalidUUID(String)
         case duplicateKey(String)
+        case unsupportedJSON(String)
     }
 
     /// Placeholder policy for public content, `{"uuid":"<lowercase uuid>","body":{}}`.
@@ -29,17 +30,20 @@ public enum FairPlayPolicy {
     /// The policy's `uuid` exactly as written (arks compares the SPC asset id
     /// with it verbatim). Throws unless it is a lower-case canonical UUID, and
     /// refuses JSON that arks' serde_json would read differently from
-    /// JSONSerialization: anything but BOM-less UTF-8, or duplicate keys
-    /// (serde keeps the last, JSONSerialization the first).
+    /// JSONSerialization or refuse outright: anything but BOM-less UTF-8,
+    /// duplicate keys (serde keeps the last, JSONSerialization the first),
+    /// trailing commas, non-finite numbers, deep nesting.
     public static func uuid(ofPolicyJSON json: Data) throws -> String {
         guard isPlainUTF8Object(json),
               let object = try? JSONSerialization.jsonObject(with: json) as? [String: Any]
         else {
             throw Error.notJSONObject
         }
-        if let key = firstDuplicateKey(in: json) {
-            throw Error.duplicateKey(key)
+        // JSONSerialization reads -1e400 as -inf; serde refuses it.
+        guard JSONSerialization.isValidJSONObject(object) else {
+            throw Error.unsupportedJSON("non-finite number")
         }
+        try checkStructure(of: json)
         guard let raw = object["uuid"] as? String, !raw.isEmpty else {
             throw Error.missingUUID
         }
@@ -71,23 +75,29 @@ public enum FairPlayPolicy {
         return json.first { !whitespace.contains($0) } == UInt8(ascii: "{")
     }
 
-    /// The first key that appears twice in one object, decoded (`"\u0075uid"`
-    /// is `uuid`). `json` must already have parsed.
-    private static func firstDuplicateKey(in json: Data) -> String? {
-        enum Container { case object(Set<String>), array }
+    /// Refuses, in JSON that has already parsed, what serde_json reads
+    /// differently or not at all: a key repeated in one object (decoded, so
+    /// `"uuid"` is `uuid`, and compared by code units as serde does), a
+    /// trailing comma (JSONSerialization allows one), nesting deeper than 64.
+    private static func checkStructure(of json: Data) throws {
+        enum Container { case object(Set<[UInt8]>), array }
         let bytes = [UInt8](json)
         var stack: [Container] = []
         var expectingKey = false
+        var afterComma = false
         var index = 0
         while index < bytes.count {
-            switch bytes[index] {
-            case UInt8(ascii: "{"):
-                stack.append(.object([]))
-                expectingKey = true
-            case UInt8(ascii: "["):
-                stack.append(.array)
-                expectingKey = false
+            let byte = bytes[index]
+            switch byte {
+            case 0x20, 0x09, 0x0A, 0x0D:
+                index += 1
+                continue
+            case UInt8(ascii: "{"), UInt8(ascii: "["):
+                guard stack.count < 64 else { throw Error.unsupportedJSON("nested deeper than 64") }
+                stack.append(byte == UInt8(ascii: "{") ? .object([]) : .array)
+                expectingKey = byte == UInt8(ascii: "{")
             case UInt8(ascii: "}"), UInt8(ascii: "]"):
+                guard !afterComma else { throw Error.unsupportedJSON("trailing comma") }
                 stack.removeLast()
                 expectingKey = false
             case UInt8(ascii: ","):
@@ -100,7 +110,7 @@ public enum FairPlayPolicy {
                 if expectingKey, case var .object(keys) = stack.last {
                     let token = Data(bytes[index ... end])
                     let key = (try? JSONSerialization.jsonObject(with: token, options: .fragmentsAllowed)) as? String ?? ""
-                    guard keys.insert(key).inserted else { return key }
+                    guard keys.insert(Array(key.utf8)).inserted else { throw Error.duplicateKey(key) }
                     stack[stack.count - 1] = .object(keys)
                 }
                 expectingKey = false
@@ -108,9 +118,9 @@ public enum FairPlayPolicy {
             default:
                 break
             }
+            afterComma = byte == UInt8(ascii: ",")
             index += 1
         }
-        return nil
     }
 
     /// `base64(HMAC-SHA256(key: dek, msg: utf8(policyBase64)))`.

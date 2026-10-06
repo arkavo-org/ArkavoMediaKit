@@ -61,6 +61,36 @@ struct FairPlayPolicyTests {
         #expect(try FairPlayPolicy.uuid(ofPolicyJSON: Data((" \n" + policy).utf8)) == "3f1c9e2a-7b4d-4e8f-9a21-5c6d7e8f9a0b")
     }
 
+    /// serde_json refuses these; JSONSerialization reads them.
+    @Test("uuid(ofPolicyJSON:) refuses trailing commas, non-finite numbers and deep nesting")
+    func policyUUIDRefusesWhatSerdeRefuses() throws {
+        let a = "3f1c9e2a-7b4d-4e8f-9a21-5c6d7e8f9a0b"
+        #expect(throws: FairPlayPolicy.Error.unsupportedJSON("trailing comma")) {
+            try FairPlayPolicy.uuid(ofPolicyJSON: Data(#"{"uuid":"\#(a)","body":{"dissem":[]},}"#.utf8))
+        }
+        #expect(throws: FairPlayPolicy.Error.unsupportedJSON("trailing comma")) {
+            try FairPlayPolicy.uuid(ofPolicyJSON: Data(#"{"uuid":"\#(a)","body":{"dissem":["x" , ]}}"#.utf8))
+        }
+        #expect(throws: FairPlayPolicy.Error.unsupportedJSON("non-finite number")) {
+            try FairPlayPolicy.uuid(ofPolicyJSON: Data(#"{"uuid":"\#(a)","body":{},"x":-1e400}"#.utf8))
+        }
+        let deep = String(repeating: "[", count: 130) + String(repeating: "]", count: 130)
+        #expect(throws: FairPlayPolicy.Error.unsupportedJSON("nested deeper than 64")) {
+            try FairPlayPolicy.uuid(ofPolicyJSON: Data(#"{"uuid":"\#(a)","body":{},"x":\#(deep)}"#.utf8))
+        }
+        // Commas inside strings, and moderate nesting, are fine.
+        let shallow = String(repeating: "[", count: 20) + String(repeating: "]", count: 20)
+        #expect(try FairPlayPolicy.uuid(ofPolicyJSON: Data(#"{"uuid":"\#(a)","body":{"dissem":["a,]"]},"x":\#(shallow)}"#.utf8)) == a)
+    }
+
+    /// Swift's String compares by canonical equivalence; serde keeps "é" (NFC)
+    /// and "é" (NFD) as two keys, and so must this.
+    @Test("uuid(ofPolicyJSON:) treats canonically equivalent but distinct keys as distinct")
+    func policyUUIDKeysCompareByCodeUnits() throws {
+        let a = "3f1c9e2a-7b4d-4e8f-9a21-5c6d7e8f9a0b"
+        #expect(try FairPlayPolicy.uuid(ofPolicyJSON: Data(#"{"uuid":"\#(a)","é":1,"é":2,"body":{}}"#.utf8)) == a)
+    }
+
     @Test("uuid(ofPolicyJSON:) refuses duplicate keys at any depth, however escaped")
     func policyUUIDRefusesDuplicateKeys() throws {
         let a = "3f1c9e2a-7b4d-4e8f-9a21-5c6d7e8f9a0b", b = "6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
