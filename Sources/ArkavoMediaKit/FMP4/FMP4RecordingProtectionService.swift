@@ -292,6 +292,7 @@ public actor FMP4RecordingProtectionService {
         let enhancedManifestData = try addFMP4Metadata(
             to: manifestData,
             assetID: assetID,
+            contentKeyID: contentKeyID,
             playlistFilename: "playlist.m3u8",
             initFilename: "init.mp4",
             segmentFilenames: segmentFilenames
@@ -405,6 +406,7 @@ public actor FMP4RecordingProtectionService {
     private func addFMP4Metadata(
         to manifestData: Data,
         assetID: String,
+        contentKeyID: String,
         playlistFilename: String,
         initFilename: String,
         segmentFilenames: [String]
@@ -420,6 +422,7 @@ public actor FMP4RecordingProtectionService {
         let fmp4Meta: [String: Any] = [
             "type": "fmp4-fairplay",
             "assetId": assetID,
+            "contentKeyId": contentKeyID,
             "playlistFilename": playlistFilename,
             "initFilename": initFilename,
             "segmentFilenames": segmentFilenames,
@@ -440,9 +443,11 @@ public actor FMP4RecordingProtectionService {
             manifest["encryptionInformation"] = encInfo
         }
 
-        // Add top-level meta section (required by IrohContentService)
+        // Add top-level meta section (required by IrohContentService). contentKeyId
+        // is the skd:// id (the policy uuid); assetId is the recording's id.
         manifest["meta"] = [
             "assetId": assetID,
+            "contentKeyId": contentKeyID,
             "protectedAt": protectedAtTimestamp
         ]
 
