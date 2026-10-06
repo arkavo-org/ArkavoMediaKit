@@ -583,7 +583,8 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
     /// `meta` and each key access object's `encryptedMetadata` (the fMP4
     /// per-segment file list, ~32 B a segment). The policy, wrapped key and
     /// binding strings are carried over unchanged. Bytes that are not a JSON
-    /// object are returned as they are.
+    /// object, or that JSONSerialization could not write back, are returned as
+    /// they are.
     private static func trimmedForKeyRequest(_ raw: Data) -> Data {
         guard var json = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else { return raw }
         json["meta"] = nil
@@ -592,6 +593,8 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
             info["keyAccess"] = keyAccess.map { $0.filter { $0.key != "encryptedMetadata" } }
             json["encryptionInformation"] = info
         }
+        // Writing a non-finite number (-1e400 parses as -inf) raises an exception `try?` cannot catch.
+        guard JSONSerialization.isValidJSONObject(json) else { return raw }
         return (try? JSONSerialization.data(withJSONObject: json, options: [.withoutEscapingSlashes])) ?? raw
     }
 }

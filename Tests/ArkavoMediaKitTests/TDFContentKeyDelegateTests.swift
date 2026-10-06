@@ -451,6 +451,14 @@ struct KeyRequestManifestTests {
         #expect(sent.count < 1024, "\(sent.count) bytes sent for a 1200-segment archive")
     }
 
+    /// JSONSerialization reads -1e400 as -inf, and writing -inf raises an
+    /// Objective-C exception `try?` cannot catch: the player would abort.
+    @Test("an archive manifest that cannot be re-serialized is sent as is")
+    func unwritableSentAsIs() throws {
+        let raw = Data(#"{"encryptionInformation":{"policy":"eyJ9","keyAccess":[{"type":"wrapped","encryptedMetadata":"bQ=="}]},"payload":{"length":-1e400}}"#.utf8)
+        #expect(try TDFContentKeyDelegate<FairPlayManifest>.keyRequestManifestData(for: Self.archiveManifest(raw)) == raw)
+    }
+
     @Test("an archive manifest that is not a JSON object is sent as is")
     func unparseableSentAsIs() throws {
         let raw = Data("not json".utf8)
