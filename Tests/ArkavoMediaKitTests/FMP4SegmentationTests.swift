@@ -20,6 +20,33 @@ struct FMP4SegmentationTests {
         #expect(ranges == [0 ..< 200, 200 ..< 400])
     }
 
+    private static func samples(count: Int, syncAt sync: Set<Int>) -> [FMP4RecordingProtectionService.SegmentSample] {
+        (0 ..< count).map { .init(duration: 1, isSync: sync.contains($0)) }
+    }
+
+    /// A recorder's keyframes jitter around the GOP: one a few ticks short of
+    /// the target must close the segment, not push it a whole GOP long.
+    @Test("a sync sample just short of the target closes the segment when it is nearer")
+    func nearestSyncSample() {
+        let ranges = FMP4RecordingProtectionService.segmentRanges(
+            for: Self.samples(count: 400, syncAt: [0, 178, 238, 300]), targetDuration: 180)
+        #expect(ranges == [0 ..< 178, 178 ..< 400])
+    }
+
+    @Test("a sync sample less than half the target in does not close a segment")
+    func earlySyncSampleIgnored() {
+        let ranges = FMP4RecordingProtectionService.segmentRanges(
+            for: Self.samples(count: 400, syncAt: [0, 15, 360]), targetDuration: 180)
+        #expect(ranges == [0 ..< 360, 360 ..< 400])
+    }
+
+    @Test("after closing at an earlier sync sample the current one is weighed again")
+    func reconsidersAfterEarlierCut() {
+        let ranges = FMP4RecordingProtectionService.segmentRanges(
+            for: Self.samples(count: 600, syncAt: [0, 100, 400]), targetDuration: 180)
+        #expect(ranges == [0 ..< 100, 100 ..< 400, 400 ..< 600])
+    }
+
     @Test("all-sync sources cut exactly at the target")
     func allSyncCutsAtTarget() {
         let ranges = FMP4RecordingProtectionService.segmentRanges(
@@ -69,7 +96,9 @@ struct FMP4SegmentationTests {
         }
         let segmentNames = lines.filter { $0.hasSuffix(".m4s") }
         #expect(segmentNames.count >= 2, "the source must span more than one segment")
-        #expect(durations.allSatisfy { $0 <= Double(target) }, "EXTINF \(durations) exceeds target \(target)")
+        // RFC 8216: each EXTINF, rounded to the nearest integer, at most the target;
+        // and the target no larger than that requires.
+        #expect(target == Int((durations.max() ?? 0).rounded()), "target \(target) for EXTINF \(durations)")
         for name in segmentNames {
             let segment = try #require(files[name])
             let flags = try #require(Self.firstSampleFlags(inSegment: segment))
@@ -112,6 +141,46 @@ struct FMP4SegmentationTests {
             let flags = try #require(Self.firstSampleFlags(inSegment: segment))
             #expect(flags & 0x0001_0000 == 0, "\(name) opens on a non-sync sample")
         }
+    }
+
+    /// A segment of 6.03 s needs a target of 6, not 7.
+    @Test("the target duration is the longest segment rounded to the nearest second")
+    func targetDurationRoundsToNearest() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("fmp4-target-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let movie = try await SyntheticMovie.make(in: dir, frames: 400, keyFrameInterval: 181)
+        let service = FMP4RecordingProtectionService(
+            kasURL: URL(string: "https://platform.arkavo.net")!, kasPublicKeyPEM: try TestKASKeyPair().spkiPublicKeyPEM)
+        let archive = try await service.protectVideo(videoURL: movie, assetID: "target")
+        let zip = try Archive(data: archive, accessMode: .read)
+        var playlistData = Data()
+        _ = try zip.extract(try #require(zip["playlist.m3u8"])) { playlistData.append($0) }
+        let lines = String(decoding: playlistData, as: UTF8.self).components(separatedBy: .newlines)
+        let target = try #require(lines.lazy.compactMap { line in
+            line.hasPrefix("#EXT-X-TARGETDURATION:") ? Int(line.dropFirst("#EXT-X-TARGETDURATION:".count)) : nil
+        }.first)
+        let longest = try #require(lines.compactMap { line -> Double? in
+            guard line.hasPrefix("#EXTINF:") else { return nil }
+            return Double(line.dropFirst("#EXTINF:".count).prefix { $0 != "," })
+        }.max())
+        #expect(longest.rounded() != longest.rounded(.up), "the source must give a segment just over a whole second (\(longest))")
+        #expect(target == Int(longest.rounded()), "target \(target) for a longest segment of \(longest) s")
+    }
+
+    @Test("a clip under half a second still declares a target duration of 1")
+    func shortClipTarget() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("fmp4-short-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let movie = try await SyntheticMovie.make(in: dir, frames: 10)
+        let service = FMP4RecordingProtectionService(
+            kasURL: URL(string: "https://platform.arkavo.net")!, kasPublicKeyPEM: try TestKASKeyPair().spkiPublicKeyPEM)
+        let archive = try await service.protectVideo(videoURL: movie, assetID: "short")
+        let zip = try Archive(data: archive, accessMode: .read)
+        var playlistData = Data()
+        _ = try zip.extract(try #require(zip["playlist.m3u8"])) { playlistData.append($0) }
+        #expect(String(decoding: playlistData, as: UTF8.self).contains("#EXT-X-TARGETDURATION:1\n"))
     }
 
     /// `6 * timescale` was Int32 arithmetic: a track timescale over 357,913,941

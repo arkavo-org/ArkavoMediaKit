@@ -260,10 +260,11 @@ public actor FMP4RecordingProtectionService {
 
         // 8. Generate HLS playlist
         print("📋 Generating HLS playlist...")
-        // Segments run past 6 s to reach a sync sample; the target must cover the longest.
+        // Segments end at sync samples, not at 6 s. RFC 8216: every EXTINF, rounded
+        // to the nearest integer, at most the target.
         let longestSegment = segments.map(\.duration).max() ?? 6
         let playlistConfig = FMP4HLSGenerator.PlaylistConfig(
-            targetDuration: Int(longestSegment.rounded(.up)),
+            targetDuration: max(1, Int(longestSegment.rounded())),
             playlistType: .vod,
             initSegmentURI: "init.mp4"
         )
@@ -313,18 +314,35 @@ public actor FMP4RecordingProtectionService {
         let isSync: Bool
     }
 
-    /// Sample index ranges for the media segments. A segment closes at the
-    /// first sync sample once `targetDuration` has accumulated, so each one
-    /// opens on a sync sample, as `#EXT-X-INDEPENDENT-SEGMENTS` promises.
+    /// Sample index ranges for the media segments. Each opens on a sync
+    /// sample, as `#EXT-X-INDEPENDENT-SEGMENTS` promises: a segment closes at
+    /// whichever sync sample lands nearer `targetDuration`, the first at or
+    /// past it or the last short of it (if at least half way), so a keyframe
+    /// a few ticks early does not stretch the segment a whole GOP.
     static func segmentRanges(for samples: [SegmentSample], targetDuration: UInt64) -> [Range<Int>] {
         var ranges: [Range<Int>] = []
         var start = 0
-        var accumulated: UInt64 = 0
+        var accumulated: UInt64 = 0  // duration of samples[start ..< index]
+        var shortOfTarget: (index: Int, accumulated: UInt64)?  // last sync sample before the target
         for (index, sample) in samples.enumerated() {
-            if accumulated >= targetDuration, sample.isSync {
+            while index > start, sample.isSync {
+                if accumulated < targetDuration {
+                    shortOfTarget = (index, accumulated)
+                    break
+                }
+                if let earlier = shortOfTarget, earlier.accumulated * 2 >= targetDuration,
+                   targetDuration - earlier.accumulated < accumulated - targetDuration {
+                    // Close at the earlier one, then weigh this sample again in the new segment.
+                    ranges.append(start ..< earlier.index)
+                    start = earlier.index
+                    accumulated -= earlier.accumulated
+                    shortOfTarget = nil
+                    continue
+                }
                 ranges.append(start ..< index)
                 start = index
                 accumulated = 0
+                shortOfTarget = nil
             }
             accumulated += UInt64(sample.duration)
         }
