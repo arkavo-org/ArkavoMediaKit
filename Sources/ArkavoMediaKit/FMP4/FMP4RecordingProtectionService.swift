@@ -61,8 +61,8 @@ public actor FMP4RecordingProtectionService {
         print("🔑 Generating content encryption key...")
         let contentKey = CBCSEncryptor.generateKeyID()  // 16-byte AES-128 key
         let constantIV = CBCSEncryptor.generateIV()     // 16-byte constant IV
-        // Use all-zero KID - FairPlay uses Asset ID for key lookup, not KID
-        // KID is CENC bookkeeping only; keep stable until playback works
+        // All-zero KID: FairPlay keys off the skd:// content-key id (the policy
+        // uuid), not the KID, which is CENC bookkeeping only
         let keyID = Data(repeating: 0, count: 16)
 
         // 2. Fetch KAS public key and wrap content key
@@ -140,7 +140,6 @@ public actor FMP4RecordingProtectionService {
         }
 
         var samples: [FMP4Writer.Sample] = []
-        var totalDuration: UInt64 = 0
         var readDuration = CMTime.zero
         var longestSample = CMTime.zero
 
@@ -215,8 +214,6 @@ public actor FMP4RecordingProtectionService {
                 compositionTimeOffset: compositionTimeOffset,
                 subsamples: encryptedResult.subsamples
             ))
-
-            totalDuration += UInt64(durationValue)
         }
         // copyNextSampleBuffer() returns nil on failure as well as at the end.
         guard reader.status == .completed else {
@@ -271,9 +268,9 @@ public actor FMP4RecordingProtectionService {
             initSegmentURI: "init.mp4"
         )
 
-        // The key URI is skd://<policy uuid>: the license service matches the SPC against it.
-        let fairPlayConfig = FMP4HLSGenerator.FairPlayConfig.fairPlay(
-            assetID: contentKeyID,
+        // The license service matches the SPC against the policy uuid.
+        let fairPlayConfig = FMP4HLSGenerator.FairPlayConfig(
+            keyURI: "skd://\(contentKeyID)",
             keyID: keyID,
             iv: constantIV
         )
