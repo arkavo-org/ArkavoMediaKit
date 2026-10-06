@@ -120,6 +120,48 @@ struct FMP4ProtectionPolicyTests {
         }
     }
 
+    /// Creator starts the writer session at zero on the first captured frame,
+    /// then drops that frame, so the track opens with an empty edit as long as
+    /// the first capture interval. A complete read of it is not short.
+    @Test("a source with a leading empty edit, read whole, protects")
+    func leadingEmptyEditProtects() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("fmp4-edit-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let times = (0 ..< 60).map { 0.050 + Double($0) / 30 }
+        let movie = try await SyntheticMovie.make(in: dir, frameTimes: times)
+        let service = FMP4RecordingProtectionService(
+            kasURL: Self.kasURL, kasPublicKeyPEM: try TestKASKeyPair().spkiPublicKeyPEM)
+        _ = try await service.protectVideo(videoURL: movie, assetID: "a", policyJSON: Data(Self.tierPolicy.utf8))
+    }
+
+    /// A paused recording holds one frame for the pause. When a truncated read
+    /// of one finishes .completed, the shortfall can be smaller than that frame.
+    @Test("a truncated source with a long held frame is refused on every read")
+    func truncatedSourceWithHeldFrameIsRefused() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("fmp4-pause-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // 3 s at 30 fps, a frame held 20 s, then 6 s at 30 fps.
+        let times = (0 ..< 90).map { Double($0) / 30 } + (0 ..< 180).map { 23 + Double($0) / 30 }
+        let movie = try await SyntheticMovie.make(in: dir, frameTimes: times, moovFirst: true)
+        let handle = try FileHandle(forWritingTo: movie)
+        try handle.truncate(atOffset: try handle.seekToEnd() * 85 / 100)
+        try handle.close()
+
+        let service = FMP4RecordingProtectionService(
+            kasURL: Self.kasURL, kasPublicKeyPEM: try TestKASKeyPair().spkiPublicKeyPEM)
+        for attempt in 1 ... 4 {
+            let error = await #expect(throws: FMP4ProtectionError.self, "attempt \(attempt)") {
+                _ = try await service.protectVideo(videoURL: movie, assetID: "a", policyJSON: Data(Self.tierPolicy.utf8))
+            }
+            guard case .readFailed = error else {
+                Issue.record("attempt \(attempt): expected readFailed, got \(String(describing: error))")
+                continue
+            }
+        }
+    }
+
     /// Nothing the protect path prints, from the service or anything it calls,
     /// may carry the content key or IV, however formatted. Runs in a Debug
     /// build, where the verbose logging is on.

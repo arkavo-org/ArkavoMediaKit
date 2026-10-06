@@ -98,7 +98,7 @@ public actor FMP4RecordingProtectionService {
 
         let dimensions = try await videoTrack.load(.naturalSize)
         let timescale = try await videoTrack.load(.naturalTimeScale)
-        let trackTimeRange = try await videoTrack.load(.timeRange)
+        let (trackSegments, totalSampleBytes) = try await videoTrack.load(.segments, .totalSampleDataLength)
 
         // Extract SPS/PPS and NAL length size from format description
         guard let h264Params = extractParameterSets(from: formatDesc) else {
@@ -140,8 +140,8 @@ public actor FMP4RecordingProtectionService {
         }
 
         var samples: [FMP4Writer.Sample] = []
-        var readDuration = CMTime.zero
-        var longestSample = CMTime.zero
+        var bytesRead: Int64 = 0
+        var readEnd = CMTime.zero  // latest presentation end among the samples read
 
         while let sampleBuffer = output.copyNextSampleBuffer() {
             guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
@@ -152,6 +152,7 @@ public actor FMP4RecordingProtectionService {
 
             guard let pointer = dataPointer else { continue }
             let sampleData = Data(bytes: pointer, count: length)
+            bytesRead += Int64(length)
 
             // Encrypt the sample using the actual NAL length size from the source video
             let encryptedResult = encryptor.encryptVideoSample(sampleData, nalLengthSize: nalLengthSize)
@@ -181,12 +182,13 @@ public actor FMP4RecordingProtectionService {
             // Get timing info
             let duration = CMSampleBufferGetDuration(sampleBuffer)
             let durationValue = UInt32(duration.value * Int64(timescale) / Int64(duration.timescale))
-            readDuration = readDuration + duration
-            longestSample = max(longestSample, duration)
 
             // Calculate Composition Time Offset (CTS) for B-frame support
             // CTS = PTS - DTS (tells decoder when to display the frame relative to decode time)
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            if pts.isNumeric, duration.isNumeric {
+                readEnd = max(readEnd, pts + duration)
+            }
             let dts = CMSampleBufferGetDecodeTimeStamp(sampleBuffer)
             var compositionTimeOffset: Int32 = 0
 
@@ -223,9 +225,13 @@ public actor FMP4RecordingProtectionService {
             throw FMP4ProtectionError.readFailed("no video samples")
         }
         // On a truncated file the reader can also finish .completed short of the end.
-        guard readDuration + longestSample >= trackTimeRange.duration else {
+        // A whole read took every sample byte, or reached the end of the last edit's
+        // media (an edit that trims the tail leaves bytes unread). Not the track's
+        // duration: empty and dwell edits make that differ from the samples'.
+        let mediaEnd = trackSegments.last { !$0.isEmpty }?.timeMapping.source.end ?? .zero
+        guard bytesRead == totalSampleBytes || readEnd >= mediaEnd else {
             throw FMP4ProtectionError.readFailed(
-                "read \(readDuration.seconds) s of a \(trackTimeRange.duration.seconds) s track")
+                "read \(bytesRead) of \(totalSampleBytes) sample bytes, to \(readEnd.seconds) s of \(mediaEnd.seconds) s")
         }
 
         // 7. Generate media segments (about 6 seconds each)

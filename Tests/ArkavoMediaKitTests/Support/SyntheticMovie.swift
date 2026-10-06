@@ -28,8 +28,8 @@ enum SyntheticMovie {
     ///     its first captured frame writes.
     ///   - mediaTimeScale: The video track's timescale, when set.
     static func make(
-        in dir: URL, frames: Int = 30, keyFrameInterval: Int? = nil, moovFirst: Bool = false,
-        variableFrameRate: Bool = false, frameTimes: [Double]? = nil, mediaTimeScale: CMTimeScale? = nil
+        in dir: URL, frames: Int = 30, frameTimes: [Double]? = nil, keyFrameInterval: Int? = nil,
+        moovFirst: Bool = false, variableFrameRate: Bool = false, mediaTimeScale: CMTimeScale? = nil
     ) async throws -> URL {
         let url = dir.appendingPathComponent("synthetic-\(UUID().uuidString).mov")
         let width = 320, height = 180, fps: Int32 = 30
