@@ -20,8 +20,11 @@ enum SyntheticMovie {
     ///   - keyFrameInterval: The most frames between sync samples, when set.
     ///   - moovFirst: Writes the movie header before the media data, so the
     ///     tracks still load after the file is truncated.
+    ///   - variableFrameRate: Jitters each timestamp by up to ±13 ms on a µs
+    ///     timescale, as a real-time recorder's frames arrive.
     static func make(
-        in dir: URL, frames: Int = 30, keyFrameInterval: Int? = nil, moovFirst: Bool = false
+        in dir: URL, frames: Int = 30, keyFrameInterval: Int? = nil, moovFirst: Bool = false,
+        variableFrameRate: Bool = false
     ) async throws -> URL {
         let url = dir.appendingPathComponent("synthetic-\(UUID().uuidString).mov")
         let width = 320, height = 180, fps: Int32 = 30
@@ -70,7 +73,11 @@ enum SyntheticMovie {
             }
             CVPixelBufferUnlockBaseAddress(buffer, [])
 
-            let pts = CMTime(value: CMTimeValue(frame), timescale: fps)
+            let pts = variableFrameRate
+                // 33,333 µs apart ± 13,000 µs (deterministic), so still strictly increasing.
+                ? CMTime(value: CMTimeValue(frame * 33_333 + (frame * 7_919) % 26_001 - 13_000).clamped(min: 0),
+                         timescale: 1_000_000)
+                : CMTime(value: CMTimeValue(frame), timescale: fps)
             guard adaptor.append(buffer, withPresentationTime: pts) else {
                 throw writer.error ?? Failure.append(frame)
             }
@@ -81,4 +88,8 @@ enum SyntheticMovie {
         guard writer.status == .completed else { throw writer.error ?? Failure.finish }
         return url
     }
+}
+
+private extension CMTimeValue {
+    func clamped(min lower: CMTimeValue) -> CMTimeValue { Swift.max(self, lower) }
 }

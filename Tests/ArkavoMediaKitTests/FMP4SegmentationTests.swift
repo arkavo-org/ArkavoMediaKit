@@ -77,6 +77,43 @@ struct FMP4SegmentationTests {
         }
     }
 
+    /// Regression for the read-duration guard and the sync cuts on a source
+    /// shaped like Creator's recorder: jittered real-time timestamps on a µs
+    /// timescale, a keyframe every 60 frames.
+    @Test("a variable-frame-rate source protects whole, each segment opening on a sync sample")
+    func variableFrameRateSource() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("fmp4-vfr-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let movie = try await SyntheticMovie.make(in: dir, frames: 400, keyFrameInterval: 60, variableFrameRate: true)
+        let kas = try TestKASKeyPair()
+        let service = FMP4RecordingProtectionService(
+            kasURL: URL(string: "https://platform.arkavo.net")!, kasPublicKeyPEM: kas.spkiPublicKeyPEM)
+        let archive = try await service.protectVideo(videoURL: movie, assetID: "vfr")
+
+        let zip = try Archive(data: archive, accessMode: .read)
+        var files: [String: Data] = [:]
+        for entry in zip {
+            var data = Data()
+            _ = try zip.extract(entry) { data.append($0) }
+            files[entry.path] = data
+        }
+        let playlist = String(decoding: try #require(files["playlist.m3u8"]), as: UTF8.self)
+        let lines = playlist.components(separatedBy: .newlines)
+        let total = lines.compactMap { line -> Double? in
+            guard line.hasPrefix("#EXTINF:") else { return nil }
+            return Double(line.dropFirst("#EXTINF:".count).prefix { $0 != "," })
+        }.reduce(0, +)
+        #expect(abs(total - 13.3) < 0.2, "segments cover \(total) s of a ~13.3 s source")
+        let segmentNames = lines.filter { $0.hasSuffix(".m4s") }
+        #expect(segmentNames.count >= 2)
+        for name in segmentNames {
+            let segment = try #require(files[name])
+            let flags = try #require(Self.firstSampleFlags(inSegment: segment))
+            #expect(flags & 0x0001_0000 == 0, "\(name) opens on a non-sync sample")
+        }
+    }
+
     /// The first sample's flags from a media segment's `trun` box.
     private static func firstSampleFlags(inSegment data: Data) -> UInt32? {
         let bytes = [UInt8](data)
