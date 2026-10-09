@@ -14,11 +14,20 @@ struct FairPlayPolicyTests {
     static let goldenPolicyBase64 = "eyJ1dWlkIjoiM2YxYzllMmEtN2I0ZC00ZThmLTlhMjEtNWM2ZDdlOGY5YTBiIiwiYm9keSI6eyJkYXRhQXR0cmlidXRlcyI6W3siYXR0cmlidXRlIjoiaHR0cHM6Ly9wYXRyZW9uLmFya2F2by5jb20vYXR0ci9jYW1wYWlnbi10aWVyL3ZhbHVlLzExMTExMTExX2dvbGQifV0sImRpc3NlbSI6W119fQ=="
     static let goldenBinding = "Ua5XgGqgNmxdle4TockmCZbQAIGzR5IY3mffTDh+47Y="
 
-    /// The golden binding is the raw 32-byte digest, not OpenTDFKit's base64(hex).
+    /// The golden binding is the raw 32-byte digest (the spec form), not OpenTDFKit 4's base64(hex).
     @Test("binding matches the openssl-produced arks fixture")
     func bindingMatchesGolden() {
         #expect(Data(Self.goldenPolicy.utf8).base64EncodedString() == Self.goldenPolicyBase64)
         #expect(FairPlayPolicy.binding(policyBase64: Self.goldenPolicyBase64, dek: Self.goldenDEK) == Self.goldenBinding)
+    }
+
+    /// OpenTDFKit 5 writes the same spec binding, so the HLS and fMP4 paths agree.
+    @Test("OpenTDFKit's policy binding matches the arks fixture")
+    func openTDFKitBindingMatchesGolden() {
+        let binding = TDFCrypto.policyBinding(policy: Data(Self.goldenPolicy.utf8),
+                                              symmetricKey: SymmetricKey(data: Self.goldenDEK))
+        #expect(binding.alg == "HS256")
+        #expect(binding.hash == Self.goldenBinding)
     }
 
     @Test("placeholder policy is {uuid, body:{}} with a fresh lower-case UUID")

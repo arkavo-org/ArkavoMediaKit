@@ -6,8 +6,9 @@ import Foundation
 /// The arks license service (arkavo-rs PR #75, `tdf_policy.rs::check_manifest`)
 /// verifies `policyBinding.hash == base64(HMAC-SHA256(key: DEK, msg:
 /// utf8(encryptionInformation.policy)))` — the OpenTDF spec form with the raw
-/// digest. OpenTDFKit's `TDFCrypto.policyBinding` emits `base64(hex(...))`,
-/// which arks refuses, so the FairPlay path computes the binding here.
+/// digest. OpenTDFKit 5's `TDFCrypto.policyBinding` emits the same form
+/// (OpenTDFKit 4 emitted `base64(hex(...))`, which arks refuses); the FairPlay
+/// path still computes it here, pinned to the arks fixture.
 ///
 /// The policy `uuid` is the FairPlay content-key id: the playlist key URI is
 /// `skd://<uuid>` and the SPC content identifier is the uuid.

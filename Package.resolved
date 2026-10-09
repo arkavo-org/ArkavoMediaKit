@@ -1,13 +1,13 @@
 {
-  "originHash" : "422db9c3e4e910afb1340be9029bb7c461825ca0ef72bfb90f35a241b0d998b5",
+  "originHash" : "a6ac91c01916dc2555ac747c5f03eb9271f958483374a6e44663502508a93c42",
   "pins" : [
     {
       "identity" : "cryptoswift",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/krzyzanowskim/CryptoSwift",
       "state" : {
-        "revision" : "e45a26384239e028ec87fbcc788f513b67e10d8f",
-        "version" : "1.9.0"
+        "revision" : "f2a627b84c1ff96f21ac2fcb623ab36142dd5512",
+        "version" : "1.10.0"
       }
     },
     {
@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/arkavo-org/OpenTDFKit",
       "state" : {
-        "revision" : "5e68ccb2e41744ab73506f3d250e0a7f44a6fc80",
-        "version" : "4.0.1"
+        "revision" : "3512e279d371e19f1495be13be3229c2e24c8783",
+        "version" : "5.0.1"
       }
     },
     {

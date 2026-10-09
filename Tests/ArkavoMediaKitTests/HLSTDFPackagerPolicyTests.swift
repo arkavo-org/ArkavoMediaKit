@@ -13,13 +13,15 @@ import ZIPFoundation
 /// (HLS tier gating).
 ///
 /// KAS contract (opentdf/platform `service/kas/access/rewrap.go`
-/// `verifyPolicyBinding`), and what OpenTDFKit >= 4.0.1
+/// `verifyPolicyBinding`, with opentdf/platform#4081), and what OpenTDFKit >= 5.0
 /// `TDFCrypto.policyBinding(policy:symmetricKey:)` emits when handed the RAW
-/// policy JSON:
+/// policy JSON — the OpenTDF spec form:
 ///
 ///   manifest.policy              = base64(policyJSON)
 ///   digest                       = HMAC-SHA256(key: DEK, msg: utf8(manifest.policy))
-///   manifest.policyBinding.hash  = base64(utf8(hex(digest)))   // 64 hex chars
+///   manifest.policyBinding.hash  = base64(digest)   // 44 chars, 32 raw bytes
+///
+/// OpenTDFKit 4 emitted the legacy base64(utf8(hex(digest))) instead.
 ///
 /// The packager must therefore pass the raw JSON to `policyBinding`; passing
 /// the already-base64'd string double-encodes and fails KAS rewrap.
@@ -76,20 +78,12 @@ struct HLSTDFPackagerPolicyTests {
         try #require(manifest["encryptionInformation"] as? [String: Any])
     }
 
-    /// Decodes a manifest `policyBinding.hash` the way rewrap.go does:
-    /// base64 -> 64-char hex string -> 32 raw digest bytes.
+    /// Decodes a manifest `policyBinding.hash` in the spec form:
+    /// base64 -> 32 raw digest bytes (44 base64 characters).
     private func decodeBindingHash(_ hash: String) throws -> Data {
-        let hexData = try #require(Data(base64Encoded: hash))
-        let hex = try #require(String(data: hexData, encoding: .utf8))
-        #expect(hex.count == 64, "expected 64 hex chars, got \(hex.count): \(hex)")
-        #expect(hex.allSatisfy { $0.isHexDigit })
-        var digest = Data(capacity: 32)
-        var idx = hex.startIndex
-        while idx < hex.endIndex {
-            let next = hex.index(idx, offsetBy: 2)
-            digest.append(try #require(UInt8(hex[idx..<next], radix: 16)))
-            idx = next
-        }
+        #expect(hash.count == 44, "expected 44 base64 chars, got \(hash.count): \(hash)")
+        let digest = try #require(Data(base64Encoded: hash))
+        #expect(digest.count == 32, "expected a 32-byte digest, got \(digest.count) bytes")
         return digest
     }
 
@@ -131,11 +125,11 @@ struct HLSTDFPackagerPolicyTests {
         return (dek, policyJSON)
     }
 
-    // MARK: - (b) OpenTDFKit contract: raw JSON in, base64(hex(HMAC(base64))) out
+    // MARK: - (b) OpenTDFKit contract: raw JSON in, base64(HMAC(base64)) out
 
-    @Test("TDFCrypto.policyBinding over raw policy JSON matches the KAS wire format")
+    @Test("TDFCrypto.policyBinding over raw policy JSON is the spec binding")
     func policyBindingKASWireFormat() throws {
-        // Pins the OpenTDFKit >= 4.0.1 contract the packager relies on, with a
+        // Pins the OpenTDFKit >= 5.0 contract the packager relies on, with a
         // known DEK so the value is reproducible.
         let dek = Data(repeating: 0xAB, count: 16)
         let key = SymmetricKey(data: dek)
@@ -145,7 +139,7 @@ struct HLSTDFPackagerPolicyTests {
         let binding = TDFCrypto.policyBinding(policy: policyJSON, symmetricKey: key)
         #expect(binding.alg == "HS256")
 
-        // hash base64-decodes to 64 hex chars, which hex-decode to the digest.
+        // hash base64-decodes to the raw 32-byte digest.
         let digest = try decodeBindingHash(binding.hash)
         #expect(digest.count == 32)
 
@@ -155,8 +149,11 @@ struct HLSTDFPackagerPolicyTests {
             for: Data(policyBase64.utf8), using: key))
         #expect(digest == expected)
 
-        let expectedHex = expected.map { String(format: "%02x", $0) }.joined()
-        #expect(binding.hash == Data(expectedHex.utf8).base64EncodedString())
+        #expect(binding.hash == expected.base64EncodedString())
+
+        // Not the legacy OpenTDFKit 4 form, base64(utf8(hex(digest))).
+        let legacyHex = expected.map { String(format: "%02x", $0) }.joined()
+        #expect(binding.hash != Data(legacyHex.utf8).base64EncodedString())
     }
 
     // MARK: - (a) nil policyJSON: generated-UUID placeholder policy
