@@ -229,7 +229,7 @@ private enum Fixture {
     static let iv = Data(repeating: 0x01, count: 16).base64EncodedString()
 
     /// The binding the packager would have written (HMAC over the base64
-    /// policy string, hex, base64) for some DEK; the fake KAS never checks it,
+    /// policy string, base64) for some DEK; the fake KAS never checks it,
     /// the tests only assert it reaches the wire unchanged.
     static var policyBinding: TDFPolicyBinding {
         TDFCrypto.policyBinding(policy: Data(policyJSON.utf8), symmetricKey: SymmetricKey(data: Data(repeating: 0xAB, count: 16)))

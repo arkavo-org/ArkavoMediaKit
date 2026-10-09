@@ -47,10 +47,11 @@ public actor HLSTDFPackager {
     ///     `{"uuid":"<generated UUID>","body":{}}` is embedded; the uuid is
     ///     freshly generated (lowercase, as the Go side emits) and is NOT the
     ///     asset id, which lives in `meta.hls.assetId`. In both cases the
-    ///     policy binding is the OpenTDF wire
-    ///     form the opentdf-platform KAS verifies: `base64(hex(HMAC-SHA256(DEK,
-    ///     base64(policyJSON))))`, computed by `TDFCrypto.policyBinding` from
-    ///     the raw policy JSON (OpenTDFKit >= 4.0.1).
+    ///     policy binding is the OpenTDF spec form:
+    ///     `base64(HMAC-SHA256(DEK, base64(policyJSON)))`, the raw 32-byte
+    ///     digest, computed by `TDFCrypto.policyBinding` from the raw policy
+    ///     JSON (OpenTDFKit >= 5.0). Rewrap needs a KAS with
+    ///     opentdf/platform#4081; platform.arkavo.net has it.
     /// - Returns: TDF archive data
     /// - Throws: HLSTDFPackagerError if packaging fails
     public func package(
@@ -157,11 +158,11 @@ public actor HLSTDFPackager {
     ) throws -> Data {
         // Resolve the policy: caller-supplied (data attributes) or a minimal
         // placeholder when nil. `policyData` is the RAW policy JSON; it is passed
-        // as-is to `TDFCrypto.policyBinding`, which (OpenTDFKit >= 4.0.1)
+        // as-is to `TDFCrypto.policyBinding`, which (OpenTDFKit >= 5.0)
         // base64-encodes it internally, HMAC-SHA256s the base64 string with the
-        // DEK, and emits hash = base64(hex(digest)) — the wire format the KAS
-        // verifies (opentdf/platform rewrap.go verifyPolicyBinding HMACs the
-        // base64 policy body, then base64- and hex-decodes the manifest hash).
+        // DEK, and emits hash = base64(digest) — the spec form the KAS verifies
+        // (opentdf/platform rewrap.go verifyPolicyBinding HMACs the base64
+        // policy body; with #4081 it accepts the raw digest).
         // Passing the pre-base64'd string here would HMAC base64(base64(json))
         // and fail rewrap binding verification. The manifest `policy` field is
         // base64(policyData), i.e. the same string the KAS HMACs.
