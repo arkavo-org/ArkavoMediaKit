@@ -205,6 +205,28 @@ struct CBCSEncryptorTests {
         #expect(requested == [16])
     }
 
+    /// The package's constant IV, which every sample's CBC chain starts from: when the random source fails, there is
+    /// no IV, never an unfilled (zero) one.
+    @Test("The constant IV is 16 random bytes, and a failing random source throws instead")
+    func generateConstantIV() throws {
+        let iv1 = try CBCSEncryptor.generateConstantIV()
+        let iv2 = try CBCSEncryptor.generateConstantIV()
+        #expect(iv1.count == 16 && iv2.count == 16 && iv1 != iv2)
+        #expect(try CBCSEncryptor.generateConstantIV { count, bytes in
+            bytes.initializeMemory(as: UInt8.self, repeating: 0xA5, count: count)
+            return errSecSuccess
+        } == Data(repeating: 0xA5, count: 16))
+
+        var requested: [Int] = []
+        #expect(throws: CBCSEncryptor.Failure.randomBytesUnavailable(errSecAllocate)) {
+            _ = try CBCSEncryptor.generateConstantIV { count, _ in
+                requested.append(count)
+                return errSecAllocate
+            }
+        }
+        #expect(requested == [16])
+    }
+
     @Test("Generate random IV produces unique values")
     func generateIVUnique() {
         let iv1 = CBCSEncryptor.generateIV()

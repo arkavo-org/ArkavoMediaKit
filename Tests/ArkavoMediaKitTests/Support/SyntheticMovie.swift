@@ -22,6 +22,16 @@ enum SyntheticMovie {
         case aac(tracks: Int)
         /// One 16-bit linear PCM track.
         case pcm
+        /// One AAC-LC track of `channels` channels in `layout`, the tone in each. Apple's encoder writes a layout no
+        /// AAC channel configuration names with channelConfiguration 0 and a program config element (quadraphonic),
+        /// or with a configuration that ISO/IEC 14496-3 reserved before it named it (11, for 6.1 and 7.0).
+        case aacLayout(channels: Int, layout: AudioChannelLayoutTag)
+
+        /// Each track's channel count and layout (nil: mono, no layout).
+        var channels: (count: Int, layout: AudioChannelLayoutTag?) {
+            if case let .aacLayout(channels, layout) = self { return (channels, layout) }
+            return (1, nil)
+        }
     }
 
     /// A 320x180, 30 fps H.264 `.mov` of `frames` solid-colour frames.
@@ -75,6 +85,7 @@ enum SyntheticMovie {
         guard writer.canAdd(input) else { throw Failure.writerRejectedInput }
         writer.add(input)
         let audioInputs = try sound.map { try addAudio($0, to: writer) } ?? []
+        let audioChannels = sound?.channels ?? (1, nil)
         guard writer.startWriting() else { throw writer.error ?? Failure.startFailed }
         writer.startSession(atSourceTime: .zero)
 
@@ -103,7 +114,8 @@ enum SyntheticMovie {
                 let count = min(1_024, audioEnd - audioFrames)
                 for (index, audioInput) in audioInputs.enumerated() {
                     try await waitUntilReady(audioInput, frame)
-                    guard audioInput.append(try tone(track: index, from: audioFrames, count: count)) else {
+                    guard audioInput.append(try tone(track: index, channels: audioChannels, from: audioFrames,
+                                                     count: count)) else {
                         throw writer.error ?? Failure.append(frame)
                     }
                 }
@@ -198,6 +210,10 @@ extension SyntheticMovie {
             tracks = count
             settings = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: audioRate,
                         AVNumberOfChannelsKey: 1, AVEncoderBitRateKey: 64_000]
+        case let .aacLayout(channels, layout):
+            tracks = 1
+            settings = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: audioRate,
+                        AVNumberOfChannelsKey: channels, AVChannelLayoutKey: layoutData(layout)]
         case .pcm:
             tracks = 1
             settings = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: audioRate, AVNumberOfChannelsKey: 1,
@@ -213,31 +229,46 @@ extension SyntheticMovie {
         }
     }
 
+    private static func layoutData(_ tag: AudioChannelLayoutTag) -> Data {
+        var layout = AudioChannelLayout()
+        layout.mChannelLayoutTag = tag
+        return Data(bytes: &layout, count: MemoryLayout<AudioChannelLayout>.size)
+    }
+
     /// `count` frames of a sine tone (440 Hz, and a fifth higher for each further track) from frame `start`, as
-    /// 16-bit linear PCM.
-    private static func tone(track: Int, from start: Int, count: Int) throws -> CMSampleBuffer {
+    /// 16-bit linear PCM, the same in each of `channels`.
+    private static func tone(track: Int, channels: (count: Int, layout: AudioChannelLayoutTag?), from start: Int,
+                             count: Int) throws -> CMSampleBuffer {
+        let width = channels.count
         var description = AudioStreamBasicDescription(
             mSampleRate: audioRate, mFormatID: kAudioFormatLinearPCM,
             mFormatFlags: kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked,
-            mBytesPerPacket: 2, mFramesPerPacket: 1, mBytesPerFrame: 2, mChannelsPerFrame: 1, mBitsPerChannel: 16,
-            mReserved: 0)
+            mBytesPerPacket: UInt32(2 * width), mFramesPerPacket: 1, mBytesPerFrame: UInt32(2 * width),
+            mChannelsPerFrame: UInt32(width), mBitsPerChannel: 16, mReserved: 0)
         var format: CMAudioFormatDescription?
-        var status = CMAudioFormatDescriptionCreate(allocator: nil, asbd: &description, layoutSize: 0, layout: nil,
-                                                    magicCookieSize: 0, magicCookie: nil, extensions: nil,
-                                                    formatDescriptionOut: &format)
+        var layout = AudioChannelLayout()
+        layout.mChannelLayoutTag = channels.layout ?? 0
+        var status = withUnsafePointer(to: &layout) { layoutPointer in
+            CMAudioFormatDescriptionCreate(
+                allocator: nil, asbd: &description,
+                layoutSize: channels.layout == nil ? 0 : MemoryLayout<AudioChannelLayout>.size,
+                layout: channels.layout == nil ? nil : layoutPointer, magicCookieSize: 0, magicCookie: nil,
+                extensions: nil, formatDescriptionOut: &format)
+        }
         guard status == noErr, let format else { throw Failure.audio(status) }
         let frequency = 440.0 * pow(1.5, Double(track))
-        let samples = (0 ..< count).map { offset in
-            Int16(8_000 * sin(2 * Double.pi * frequency * Double(start + offset) / audioRate))
+        let samples = (0 ..< count * width).map { index in
+            Int16(8_000 * sin(2 * Double.pi * frequency * Double(start + index / width) / audioRate))
         }
+        let length = count * width * 2
         var block: CMBlockBuffer?
-        status = CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: nil, blockLength: count * 2,
+        status = CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: nil, blockLength: length,
                                                     blockAllocator: nil, customBlockSource: nil, offsetToData: 0,
-                                                    dataLength: count * 2, flags: 0, blockBufferOut: &block)
+                                                    dataLength: length, flags: 0, blockBufferOut: &block)
         guard status == noErr, let block else { throw Failure.audio(status) }
         status = samples.withUnsafeBytes {
             CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block, offsetIntoDestination: 0,
-                                          dataLength: count * 2)
+                                          dataLength: length)
         }
         guard status == noErr else { throw Failure.audio(status) }
         var buffer: CMSampleBuffer?
@@ -252,4 +283,113 @@ extension SyntheticMovie {
 
 private extension CMTimeValue {
     func clamped(min lower: CMTimeValue) -> CMTimeValue { Swift.max(self, lower) }
+}
+
+extension SyntheticMovie {
+    /// A copy of `movie`'s video alone, written as it is (no re-encoding), each sample's NAL units passed through
+    /// `transform` and written with `nalLengthSize`-byte lengths, which the copy's avcC declares. The source's NAL
+    /// units have 4-byte lengths.
+    static func rewritingVideo(of movie: URL, in dir: URL, nalLengthSize: Int = 4,
+                               transform: @escaping ([Data]) -> [Data] = { $0 }) async throws -> URL {
+        let asset = AVURLAsset(url: movie)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first,
+              let source = try await track.load(.formatDescriptions).first
+        else { throw Failure.writerRejectedInput }
+        // The source's parameter sets, under the new length size.
+        var count = 0
+        var status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+            source, parameterSetIndex: 0, parameterSetPointerOut: nil, parameterSetSizeOut: nil,
+            parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil)
+        guard status == noErr else { throw Failure.audio(status) }
+        var pointers: [UnsafePointer<UInt8>] = [], sizes: [Int] = []
+        for index in 0 ..< count {
+            var pointer: UnsafePointer<UInt8>?, size = 0
+            status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                source, parameterSetIndex: index, parameterSetPointerOut: &pointer, parameterSetSizeOut: &size,
+                parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil)
+            guard status == noErr, let pointer else { throw Failure.audio(status) }
+            pointers.append(pointer)
+            sizes.append(size)
+        }
+        var format: CMFormatDescription?
+        status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+            allocator: nil, parameterSetCount: count, parameterSetPointers: pointers, parameterSetSizes: sizes,
+            nalUnitHeaderLength: Int32(nalLengthSize), formatDescriptionOut: &format)
+        guard status == noErr, let format else { throw Failure.audio(status) }
+
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        reader.add(output)
+        let url = dir.appendingPathComponent("rewritten-\(UUID().uuidString).mov")
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: format)
+        input.expectsMediaDataInRealTime = false
+        guard writer.canAdd(input) else { throw Failure.writerRejectedInput }
+        writer.add(input)
+        guard reader.startReading(), writer.startWriting() else { throw writer.error ?? Failure.startFailed }
+        writer.startSession(atSourceTime: .zero)
+        var frame = 0
+        while let buffer = output.copyNextSampleBuffer() {
+            guard let block = CMSampleBufferGetDataBuffer(buffer) else { continue }
+            var bytes = [UInt8](repeating: 0, count: CMBlockBufferGetDataLength(block))
+            guard CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: bytes.count, destination: &bytes) == noErr
+            else { throw Failure.append(frame) }
+            var nals: [Data] = [], offset = 0
+            while offset + 4 <= bytes.count {
+                let length = bytes[offset ..< offset + 4].reduce(0) { $0 << 8 | Int($1) }
+                nals.append(Data(bytes[offset + 4 ..< offset + 4 + length]))
+                offset += 4 + length
+            }
+            var sample = Data()
+            for nal in transform(nals) {
+                sample += (0 ..< nalLengthSize).reversed().map { UInt8(truncatingIfNeeded: nal.count >> (8 * $0)) }
+                sample += nal
+            }
+            var timing = CMSampleTimingInfo()
+            guard CMSampleBufferGetSampleTimingInfo(buffer, at: 0, timingInfoOut: &timing) == noErr else {
+                throw Failure.append(frame)
+            }
+            var rewritten: CMBlockBuffer?
+            status = CMBlockBufferCreateWithMemoryBlock(
+                allocator: nil, memoryBlock: nil, blockLength: sample.count, blockAllocator: nil,
+                customBlockSource: nil, offsetToData: 0, dataLength: sample.count,
+                flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &rewritten)
+            guard status == noErr, let rewritten else { throw Failure.audio(status) }
+            status = sample.withUnsafeBytes {
+                CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: rewritten,
+                                              offsetIntoDestination: 0, dataLength: sample.count)
+            }
+            guard status == noErr else { throw Failure.audio(status) }
+            var copy: CMSampleBuffer?
+            var size = sample.count
+            status = CMSampleBufferCreateReady(
+                allocator: nil, dataBuffer: rewritten, formatDescription: format, sampleCount: 1,
+                sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleSizeEntryCount: 1,
+                sampleSizeArray: &size, sampleBufferOut: &copy)
+            guard status == noErr, let copy else { throw Failure.audio(status) }
+            // Keep which samples are sync samples.
+            if let attachments = CMSampleBufferGetSampleAttachmentsArray(buffer, createIfNecessary: false)
+                as? [[CFString: Any]], attachments.first?[kCMSampleAttachmentKey_NotSync] as? Bool == true,
+                let target = CMSampleBufferGetSampleAttachmentsArray(copy, createIfNecessary: true) {
+                let dictionary = unsafeBitCast(CFArrayGetValueAtIndex(target, 0), to: CFMutableDictionary.self)
+                CFDictionarySetValue(dictionary, Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
+                                     Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+            }
+            let deadline = Date().addingTimeInterval(5)
+            while !input.isReadyForMoreMediaData {
+                guard Date() < deadline, writer.status != .failed else { throw writer.error ?? Failure.append(frame) }
+                try await Task.sleep(nanoseconds: 2_000_000)
+            }
+            guard input.append(copy) else { throw writer.error ?? Failure.append(frame) }
+            frame += 1
+        }
+        guard reader.status == .completed else { throw reader.error ?? Failure.finish }
+        input.markAsFinished()
+        await writer.finishWriting()
+        guard writer.status == .completed else { throw writer.error ?? Failure.finish }
+        return url
+    }
+
+    /// A filler data NAL unit (type 12): kept clear, its own subsample.
+    static let fillerNAL = Data([0x0C, 0xFF, 0xFF, 0x80])
 }

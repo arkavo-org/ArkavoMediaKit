@@ -387,8 +387,10 @@ struct FMP4ProtectSoundTests {
         return (Double(first.baseDecodeTime) / 48_000, Double(end) / 48_000)
     }
 
-    /// The package's audio, decrypted under its key and decoded to mono PCM at 48 kHz.
+    /// The package's audio, decrypted under its key and decoded to mono PCM at 48 kHz, once its fragments have passed
+    /// `audioFragments`' checks.
     private func decodedAudio(_ protected: Protected) throws -> (track: FMP4PackageReader.Track, pcm: [Float]) {
+        _ = try audioFragments(protected)
         let audioReader = try reader(.audio, of: protected)
         let audio = try #require(audioReader.tracks[1])
         let pcm = try AACDecoder.decode(try #require(audioReader.samples[1]),
@@ -581,6 +583,80 @@ struct FMP4ProtectSoundTests {
     }
 }
 
+extension FMP4ProtectSoundTests {
+    static func isPackagingFailed(_ error: (any Error)?) -> Bool {
+        if case .packagingFailed = error as? FMP4ProtectionError { return true }
+        return false
+    }
+
+    /// The AudioSpecificConfig channelConfiguration of the source's first audio track.
+    private func sourceChannelConfiguration(_ movie: URL) async throws -> Int? {
+        let track = try #require(try await AVURLAsset(url: movie).loadTracks(withMediaType: .audio).first)
+        let format = try #require(try await track.load(.formatDescriptions).first)
+        return FMP4RecordingProtectionService.audioSpecificConfig(of: format)
+            .flatMap(FairPlayPackage.channelConfiguration(ofAudioSpecificConfig:))
+    }
+
+    /// Apple's encoder writes a quadraphonic track with channelConfiguration 0 and a program config element, and a 6.1
+    /// track with configuration 11: neither states a channel count a playlist may carry, so the one track is mixed and
+    /// re-encoded like any other sound that cannot pass through.
+    @Test("A single AAC-LC track whose layout has no channel configuration of its own is re-encoded, not refused",
+          arguments: [(4, kAudioChannelLayoutTag_AAC_Quadraphonic), (7, kAudioChannelLayoutTag_AAC_6_1)])
+    func oddLayoutTrack(channels: Int, layout: AudioChannelLayoutTag) async throws {
+        let dir = try directory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let movie = try await SyntheticMovie.make(in: dir, frames: 90,
+                                                  sound: .aacLayout(channels: channels, layout: layout))
+        let configuration = try #require(try await sourceChannelConfiguration(movie))
+        try #require(configuration == 0 || (8 ... 15).contains(configuration), "configuration \(configuration)")
+
+        let protected = try await protect(movie: movie, policyJSON: nil)
+
+        let (audio, pcm) = try decodedAudio(protected)
+        #expect(audio.sampleEntry == "enca" && audio.audioObjectType == 2)
+        // The mix: stereo AAC-LC, which the master playlist states.
+        #expect(audio.channelCount == 2)
+        #expect(try lines(protected, "master.m3u8").contains { $0.contains(#"CHANNELS="2""#) })
+        expectTones([440], in: pcm)
+    }
+
+    /// The init's avcC always declares 4-byte NAL unit lengths: samples with shorter ones would be undecodable.
+    @Test("A source whose NAL units have 2-byte lengths is refused, never packaged under an avcC that says 4")
+    func shortNALLengths() async throws {
+        let dir = try directory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let movie = try await SyntheticMovie.rewritingVideo(
+            of: try await SyntheticMovie.make(in: dir, frames: 30), in: dir, nalLengthSize: 2)
+
+        let error = await #expect(throws: FMP4ProtectionError.self) {
+            _ = try await protect(movie: movie, policyJSON: nil)
+        }
+        #expect(Self.isPackagingFailed(error), "\(String(describing: error))")
+    }
+
+    /// `saiz` states each sample's `senc` entry in one byte: 2 + 6 per subsample, at most 42 subsamples.
+    @Test("A video sample of 43 subsamples is refused, never written with a saiz that cannot state its senc entry")
+    func tooManySubsamples() async throws {
+        let dir = try directory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let source = try await SyntheticMovie.make(in: dir, frames: 30)
+        // Every NAL unit is its own subsample: pad each sample with filler NAL units to `count`.
+        func padded(to count: Int) async throws -> URL {
+            try await SyntheticMovie.rewritingVideo(of: source, in: dir) { nals in
+                nals + Array(repeating: SyntheticMovie.fillerNAL, count: max(0, count - nals.count))
+            }
+        }
+
+        let error = await #expect(throws: FMP4ProtectionError.self) {
+            _ = try await protect(movie: try await padded(to: 43), policyJSON: nil)
+        }
+        #expect(Self.isPackagingFailed(error), "\(String(describing: error))")
+        // 42 subsamples (a 254-byte entry) are protected.
+        let protected = try await protect(movie: try await padded(to: 42), policyJSON: nil)
+        #expect(try reader(.video, of: protected).samples[1]?.count == 30)
+    }
+}
+
 /// Whether placed audio covers the video's span (ADR-0055 §4): every segment holds a packet; the sound starts within a
 /// packet of the first presented frame and ends within a packet of the video's end; and laid end to end, as the
 /// segments place them, every packet stays within a packet of its own time.
@@ -711,7 +787,82 @@ struct FMP4SegmentCountTests {
     @Test("A component holds at most 4,093 segments")
     func limit() throws {
         try FMP4RecordingProtectionService.checkSegmentCount(4_093)
-        #expect(throws: FMP4ProtectionError.self) { try FMP4RecordingProtectionService.checkSegmentCount(4_094) }
+        let error = #expect(throws: FMP4ProtectionError.self) {
+            try FMP4RecordingProtectionService.checkSegmentCount(4_094)
+        }
+        #expect(FMP4ProtectSoundTests.isPackagingFailed(error))
+    }
+}
+
+/// A stored ZIP without ZIP64: every size and offset is 32 bits, so an archive holds at most 4,294,967,295 bytes. A
+/// longer recording is refused before the archive is assembled, never trapped on or truncated.
+@Suite("fMP4 archive size")
+struct FMP4ArchiveSizeTests {
+    /// A directory of `entries`, each of its size in bytes.
+    private func directory(_ entries: [(name: String, size: Int)]) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("fmp4-zip-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for (index, entry) in entries.enumerated() {
+            try Data((0 ..< entry.size).map { UInt8(truncatingIfNeeded: $0 &* 7 &+ index) })
+                .write(to: dir.appendingPathComponent(entry.name))
+        }
+        return dir
+    }
+
+    @Test("The archive's size is computed exactly: 30 + name + data an entry, 46 + name in the directory, 22 at the end")
+    func exactSize() throws {
+        let entries = [("master.m3u8", 213), ("video.m3u8", 0), ("video-init.mp4", 1_021), ("video-segment0.m4s", 70_001)]
+        let dir = try directory(entries)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let manifest = Data(#"{"encryptionInformation":{}}"#.utf8)
+
+        let archive = try FMP4RecordingProtectionService.createTDFArchive(
+            tempDir: dir, manifestData: manifest, entryNames: entries.map(\.0))
+
+        let size = FMP4RecordingProtectionService.archiveSize(
+            entries: [(FairPlayPackage.manifestName, manifest.count)] + entries.map { (name: $0.0, size: $0.1) })
+        #expect(UInt64(archive.count) == size)
+        // One entry by hand: 30 + 11 + 213 + 46 + 11 + 22.
+        #expect(FMP4RecordingProtectionService.archiveSize(entries: [("master.m3u8", 213)]) == 333)
+        let zip = try Archive(data: archive, accessMode: .read)
+        #expect(zip.map(\.path) == [FairPlayPackage.manifestName] + entries.map(\.0))
+    }
+
+    @Test("An archive of 4,294,967,295 bytes is accepted; one more byte is refused as packagingFailed")
+    func ceiling() throws {
+        try FMP4RecordingProtectionService.checkArchiveSize(4_294_967_295)
+        let error = #expect(throws: FMP4ProtectionError.self) {
+            try FMP4RecordingProtectionService.checkArchiveSize(4_294_967_296)
+        }
+        #expect(FMP4ProtectSoundTests.isPackagingFailed(error))
+        // The ceiling falls inside a recording's last segment.
+        let name = "video-segment4092.m4s", overhead = 30 + name.utf8.count + 46 + name.utf8.count + 22
+        let largest = FMP4RecordingProtectionService.archiveSize(entries: [(name, 4_294_967_295 - overhead)])
+        #expect(largest == 4_294_967_295)
+        #expect(FMP4RecordingProtectionService.archiveSize(entries: [(name, 4_294_967_296 - overhead)])
+            == 4_294_967_296)
+        #expect(FMP4RecordingProtectionService.archiveSize(entries: Array(repeating: (name, Int(UInt32.max)), count: 3))
+            > 3 * UInt64(UInt32.max))
+    }
+
+    @Test("Entries that take the archive past the ceiling are refused before any is read")
+    func refusedBeforeReading() throws {
+        let entries = [("master.m3u8", 100), ("video-segment0.m4s", 1_000)]
+        let dir = try directory(entries)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        var asked: [String] = []
+
+        // The files on disk are small; their sizes, as the archive is told them, are not.
+        let error = #expect(throws: FMP4ProtectionError.self) {
+            _ = try FMP4RecordingProtectionService.createTDFArchive(
+                tempDir: dir, manifestData: Data("{}".utf8), entryNames: entries.map(\.0)) { url in
+                asked.append(url.lastPathComponent)
+                return url.lastPathComponent == "video-segment0.m4s" ? 4 << 30 : 100
+            }
+        }
+
+        #expect(FMP4ProtectSoundTests.isPackagingFailed(error))
+        #expect(asked == entries.map(\.0))
     }
 }
 

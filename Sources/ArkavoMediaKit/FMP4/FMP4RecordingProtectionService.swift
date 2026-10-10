@@ -40,8 +40,10 @@ public actor FMP4RecordingProtectionService {
     ///     - Its `uuid` must be a lower-case UUID: each component's key URI is `skd://<uuid>/<id>`.
     ///     - Nil embeds `FairPlayPolicy.placeholderJSON()`, which the license service refuses (no data attributes).
     /// - Returns: The TDF ZIP archive.
-    /// - Throws: `FMP4ProtectionError.packagingFailed` for more than 4,093 segments, and `unsupportedAudio` for sound
-    ///   that cannot be made into an audio component covering the video, rather than drop it.
+    /// - Throws: `FMP4ProtectionError.packagingFailed` for more than 4,093 segments, an archive over 4,294,967,295
+    ///   bytes (a ZIP without ZIP64), a source whose NAL unit lengths are not 4 bytes, or a video sample of more than 42
+    ///   subsamples; `unsupportedAudio` for sound that cannot be made into an audio component covering the video,
+    ///   rather than drop it.
     public func protectVideo(
         videoURL: URL,
         assetID: String,
@@ -79,6 +81,11 @@ public actor FMP4RecordingProtectionService {
               let videoCodec = h264Params.sps.first.flatMap(FairPlayPackage.avc1Codec(sps:)) else {
             throw FMP4ProtectionError.noParameterSets
         }
+        // The init's avcC declares 4-byte NAL unit lengths, and the samples are written as the source has them.
+        try Self.checkNALLengthSize(h264Params.nalLengthSize)
+        // Every video sample byte is written: an archive that would hold more than a ZIP can is refused now, before
+        // anything is encrypted.
+        try Self.checkArchiveSize(UInt64(max(totalSampleBytes, 0)))
         // Profile v2 carries the sound as its own component whenever the source has sound (ADR-0055 §1).
         let audioTracks = try await asset.loadTracks(withMediaType: .audio)
 
@@ -86,7 +93,7 @@ public actor FMP4RecordingProtectionService {
         print("🔑 Generating content encryption keys...")
         let videoKey = try CBCSEncryptor.generateContentKey()
         let audioKey = audioTracks.isEmpty ? nil : try CBCSEncryptor.generateContentKey()
-        let constantIV = CBCSEncryptor.generateIV()
+        let constantIV = try CBCSEncryptor.generateConstantIV()
         // All-zero KID: FairPlay keys off the skd:// URI, not the KID, which is CENC bookkeeping only
         let keyID = Data(repeating: 0, count: 16)
         let componentKeys = [FairPlayComponentKey(component: .video, key: videoKey)]
@@ -148,6 +155,7 @@ public actor FMP4RecordingProtectionService {
             // Encrypt the sample using the actual NAL length size from the source video
             let encryptedResult = try encryptor.encryptVideoSample(sampleData, nalLengthSize: nalLengthSize,
                                                                    sliceHeaders: sliceHeaders)
+            try Self.checkSubsampleCount(encryptedResult.subsamples.count)
 
             // CRITICAL ALIGNMENT CHECK: sum(clear + protected) must equal sample_size
             let originalSize = sampleData.count
@@ -340,7 +348,8 @@ public actor FMP4RecordingProtectionService {
             [FairPlayPackage.playlistName(component), FairPlayPackage.initName(component)]
                 + durations.indices.map { FairPlayPackage.segmentName(component, index: $0) }
         }
-        let archive = try createTDFArchive(tempDir: tempDir, manifestData: enhancedManifestData, entryNames: entryNames)
+        let archive = try Self.createTDFArchive(tempDir: tempDir, manifestData: enhancedManifestData,
+                                                entryNames: entryNames)
 
         print("✅ fMP4 FairPlay protection complete: \(archive.count) bytes")
         return archive
@@ -436,13 +445,15 @@ public actor FMP4RecordingProtectionService {
     /// silence where there is no sound, into `directory`:
     /// - several tracks, as a recorder writes one per source;
     /// - audio in another format;
+    /// - AAC-LC whose channel configuration states no channel count a playlist may carry: 0 (a program config element
+    ///   sets the channels, as Apple's encoder writes a quadraphonic track) or 8 to 15 (11 for 6.1);
     /// - a track that starts after the first presented frame or stops before the video's end;
     /// - a track whose packets are not contiguous: a gap or an overlap of more than a packet.
     ///
     /// Profile v2 needs every segment of each component to name the same span, with the audio's decode times
     /// contiguous (ADR-0055 §4), and sound is never dropped.
-    /// - Throws: `unsupportedAudio` for AAC-LC whose channel configuration states no supported channel count, and when
-    ///   even the mix does not cover the video.
+    /// - Throws: `unsupportedAudio` when the mix is not AAC-LC of a supported channel count, or even the mix does not
+    ///   cover the video.
     static func coveringAudio(of asset: AVURLAsset, tracks: [AVAssetTrack], mixingIn directory: URL,
                               encryptor: CBCSEncryptor, timeOffset: Double, videoStart: Double, videoEnd: Double,
                               segmentStarts: [Double]) async throws
@@ -462,7 +473,8 @@ public actor FMP4RecordingProtectionService {
         let mixedAsset = AVURLAsset(url: mixed.url)
         guard let track = try await mixedAsset.loadTracks(withMediaType: .audio).first,
               let source = try await passThrough(track, of: mixedAsset) else {
-            throw FMP4ProtectionError.unsupportedAudio("mixing the audio did not produce AAC-LC")
+            throw FMP4ProtectionError.unsupportedAudio(
+                "mixing the audio did not produce AAC-LC with a channel count a playlist may state")
         }
         // The mix's time 0 is its origin on the source's timeline.
         let packets = trim(try readAudio(source, encryptor: encryptor, timeOffset: timeOffset + mixed.origin.seconds),
@@ -519,22 +531,18 @@ public actor FMP4RecordingProtectionService {
         }
     }
 
-    /// `track` packaged as it is, when it is AAC-LC; otherwise nil.
-    /// - Throws: `unsupportedAudio` for AAC-LC whose channel configuration states no channel count a playlist may
-    ///   carry: 0 (a program config element sets the channels) or the reserved 8 to 15.
+    /// `track` packaged as it is, when it is AAC-LC whose channel configuration states a channel count a playlist may
+    /// carry (`FairPlayPackage.channelCount(ofAudioSpecificConfig:)`); otherwise nil, and the caller mixes it. Not
+    /// configuration 0 (a program config element sets the channels) or 8 to 15.
     private static func passThrough(_ track: AVAssetTrack, of asset: AVURLAsset) async throws -> AudioSource? {
         let descriptions = try await track.load(.formatDescriptions)
         guard descriptions.count == 1, let format = descriptions.first,
               CMFormatDescriptionGetMediaSubType(format) == kAudioFormatMPEG4AAC,
               let description = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
               description.mSampleRate > 0, description.mChannelsPerFrame > 0,
-              let config = audioSpecificConfig(of: format), config.count >= 2, config[config.startIndex] >> 3 == 2
+              let config = audioSpecificConfig(of: format), config.count >= 2, config[config.startIndex] >> 3 == 2,
+              let channels = FairPlayPackage.channelCount(ofAudioSpecificConfig: config)
         else { return nil }
-        guard let channels = FairPlayPackage.channelCount(ofAudioSpecificConfig: config) else {
-            let configuration = FairPlayPackage.channelConfiguration(ofAudioSpecificConfig: config)
-            throw FMP4ProtectionError.unsupportedAudio(
-                "AAC channel configuration \(configuration.map(String.init) ?? "unreadable") is not supported")
-        }
         let sampleRate = UInt32(description.mSampleRate)
         return AudioSource(
             asset: asset,
@@ -692,6 +700,30 @@ public actor FMP4RecordingProtectionService {
             presentationTimeStamp: time, packetDescriptions: nil, sampleBufferOut: &buffer)
         guard status == noErr, let buffer else { throw FMP4ProtectionError.encodingFailed("silence buffer \(status)") }
         return buffer
+    }
+
+    // MARK: - Limits
+
+    /// Refuses NAL unit lengths other than 4 bytes: the init's avcC declares 4, and the samples are written as the
+    /// source has them, so shorter ones would be undecodable.
+    static func checkNALLengthSize(_ size: Int) throws {
+        guard size == 4 else {
+            throw FMP4ProtectionError.packagingFailed(
+                "the video's NAL unit lengths are \(size) bytes; profile v2 packages 4-byte lengths only")
+        }
+    }
+
+    /// The most subsamples a video sample may have: its `senc` entry is 2 bytes plus 6 a subsample, and `saiz` states
+    /// that size in one byte (at most 255), so 42.
+    static let maxSubsamples = (255 - 2) / 6
+
+    /// Refuses a video sample of more than 42 subsamples (NAL units): its `senc` entry would be larger than `saiz` can
+    /// state, which would leave the two disagreeing.
+    static func checkSubsampleCount(_ count: Int) throws {
+        guard count <= maxSubsamples else {
+            throw FMP4ProtectionError.packagingFailed(
+                "a video sample has \(count) NAL units; its senc entry would exceed saiz's 255 bytes (at most 42)")
+        }
     }
 
     // MARK: - Segment count
@@ -1003,12 +1035,64 @@ public actor FMP4RecordingProtectionService {
         return try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])
     }
 
+    // MARK: - Archive
+
+    /// The largest archive a ZIP without ZIP64 can describe: every size and offset in it is 32 bits.
+    static let maxArchiveSize = UInt64(UInt32.max)
+
+    /// The exact size of the stored ZIP of `entries` that `createTDFArchive` writes: for each entry its local header (30
+    /// bytes), name and data, then for each its central directory entry (46 bytes) and name, then the end record (22
+    /// bytes). No extra fields, comments or data descriptors.
+    static func archiveSize(entries: [(name: String, size: Int)]) -> UInt64 {
+        entries.reduce(22) { total, entry in
+            total + 30 + 46 + 2 * UInt64(entry.name.utf8.count) + UInt64(max(entry.size, 0))
+        }
+    }
+
+    /// Refuses an archive larger than a ZIP without ZIP64 can describe (4,294,967,295 bytes). At or below it, no size,
+    /// offset or count in the archive is 0xFFFFFFFF, which a reader would take for ZIP64.
+    static func checkArchiveSize(_ size: UInt64) throws {
+        guard size <= maxArchiveSize else {
+            throw FMP4ProtectionError.packagingFailed(
+                "the archive would be \(size) bytes; a ZIP without ZIP64 holds at most 4,294,967,295")
+        }
+    }
+
+    static func fileSize(_ url: URL) throws -> Int {
+        guard let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
+            throw FMP4ProtectionError.packagingFailed("the size of \(url.lastPathComponent) is unknown")
+        }
+        return size
+    }
+
     /// A stored ZIP of `manifest.json` (`manifestData`), then each of `entryNames`, read from `tempDir`, in order.
-    private func createTDFArchive(
+    /// - Parameter entrySize: An entry's size, before it is read (the file's size on disk).
+    /// - Throws: `packagingFailed` when the archive would be larger than 4,294,967,295 bytes (`archiveSize`), before any
+    ///   entry is read.
+    static func createTDFArchive(
         tempDir: URL,
         manifestData: Data,
-        entryNames: [String]
+        entryNames: [String],
+        entrySize: (URL) throws -> Int = fileSize
     ) throws -> Data {
+        // Its size first, from the entries' sizes: nothing is read for an archive a ZIP cannot hold.
+        let sizes = try entryNames.map { (name: $0, size: try entrySize(tempDir.appendingPathComponent($0))) }
+        try checkArchiveSize(archiveSize(entries: [(FairPlayPackage.manifestName, manifestData.count)] + sizes))
+
+        // Within the ceiling every field fits; a conversion that does not is a failure, never a trap.
+        func field32(_ value: Int) throws -> UInt32 {
+            guard let field = UInt32(exactly: value) else {
+                throw FMP4ProtectionError.packagingFailed("\(value) does not fit a ZIP field")
+            }
+            return field
+        }
+        func field16(_ value: Int) throws -> UInt16 {
+            guard let field = UInt16(exactly: value) else {
+                throw FMP4ProtectionError.packagingFailed("\(value) does not fit a ZIP field")
+            }
+            return field
+        }
+
         // Create ZIP archive manually (simplified implementation)
         var archive = Data()
 
@@ -1037,14 +1121,16 @@ public actor FMP4RecordingProtectionService {
             localHeader.append(crc.littleEndianData)
 
             // Compressed size (same as uncompressed for store)
-            localHeader.append(UInt32(file.data.count).littleEndianData)
+            let size = try field32(file.data.count)
+            localHeader.append(size.littleEndianData)
 
             // Uncompressed size
-            localHeader.append(UInt32(file.data.count).littleEndianData)
+            localHeader.append(size.littleEndianData)
 
             // Filename length
-            let filenameData = file.name.data(using: .utf8) ?? Data()
-            localHeader.append(UInt16(filenameData.count).littleEndianData)
+            let filenameData = Data(file.name.utf8)
+            let filenameLength = try field16(filenameData.count)
+            localHeader.append(filenameLength.littleEndianData)
 
             // Extra field length
             localHeader.append(contentsOf: [0x00, 0x00])
@@ -1066,9 +1152,9 @@ public actor FMP4RecordingProtectionService {
             cdEntry.append(contentsOf: [0x00, 0x00])            // Last mod time
             cdEntry.append(contentsOf: [0x00, 0x00])            // Last mod date
             cdEntry.append(crc.littleEndianData)
-            cdEntry.append(UInt32(file.data.count).littleEndianData)
-            cdEntry.append(UInt32(file.data.count).littleEndianData)
-            cdEntry.append(UInt16(filenameData.count).littleEndianData)
+            cdEntry.append(size.littleEndianData)
+            cdEntry.append(size.littleEndianData)
+            cdEntry.append(filenameLength.littleEndianData)
             cdEntry.append(contentsOf: [0x00, 0x00])            // Extra field length
             cdEntry.append(contentsOf: [0x00, 0x00])            // Comment length
             cdEntry.append(contentsOf: [0x00, 0x00])            // Disk number start
@@ -1078,7 +1164,7 @@ public actor FMP4RecordingProtectionService {
             cdEntry.append(filenameData)
 
             centralDirectory.append(cdEntry)
-            localOffset = UInt32(archive.count)
+            localOffset = try field32(archive.count)
         }
 
         let cdOffset = archive.count
@@ -1089,10 +1175,10 @@ public actor FMP4RecordingProtectionService {
         eocd.append(contentsOf: [0x50, 0x4B, 0x05, 0x06]) // Signature
         eocd.append(contentsOf: [0x00, 0x00])            // Disk number
         eocd.append(contentsOf: [0x00, 0x00])            // CD start disk
-        eocd.append(UInt16(files.count).littleEndianData)
-        eocd.append(UInt16(files.count).littleEndianData)
-        eocd.append(UInt32(centralDirectory.count).littleEndianData)
-        eocd.append(UInt32(cdOffset).littleEndianData)
+        eocd.append(try field16(files.count).littleEndianData)
+        eocd.append(try field16(files.count).littleEndianData)
+        eocd.append(try field32(centralDirectory.count).littleEndianData)
+        eocd.append(try field32(cdOffset).littleEndianData)
         eocd.append(contentsOf: [0x00, 0x00])            // Comment length
 
         archive.append(eocd)
@@ -1101,7 +1187,7 @@ public actor FMP4RecordingProtectionService {
     }
 
     /// Simple CRC-32 implementation
-    private func crc32(_ data: Data) -> UInt32 {
+    private static func crc32(_ data: Data) -> UInt32 {
         var crc: UInt32 = 0xFFFFFFFF
         let table = makeCRCTable()
 
@@ -1113,7 +1199,7 @@ public actor FMP4RecordingProtectionService {
         return ~crc
     }
 
-    private func makeCRCTable() -> [UInt32] {
+    private static func makeCRCTable() -> [UInt32] {
         var table = [UInt32](repeating: 0, count: 256)
         for n in 0..<256 {
             var c = UInt32(n)
