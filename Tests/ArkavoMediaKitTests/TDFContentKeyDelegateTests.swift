@@ -282,23 +282,7 @@ extension FairPlayVerboseLoggingTests {
 
             // These should not crash
             FairPlayDebug.log("Test message")
-            FairPlayDebug.logData("Test data", data: Data([0x01, 0x02, 0x03]))
             FairPlayDebug.logRequest("GET", url: URL(string: "https://example.com")!, body: nil)
-            FairPlayDebug.logResponse(200, data: Data())
-
-            FairPlayDebugConfig.isVerboseLoggingEnabled = originalValue
-        }
-
-        @Test("logData truncates long data")
-        func logDataTruncation() {
-            let originalValue = FairPlayDebugConfig.isVerboseLoggingEnabled
-            FairPlayDebugConfig.isVerboseLoggingEnabled = true
-
-            // Create data longer than maxBytes
-            let longData = Data(repeating: 0xAB, count: 100)
-
-            // Should not crash and should truncate
-            FairPlayDebug.logData("Long data", data: longData, maxBytes: 10)
 
             FairPlayDebugConfig.isVerboseLoggingEnabled = originalValue
         }
@@ -316,22 +300,6 @@ extension FairPlayVerboseLoggingTests {
 
             // Should not crash
             FairPlayDebug.logRequest("POST", url: URL(string: "https://example.com")!, body: jsonData)
-
-            FairPlayDebugConfig.isVerboseLoggingEnabled = originalValue
-        }
-
-        @Test("logResponse handles text and binary data")
-        func logResponseHandlesDataTypes() {
-            let originalValue = FairPlayDebugConfig.isVerboseLoggingEnabled
-            FairPlayDebugConfig.isVerboseLoggingEnabled = true
-
-            // Text response
-            let textData = "Hello, World!".data(using: .utf8)!
-            FairPlayDebug.logResponse(200, data: textData)
-
-            // Binary response (non-UTF8)
-            let binaryData = Data([0x00, 0x01, 0xFF, 0xFE])
-            FairPlayDebug.logResponse(200, data: binaryData)
 
             FairPlayDebugConfig.isVerboseLoggingEnabled = originalValue
         }

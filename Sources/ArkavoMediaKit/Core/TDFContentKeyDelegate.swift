@@ -19,19 +19,13 @@ public enum FairPlayDebugConfig {
 
 private let fairPlayLog = OSLog(subsystem: "com.arkavo.mediakit", category: "FairPlay")
 
-/// Debug logger for FairPlay key exchange
+/// Debug logger for FairPlay key exchange. Nothing a server sends is ever logged, nor any key material: the exchange
+/// logs routes, statuses and sizes.
 enum FairPlayDebug {
     static func log(_ message: String, type: OSLogType = .debug) {
         guard FairPlayDebugConfig.isVerboseLoggingEnabled else { return }
         os_log("%{public}@", log: fairPlayLog, type: type, message)
         print("🎬 [FairPlay] \(message)")
-    }
-
-    static func logData(_ label: String, data: Data, maxBytes: Int = 64) {
-        guard FairPlayDebugConfig.isVerboseLoggingEnabled else { return }
-        let hex = data.prefix(maxBytes).map { String(format: "%02x", $0) }.joined(separator: " ")
-        let truncated = data.count > maxBytes ? "... (\(data.count) bytes total)" : ""
-        log("\(label): \(hex)\(truncated)")
     }
 
     static func logRequest(_ method: String, url: URL, body: Data?) {
@@ -50,20 +44,12 @@ enum FairPlayDebug {
             log("   Body: \(truncated)")
         }
     }
-
-    static func logResponse(_ statusCode: Int, data: Data) {
-        guard FairPlayDebugConfig.isVerboseLoggingEnabled else { return }
-        if let str = String(data: data, encoding: .utf8) {
-            log("← HTTP \(statusCode): \(str.prefix(500))")
-        } else {
-            log("← HTTP \(statusCode): \(data.count) bytes (binary)")
-        }
-    }
 }
 
 // MARK: - FairPlay Errors
 
-/// Errors that can occur during FairPlay key exchange
+/// Errors that can occur during FairPlay key exchange. A reason is the HTTP status or a fixed text, never what a server
+/// sent: a refusal's body can echo the SPC, the token or the session.
 public enum FairPlayError: Error, LocalizedError, Sendable {
     case sessionStartFailed(String)
     case certificateFetchFailed(String)
@@ -146,10 +132,11 @@ public struct FairPlayManifest: FairPlayManifestProtocol, Sendable {
 
 // MARK: - State Actor for Thread Safety
 
-/// The delegate's shared state: the certificate fetch, the keys delivered, and whether the outcome has been reported.
+/// The delegate's shared state: the certificate fetch, the keys AVFoundation has accepted, and whether the outcome has
+/// been reported.
 private actor FairPlayState {
     private var certificateFetch: Task<Data, Error>?
-    private var delivered: Set<String> = []
+    private var accepted: Set<String> = []
     private var settled = false
 
     /// The FairPlay certificate, fetched once for every request. After a failed fetch, the next request tries again.
@@ -165,16 +152,16 @@ private actor FairPlayState {
         }
     }
 
-    /// True once: when `uri`'s delivery completes `expected`, before any failure.
-    func deliver(_ uri: String, expected: Set<String>) -> Bool {
-        guard !settled else { return false }
-        delivered.insert(uri)
-        guard delivered.isSuperset(of: expected) else { return false }
+    /// True once: when AVFoundation's acceptance of `uri`, one of `expected`, completes `expected`, before any failure.
+    func accept(_ uri: String, expected: Set<String>) -> Bool {
+        guard !settled, expected.contains(uri) else { return false }
+        accepted.insert(uri)
+        guard accepted.isSuperset(of: expected) else { return false }
         settled = true
         return true
     }
 
-    /// True once: for the first failure before every key was delivered.
+    /// True once: for the first failure before every key was accepted.
     func fail() -> Bool {
         guard !settled else { return false }
         settled = true
@@ -196,19 +183,26 @@ private actor FairPlayState {
 /// 2. the SPC, whose content identifier is `<policy uuid>/<id>` (profile v1: the uuid);
 /// 3. a session for the policy uuid, the key request, and the session's end. The key request carries the SPC, the
 ///    archive manifest and, for a component, `component`;
-/// 4. the CKC, given to AVFoundation.
+/// 4. the CKC, given to AVFoundation, which accepts it (`contentKeySession(_:contentKeyRequestDidSucceed:)`) or fails
+///    the request.
+///
+/// None of these requests follows a redirect: each carries the bearer token, and the key request the SPC and the
+/// manifest. A 3xx fails the key like any other non-2xx. No request body names the user.
 ///
 /// A request for any other key is refused without a request. So is every request when the archive manifest's
 /// `arkavo:components` is malformed (`FairPlayComponents.Error.malformedComponents`): such a package has no keys.
 ///
 /// The outcome is reported at most once, on the main queue:
-/// - `onKeyDelivered`, once every one of `keyIdentifiers` has had its first key given to AVFoundation; or
+/// - `onKeyDelivered`, once AVFoundation has accepted the first key of every one of `keyIdentifiers`
+///   (`contentKeySession(_:contentKeyRequestDidSucceed:)`; a CKC handed to AVFoundation is not yet a key accepted); or
 /// - `onKeyFailed`, at the first failure before that: a refused, unknown or failed key request, or AVFoundation's own
-///   failure of a key request (`contentKeySession(_:contentKeyRequest:didFailWithError:)`).
+///   failure of a key request (`contentKeySession(_:contentKeyRequest:didFailWithError:)`), a CKC it rejects included.
+///   The error is the delegate's own when it failed the request itself, not AVFoundation's report of that failure.
 ///
 /// Never both, and neither twice, whatever the number, order or outcome of the requests, so a caller can resume one
 /// continuation from either. A renewal never reports: it is answered, or its failure goes to AVFoundation alone. Nor
-/// does anything after the outcome: a later key is still answered, and a later failure goes to AVFoundation alone.
+/// does anything after the outcome: a later key is still answered, and a later failure goes to AVFoundation alone. A
+/// renewal's acceptance never counts towards the outcome.
 ///
 /// If AVFoundation asks for fewer keys than the package has, neither callback is ever called: a caller that waits for
 /// the outcome needs its own timeout. Set both callbacks before giving the delegate to a session: an outcome reached
@@ -229,19 +223,19 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
     /// The package's keys, or why it has none.
     private let targets: Result<[FairPlayKeyTarget], any Error>
     private let serverURL: URL
-    private let userId: String
     private let authToken: String?
     private let http: any FairPlayHTTP
     private let state = FairPlayState()
     private let callbacks = Mutex(Callbacks())
 
-    /// Called at most once, on the main queue, when every key the package's playlists ask for has been delivered.
+    /// Called at most once, on the main queue, when AVFoundation has accepted every key the package's playlists ask
+    /// for.
     public var onKeyDelivered: (@Sendable () -> Void)? {
         get { callbacks.withLock { $0.delivered } }
         set { callbacks.withLock { $0.delivered = newValue } }
     }
 
-    /// Called at most once, on the main queue, at the first failure before every key was delivered.
+    /// Called at most once, on the main queue, at the first failure before every key was accepted.
     public var onKeyFailed: (@Sendable (Error) -> Void)? {
         get { callbacks.withLock { $0.failed } }
         set { callbacks.withLock { $0.failed = newValue } }
@@ -255,23 +249,22 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
     /// - Parameters:
     ///   - manifest: The TDF manifest containing encryption info
     ///   - authToken: Optional authentication token for server requests
-    ///   - userId: User identifier for session (defaults to "anonymous")
+    ///   - userId: Unused, kept for source compatibility. No request names the user (ADR-0046 §4's never-sent list,
+    ///     which ADR-0055 §7 keeps): the bearer token identifies the viewer.
     ///   - serverURL: FairPlay server URL (defaults to 100.arkavo.net)
     public convenience init(
         manifest: Manifest,
         authToken: String? = nil,
-        userId: String = "anonymous",
+        userId _: String = "anonymous",
         serverURL: URL = URL(string: "https://100.arkavo.net")!
     ) {
-        self.init(manifest: manifest, authToken: authToken, userId: userId, serverURL: serverURL,
-                  http: URLSessionFairPlayHTTP())
+        self.init(manifest: manifest, authToken: authToken, serverURL: serverURL, http: URLSessionFairPlayHTTP())
     }
 
-    init(manifest: Manifest, authToken: String?, userId: String, serverURL: URL, http: any FairPlayHTTP) {
+    init(manifest: Manifest, authToken: String?, serverURL: URL, http: any FairPlayHTTP) {
         self.manifest = manifest
         self.targets = Result { try FairPlayKeyTarget.targets(for: manifest) }
         self.authToken = authToken
-        self.userId = userId
         self.serverURL = serverURL
         self.http = http
         super.init()
@@ -342,8 +335,11 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         FairPlayDebug.log("📋 contentKeySessionDidGenerateExpiredSessionReport")
     }
 
-    public func contentKeySession(_: AVContentKeySession, contentKeyRequestDidSucceed _: AVContentKeyRequest) {
-        FairPlayDebug.log("✅ contentKeyRequestDidSucceed!")
+    public func contentKeySession(_: AVContentKeySession, contentKeyRequestDidSucceed keyRequest: AVContentKeyRequest) {
+        let identifier = AVFoundationKeyRequest(request: keyRequest).keyIdentifier
+        let renewal = keyRequest.renewsExpiringResponseData
+        FairPlayDebug.log("✅ contentKeyRequestDidSucceed for \(identifier ?? "no identifier")\(renewal ? " (renewal)" : "")")
+        Task { await self.keyRequestSucceeded(identifier, renewal: renewal) }
     }
 
     // MARK: - Key Request Handling
@@ -380,11 +376,9 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
                 await endSession(session)
                 throw error
             }
+            // Handed off, not yet accepted: the outcome waits for AVFoundation (`keyRequestSucceeded`).
             request.process(ckc: ckc)
             FairPlayDebug.log("✅ Key delivered: \(target.uri)\(renewal ? " (renewal)" : "")")
-            if !renewal, await state.deliver(target.uri, expected: Set(keyIdentifiers)), let callback = onKeyDelivered {
-                DispatchQueue.main.async { callback() }
-            }
             await endSession(session)
         } catch {
             FairPlayDebug.log("❌ Key exchange failed for \(target.uri): \(error.localizedDescription)", type: .error)
@@ -392,8 +386,18 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         }
     }
 
+    /// AVFoundation accepted the key of the request for `identifier`: ready is reported when that completes every one of
+    /// `keyIdentifiers`, before any failure. A renewal's acceptance, or one for a key this package does not have,
+    /// never counts.
+    func keyRequestSucceeded(_ identifier: String?, renewal: Bool = false) async {
+        guard !renewal, let identifier else { return }
+        if await state.accept(identifier, expected: Set(keyIdentifiers)), let callback = onKeyDelivered {
+            DispatchQueue.main.async { callback() }
+        }
+    }
+
     /// A key request that failed, here or in AVFoundation: reported when it is the first failure before every key was
-    /// delivered, and never for a renewal.
+    /// accepted, and never for a renewal.
     func keyRequestFailed(_ error: Error, renewal: Bool = false) async {
         guard !renewal else { return }
         if await state.fail(), let callback = onKeyFailed {
@@ -401,9 +405,11 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         }
     }
 
+    /// Fails `request` with `error`, recorded first: AVFoundation answers `request.fail` with its own report of the same
+    /// failure (`didFailWithError`), which must not win the outcome.
     private func fail(_ request: some FairPlayKeyRequesting, _ error: Error, renewal: Bool) async {
-        request.fail(error)
         await keyRequestFailed(error, renewal: renewal)
+        request.fail(error)
     }
 
     // MARK: - Server Communication
@@ -420,7 +426,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
     }
 
     /// Start a FairPlay playback session for the policy uuid: one per license request. Neither the body nor the answer
-    /// is printed.
+    /// is printed, and a refusal's error carries its status alone.
     private func startSession(assetID: String) async throws -> String {
         let url = serverURL.appendingPathComponent("media/v1/session/start")
         var request = URLRequest(url: url)
@@ -428,7 +434,6 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         prepareRequest(&request)
         request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "userId": userId,
             "assetId": assetID,
             "protocol": "fairplay",
         ])
@@ -440,7 +445,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         FairPlayDebug.log("← HTTP \(statusCode): \(data.count) bytes")
 
         guard (200 ... 299).contains(statusCode) else {
-            throw FairPlayError.sessionStartFailed("HTTP \(statusCode): \(String(data: data, encoding: .utf8) ?? "")")
+            throw FairPlayError.sessionStartFailed("HTTP \(statusCode)")
         }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let sessionId = json["sessionId"] as? String, !sessionId.isEmpty
@@ -483,7 +488,8 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
     }
 
     /// The CKC for `target`'s SPC. The body names the policy uuid as `assetId`, and the component for a profile v2 key
-    /// (ADR-0055 §7). Neither the body nor the answer is printed: they carry the SPC, the manifest and the CKC.
+    /// (ADR-0055 §7). Neither the body nor the answer is printed: they carry the SPC, the manifest and the CKC. A
+    /// refusal's error carries its status alone, never the service's error or message.
     private func requestCKC(spcData: Data, sessionId: String, target: FairPlayKeyTarget) async throws -> Data {
         let url = serverURL.appendingPathComponent("media/v1/key-request")
         var request = URLRequest(url: url)
@@ -493,7 +499,6 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
 
         var body: [String: Any] = [
             "sessionId": sessionId,
-            "userId": userId,
             "assetId": target.policyUUID,
             "spcData": spcData.base64EncodedString(),
             "tdfManifest": try Self.keyRequestManifestData(for: manifest).base64EncodedString(),
@@ -508,14 +513,14 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         FairPlayDebug.log("← HTTP \(statusCode): \(data.count) bytes")
 
         guard (200 ... 299).contains(statusCode) else {
-            // A refusal carries an error and a message, never a CKC.
-            throw FairPlayError.ckcRequestFailed("HTTP \(statusCode): \(String(data: data, encoding: .utf8) ?? "")")
+            // A refusal carries an error and a message, never a CKC; neither is kept.
+            throw FairPlayError.ckcRequestFailed("HTTP \(statusCode)")
         }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw FairPlayError.invalidCKCResponse("Response is not valid JSON")
         }
-        if let error = json["error"] as? String {
-            throw FairPlayError.ckcRequestFailed("\(error): \(json["message"] as? String ?? "Unknown error")")
+        if json["error"] != nil {
+            throw FairPlayError.ckcRequestFailed("HTTP \(statusCode): the key service refused the key")
         }
         guard let ckcBase64 = json["wrappedKey"] as? String else {
             throw FairPlayError.invalidCKCResponse("Missing wrappedKey in response")

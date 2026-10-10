@@ -26,11 +26,36 @@ actor FakeMediaService: FairPlayHTTP {
         let body: [String: String]
     }
 
+    /// How a refusal answers: its status and its body.
+    struct Refusal: Sendable {
+        let status: Int
+        let body: Data
+
+        static let forbidden = Refusal(status: 403,
+                                       body: Data(#"{"error":"forbidden","message":"manifest refused"}"#.utf8))
+    }
+
     private(set) var calls: [Call] = []
     private var sessions = 0
     private var refused: String?
+    private let refusal: Refusal
+    private let sessionPrefix: String
+    private let sessionStartRefusal: Refusal?
+    private let redirectedRoute: String?
 
-    init(refusing component: String? = nil) { refused = component }
+    /// - Parameters:
+    ///   - component: Refuses that component's key requests with `refusal`.
+    ///   - sessionPrefix: Each session id is this and the session's number.
+    ///   - sessionStartRefusal: Refuses every session start with this, when set.
+    ///   - redirectedRoute: Answers this route (`"GET certificate"`, …) with a 307 to another host, when set.
+    init(refusing component: String? = nil, refusal: Refusal = .forbidden, sessionPrefix: String = "session-",
+         sessionStartRefusal: Refusal? = nil, redirecting redirectedRoute: String? = nil) {
+        refused = component
+        self.refusal = refusal
+        self.sessionPrefix = sessionPrefix
+        self.sessionStartRefusal = sessionStartRefusal
+        self.redirectedRoute = redirectedRoute
+    }
 
     /// From now on, refuses `component`'s key requests (nil: none).
     func refuse(_ component: String?) { refused = component }
@@ -45,14 +70,19 @@ actor FakeMediaService: FairPlayHTTP {
         let object = request.httpBody.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
         let body = object.compactMapValues { $0 as? String }
         calls.append(Call(route: route, body: body))
+        if route == redirectedRoute {
+            return respond(request, 307, Data(), headers: ["Location": "https://elsewhere.example/media/v1/\(path)"])
+        }
         switch route {
         case "GET certificate":
             return respond(request, 200, Data(repeating: 0x30, count: 64))
         case "POST session/start":
+            if let sessionStartRefusal { return respond(request, sessionStartRefusal.status, sessionStartRefusal.body) }
             sessions += 1
-            return respond(request, 200, Data(#"{"sessionId":"session-\#(sessions)","status":"started"}"#.utf8))
+            return respond(request, 200,
+                           Data(#"{"sessionId":"\#(sessionPrefix)\#(sessions)","status":"started"}"#.utf8))
         case "POST key-request" where body["component"] != nil && body["component"] == refused:
-            return respond(request, 403, Data(#"{"error":"forbidden","message":"manifest refused"}"#.utf8))
+            return respond(request, refusal.status, refusal.body)
         case "POST key-request":
             let ckc = Self.ckc(for: body["component"] ?? "v1").base64EncodedString()
             return respond(request, 200, Data(#"{"status":"success","wrappedKey":"\#(ckc)"}"#.utf8))
@@ -61,8 +91,9 @@ actor FakeMediaService: FairPlayHTTP {
         }
     }
 
-    private func respond(_ request: URLRequest, _ status: Int, _ body: Data) -> (Data, URLResponse) {
-        (body, HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!)
+    private func respond(_ request: URLRequest, _ status: Int, _ body: Data,
+                         headers: [String: String]? = nil) -> (Data, URLResponse) {
+        (body, HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!)
     }
 }
 
@@ -76,8 +107,14 @@ final class FakeKeyRequest: FairPlayKeyRequesting {
 
     let keyIdentifier: String?
     private let log = Mutex(Log())
+    /// Run when the delegate fails the request, before `fail(_:)` returns: as AVFoundation reports its own failure of
+    /// a request the delegate failed.
+    private let onFail: (@Sendable (Error) -> Void)?
 
-    init(_ keyIdentifier: String?) { self.keyIdentifier = keyIdentifier }
+    init(_ keyIdentifier: String?, onFail: (@Sendable (Error) -> Void)? = nil) {
+        self.keyIdentifier = keyIdentifier
+        self.onFail = onFail
+    }
 
     /// A long SPC whose base64 holds `/` and `+`, which JSONSerialization escapes and the log truncation missed.
     static func spc(for contentIdentifier: String) -> Data {
@@ -97,7 +134,10 @@ final class FakeKeyRequest: FairPlayKeyRequesting {
 
     func process(ckc: Data) { log.withLock { $0.ckcs.append(ckc) } }
 
-    func fail(_ error: Error) { log.withLock { $0.errors.append(error) } }
+    func fail(_ error: Error) {
+        log.withLock { $0.errors.append(error) }
+        onFail?(error)
+    }
 }
 
 /// `TDFContentKeyDelegate` answers every key a profile v2 package's playlists ask for, each as its own license request,
@@ -145,15 +185,22 @@ struct TDFContentKeyDelegateComponentTests {
         try delegate(manifest: manifest(components: components), service: service)
     }
 
-    static func delegate(manifest: FairPlayManifest, service: FakeMediaService)
+    static func delegate(manifest: FairPlayManifest, service: FakeMediaService, authToken: String = "token")
         -> (TDFContentKeyDelegate<FairPlayManifest>, Outcomes) {
         let delegate = TDFContentKeyDelegate(
-            manifest: manifest, authToken: "token", userId: "viewer",
-            serverURL: URL(string: "https://platform.arkavo.net")!, http: service)
+            manifest: manifest, authToken: authToken, serverURL: URL(string: "https://platform.arkavo.net")!,
+            http: service)
         let outcomes = Outcomes()
         delegate.onKeyDelivered = { outcomes.record("ready") }
         delegate.onKeyFailed = { _ in outcomes.record("failed") }
         return (delegate, outcomes)
+    }
+
+    /// Answers each request, then has AVFoundation accept each one's key, in order.
+    static func answerAndAccept(_ delegate: TDFContentKeyDelegate<FairPlayManifest>, _ requests: FakeKeyRequest...)
+        async {
+        for request in requests { await delegate.handle(request) }
+        for request in requests { await delegate.keyRequestSucceeded(request.keyIdentifier) }
     }
 
     @Test("A package's keys are its components' skd:// URIs, in order; profile v1 has the uuid's alone")
@@ -163,15 +210,17 @@ struct TDFContentKeyDelegateComponentTests {
         #expect(try Self.delegate(nil, service: FakeMediaService()).0.keyIdentifiers == ["skd://\(Self.uuid)"])
     }
 
-    @Test("Each component's key is its own license request, and ready is reported once, after the last key")
+    @Test("Each component's key is its own license request, and ready is reported once, after the last key is accepted")
     func everyKeyThenReady() async throws {
         let service = FakeMediaService()
         let (delegate, outcomes) = try Self.delegate(service: service)
         let video = FakeKeyRequest(Self.video), audio = FakeKeyRequest(Self.audio)
 
         await delegate.handle(video)
+        await delegate.keyRequestSucceeded(Self.video)
         #expect(await outcomes.reported() == [])
         await delegate.handle(audio)
+        await delegate.keyRequestSucceeded(Self.audio)
         #expect(await outcomes.reported() == ["ready"])
 
         #expect(video.contentIdentifiers == ["\(Self.uuid)/video"])
@@ -184,21 +233,73 @@ struct TDFContentKeyDelegateComponentTests {
             "POST session/start", "POST key-request", "DELETE session/session-1",
             "POST session/start", "POST key-request", "DELETE session/session-2",
         ])
+        // Exactly these members: never `userId` (ADR-0046 §4's never-sent list, kept by ADR-0055 §7).
         let starts = calls.filter { $0.route == "POST session/start" }
-        #expect(starts.map { $0.body["assetId"] } == [Self.uuid, Self.uuid])
+        #expect(starts.map { $0.body } == [["assetId": Self.uuid, "protocol": "fairplay"],
+                                           ["assetId": Self.uuid, "protocol": "fairplay"]])
         let keyRequests = calls.filter { $0.route == "POST key-request" }
+        #expect(keyRequests.allSatisfy {
+            Set($0.body.keys) == ["sessionId", "assetId", "spcData", "tdfManifest", "component"]
+        })
         #expect(keyRequests.map { $0.body["component"] } == ["video", "audio"])
         #expect(keyRequests.map { $0.body["assetId"] } == [Self.uuid, Self.uuid])
         #expect(keyRequests.map { $0.body["sessionId"] } == ["session-1", "session-2"])
-        #expect(keyRequests.allSatisfy { $0.body["spcData"] != nil && $0.body["tdfManifest"] != nil })
     }
 
-    @Test("Keys answered in either order report ready once, after the last")
+    @Test("A CKC handed to AVFoundation is not a key accepted: nothing is reported until AVFoundation accepts each")
+    func handOffIsNotAcceptance() async throws {
+        let (delegate, outcomes) = try Self.delegate(service: FakeMediaService())
+        let video = FakeKeyRequest(Self.video), audio = FakeKeyRequest(Self.audio)
+
+        await delegate.handle(video)
+        await delegate.handle(audio)
+
+        #expect(video.ckcs.count == 1 && audio.ckcs.count == 1)
+        #expect(await outcomes.reported() == [])
+    }
+
+    @Test("Every key accepted reports ready once; a renewal's or an unknown key's acceptance never counts")
+    func allAcceptedReadyOnce() async throws {
+        let (delegate, outcomes) = try Self.delegate(service: FakeMediaService())
+        await delegate.handle(FakeKeyRequest(Self.video))
+        await delegate.handle(FakeKeyRequest(Self.audio))
+
+        await delegate.keyRequestSucceeded(Self.video)
+        await delegate.keyRequestSucceeded(Self.audio, renewal: true)
+        await delegate.keyRequestSucceeded("skd://\(Self.uuid)/subtitles")
+        await delegate.keyRequestSucceeded(nil)
+        #expect(await outcomes.reported() == [])
+
+        await delegate.keyRequestSucceeded(Self.audio)
+        #expect(await outcomes.reported() == ["ready"])
+
+        await delegate.keyRequestSucceeded(Self.audio)
+        await delegate.keyRequestSucceeded(Self.video)
+        await delegate.keyRequestFailed(FairPlayError.invalidCKCResponse("late"))
+        #expect(await outcomes.reported() == ["ready"])
+    }
+
+    @Test("CKCs handed off, then one rejected by AVFoundation: failed, never ready")
+    func handedOffThenRejected() async throws {
+        let (delegate, outcomes) = try Self.delegate(service: FakeMediaService())
+        await delegate.handle(FakeKeyRequest(Self.video))
+        await delegate.handle(FakeKeyRequest(Self.audio))
+        await delegate.keyRequestSucceeded(Self.video)
+
+        // AVFoundation rejects the audio CKC it was given.
+        await delegate.keyRequestFailed(FairPlayError.invalidCKCResponse("rejected"))
+        #expect(await outcomes.reported() == ["failed"])
+
+        await delegate.keyRequestSucceeded(Self.audio)
+        #expect(await outcomes.reported() == ["failed"])
+    }
+
+    @Test("Keys answered and accepted in either order report ready once, after the last")
     func outOfOrder() async throws {
         let (delegate, outcomes) = try Self.delegate(service: FakeMediaService())
-        await delegate.handle(FakeKeyRequest(Self.audio))
+        await Self.answerAndAccept(delegate, FakeKeyRequest(Self.audio))
         #expect(await outcomes.reported() == [])
-        await delegate.handle(FakeKeyRequest(Self.video))
+        await Self.answerAndAccept(delegate, FakeKeyRequest(Self.video))
         #expect(await outcomes.reported() == ["ready"])
     }
 
@@ -206,8 +307,8 @@ struct TDFContentKeyDelegateComponentTests {
     func concurrent() async throws {
         let service = FakeMediaService()
         let (delegate, outcomes) = try Self.delegate(service: service)
-        async let first: Void = delegate.handle(FakeKeyRequest(Self.video))
-        async let second: Void = delegate.handle(FakeKeyRequest(Self.audio))
+        async let first: Void = Self.answerAndAccept(delegate, FakeKeyRequest(Self.video))
+        async let second: Void = Self.answerAndAccept(delegate, FakeKeyRequest(Self.audio))
         _ = await (first, second)
 
         #expect(await outcomes.reported() == ["ready"])
@@ -223,13 +324,36 @@ struct TDFContentKeyDelegateComponentTests {
         let (delegate, outcomes) = try Self.delegate(service: service)
         let video = FakeKeyRequest(Self.video), audio = FakeKeyRequest(Self.audio)
 
-        await delegate.handle(video)
+        await Self.answerAndAccept(delegate, video)
         await delegate.handle(audio)
 
         #expect(await outcomes.reported() == ["failed"])
         #expect(video.ckcs.count == 1)
         #expect(audio.ckcs.isEmpty && audio.failures == 1)
+        #expect(audio.errors.first.map { "\($0)" } == "\(FairPlayError.ckcRequestFailed("HTTP 403"))")
         #expect(await service.calls.filter { $0.route.hasPrefix("DELETE session/") }.count == 2)
+    }
+
+    @Test("A refused key reports the delegate's own error, even when AVFoundation's report of the failure comes first")
+    func ownErrorWins() async throws {
+        let (delegate, _) = try Self.delegate(service: FakeMediaService(refusing: "video"))
+        let reported = Mutex<[String]>([])
+        delegate.onKeyFailed = { error in reported.withLock { $0.append("\(error)") } }
+        struct Echo: Error {}
+        // AVFoundation answers `processContentKeyResponseError` with `didFailWithError`: here, before `fail` returns.
+        let echoed = DispatchSemaphore(value: 0)
+        let request = FakeKeyRequest(Self.video) { _ in
+            Task.detached {
+                await delegate.keyRequestFailed(Echo())
+                echoed.signal()
+            }
+            _ = echoed.wait(timeout: .now() + 5)
+        }
+
+        await delegate.handle(request)
+        await MainActor.run {}
+
+        #expect(reported.withLock { $0 } == ["\(FairPlayError.ckcRequestFailed("HTTP 403"))"])
     }
 
     @Test("After a failure, a later key is still answered but reports nothing")
@@ -239,7 +363,7 @@ struct TDFContentKeyDelegateComponentTests {
 
         await delegate.handle(video)
         #expect(await outcomes.reported() == ["failed"])
-        await delegate.handle(audio)
+        await Self.answerAndAccept(delegate, audio)
 
         #expect(audio.ckcs.count == 1)
         #expect(await outcomes.reported() == ["failed"])
@@ -250,10 +374,10 @@ struct TDFContentKeyDelegateComponentTests {
         let service = FakeMediaService()
         let (delegate, outcomes) = try Self.delegate(service: service)
 
-        await delegate.handle(FakeKeyRequest(Self.video))
-        await delegate.handle(FakeKeyRequest(Self.audio))
+        await Self.answerAndAccept(delegate, FakeKeyRequest(Self.video), FakeKeyRequest(Self.audio))
         let renewal = FakeKeyRequest(Self.video)
         await delegate.handle(renewal, renewal: true)
+        await delegate.keyRequestSucceeded(Self.video, renewal: true)
 
         #expect(await outcomes.reported() == ["ready"])
         #expect(renewal.ckcs.count == 1)
@@ -268,7 +392,7 @@ struct TDFContentKeyDelegateComponentTests {
         let service = FakeMediaService()
         let (delegate, outcomes) = try Self.delegate(service: service)
 
-        await delegate.handle(FakeKeyRequest(Self.video))
+        await Self.answerAndAccept(delegate, FakeKeyRequest(Self.video))
         await service.refuse("video")
         let renewal = FakeKeyRequest(Self.video)
         await delegate.handle(renewal, renewal: true)
@@ -276,8 +400,41 @@ struct TDFContentKeyDelegateComponentTests {
         await delegate.keyRequestFailed(FairPlayError.invalidCKCResponse("renewal"), renewal: true)
         #expect(await outcomes.reported() == [])
 
-        await delegate.handle(FakeKeyRequest(Self.audio))
+        await Self.answerAndAccept(delegate, FakeKeyRequest(Self.audio))
         #expect(await outcomes.reported() == ["ready"])
+    }
+
+    @Test("A refused session start fails the key with its status alone, and asks for no key")
+    func sessionStartRefused() async throws {
+        let service = FakeMediaService(sessionStartRefusal: FakeMediaService.Refusal(
+            status: 500, body: Data(#"{"error":"internal","message":"session store said: secret-detail-4b2f"}"#.utf8)))
+        let (delegate, outcomes) = try Self.delegate(service: service)
+        let request = FakeKeyRequest(Self.video)
+
+        await delegate.handle(request)
+
+        #expect(await outcomes.reported() == ["failed"])
+        #expect(request.ckcs.isEmpty && request.failures == 1)
+        let error = try #require(request.errors.first)
+        #expect("\(error)" == "\(FairPlayError.sessionStartFailed("HTTP 500"))")
+        #expect(!error.localizedDescription.contains("secret-detail"))
+        #expect(await service.calls.map(\.route) == ["GET certificate", "POST session/start"])
+    }
+
+    @Test("A credential-bearing request answered with a redirect fails, and the redirect is not followed",
+          arguments: ["GET certificate", "POST session/start", "POST key-request"])
+    func redirectRefused(route: String) async throws {
+        let service = FakeMediaService(redirecting: route)
+        let (delegate, outcomes) = try Self.delegate(service: service)
+        let request = FakeKeyRequest(Self.video)
+
+        await delegate.handle(request)
+
+        #expect(await outcomes.reported() == ["failed"])
+        #expect(request.ckcs.isEmpty && request.failures == 1)
+        let calls = await service.calls
+        #expect(calls.filter { $0.route == route }.count == 1)
+        #expect(calls.last.map { $0.route == route || $0.route.hasPrefix("DELETE session/") } == true)
     }
 
     @Test("A key the package does not ask for is refused without any request", arguments: [
@@ -341,13 +498,14 @@ struct TDFContentKeyDelegateComponentTests {
         let (delegate, outcomes) = try Self.delegate(nil, service: service)
         let request = FakeKeyRequest("skd://\(Self.uuid)")
 
-        await delegate.handle(request)
+        await Self.answerAndAccept(delegate, request)
 
         #expect(await outcomes.reported() == ["ready"])
         #expect(request.contentIdentifiers == [Self.uuid])
         let keyRequest = try #require(await service.calls.first { $0.route == "POST key-request" })
         #expect(keyRequest.body["component"] == nil)
         #expect(keyRequest.body["assetId"] == Self.uuid)
+        #expect(Set(keyRequest.body.keys) == ["sessionId", "assetId", "spcData", "tdfManifest"])
     }
 
     @Test("AVFoundation's key failure before ready reports one failure; after ready, nothing")
@@ -358,8 +516,7 @@ struct TDFContentKeyDelegateComponentTests {
         #expect(await failingOutcomes.reported() == ["failed"])
 
         let (ready, readyOutcomes) = try Self.delegate(service: FakeMediaService())
-        await ready.handle(FakeKeyRequest(Self.video))
-        await ready.handle(FakeKeyRequest(Self.audio))
+        await Self.answerAndAccept(ready, FakeKeyRequest(Self.video), FakeKeyRequest(Self.audio))
         await ready.keyRequestFailed(FairPlayError.invalidCKCResponse("late"))
         #expect(await readyOutcomes.reported() == ["ready"])
     }
@@ -368,8 +525,8 @@ struct TDFContentKeyDelegateComponentTests {
     func callbacksSetConcurrently() async throws {
         let (delegate, outcomes) = try Self.delegate(service: FakeMediaService())
         await withTaskGroup(of: Void.self) { group in
-            group.addTask { await delegate.handle(FakeKeyRequest(Self.video)) }
-            group.addTask { await delegate.handle(FakeKeyRequest(Self.audio)) }
+            group.addTask { await Self.answerAndAccept(delegate, FakeKeyRequest(Self.video)) }
+            group.addTask { await Self.answerAndAccept(delegate, FakeKeyRequest(Self.audio)) }
             for _ in 0 ..< 100 {
                 group.addTask { delegate.onKeyDelivered = { outcomes.record("ready") } }
                 group.addTask { delegate.onKeyFailed = { _ in outcomes.record("failed") } }
@@ -384,7 +541,7 @@ extension FairPlayVerboseLoggingTests {
     /// the key request's answer).
     @Suite("TDFContentKeyDelegate key material")
     struct DelegateKeyMaterialTests {
-        @Test("The exchange prints no SPC, CKC, wrapped key or IV, however formatted")
+        @Test("The exchange prints no SPC, CKC, wrapped key, IV, token or session id, however formatted, nor any refusal's text")
         func printsNoKeyMaterial() async throws {
             let original = FairPlayDebugConfig.isVerboseLoggingEnabled
             FairPlayDebugConfig.isVerboseLoggingEnabled = true
@@ -392,30 +549,121 @@ extension FairPlayVerboseLoggingTests {
             // A uuid of this test's own, so the positive control below cannot see another test's exchange.
             let uuid = UUID().uuidString.lowercased()
             let manifest = try TDFContentKeyDelegateComponentTests.manifest(components: [.video, .audio], uuid: uuid)
-            let (_, output) = try await StdoutCapture.capture {
-                let (delegate, _) = TDFContentKeyDelegateComponentTests.delegate(
-                    manifest: manifest, service: FakeMediaService())
-                await delegate.handle(FakeKeyRequest("skd://\(uuid)/video"))
-                await delegate.handle(FakeKeyRequest("skd://\(uuid)/audio"))
-            }
-            // The positive control: the capture saw this exchange's log, so the absences below are not vacuous.
-            #expect(output.contains("Key delivered: skd://\(uuid)/video"))
-            #expect(output.contains("Key delivered: skd://\(uuid)/audio"))
-
+            let token = "bearer-marker-\(UUID().uuidString)"
+            let sessionPrefix = "session-marker-\(UUID().uuidString)-"
             let secrets = [
                 FakeKeyRequest.spc(for: "\(uuid)/video"), FakeKeyRequest.spc(for: "\(uuid)/audio"),
                 FakeMediaService.ckc(for: "video"), FakeMediaService.ckc(for: "audio"),
                 TDFContentKeyDelegateComponentTests.wrappedKey, TDFContentKeyDelegateComponentTests.iv,
             ]
+            // A refusal that echoes everything a key service could: the SPC, a CKC, the wrapped key, the IV, the
+            // bearer token and the session id.
+            let echoed = "spc=\(secrets[0].base64EncodedString()) ckc=\(secrets[2].base64EncodedString()) "
+                + "wrappedKey=\(secrets[4].base64EncodedString()) iv=\(secrets[5].base64EncodedString()) "
+                + "bearer=\(token) session=\(sessionPrefix)1"
+            let refusals = [
+                FakeMediaService(refusing: "video", refusal: .init(
+                    status: 403, body: Data(#"{"error":"forbidden","message":"\#(echoed)"}"#.utf8)),
+                    sessionPrefix: sessionPrefix),
+                FakeMediaService(refusing: "video", refusal: .init(
+                    status: 200, body: Data(#"{"error":"\#(echoed)","message":"\#(echoed)"}"#.utf8)),
+                    sessionPrefix: sessionPrefix),
+                FakeMediaService(sessionPrefix: sessionPrefix, sessionStartRefusal: .init(
+                    status: 500, body: Data(#"{"error":"\#(echoed)","message":"\#(echoed)"}"#.utf8))),
+            ]
+            let errors = Mutex<[any Error]>([])
+            let (_, output) = try await StdoutCapture.capture {
+                let (delegate, _) = TDFContentKeyDelegateComponentTests.delegate(
+                    manifest: manifest, service: FakeMediaService(sessionPrefix: sessionPrefix), authToken: token)
+                await TDFContentKeyDelegateComponentTests.answerAndAccept(
+                    delegate, FakeKeyRequest("skd://\(uuid)/video"), FakeKeyRequest("skd://\(uuid)/audio"))
+                for service in refusals {
+                    let (refusing, _) = TDFContentKeyDelegateComponentTests.delegate(
+                        manifest: manifest, service: service, authToken: token)
+                    refusing.onKeyFailed = { error in errors.withLock { $0.append(error) } }
+                    let request = FakeKeyRequest("skd://\(uuid)/video")
+                    await refusing.handle(request)
+                    errors.withLock { $0 += request.errors }
+                }
+                await MainActor.run {}
+            }
+            // The positive control: the capture saw this exchange's log, so the absences below are not vacuous.
+            #expect(output.contains("Key delivered: skd://\(uuid)/video"))
+            #expect(output.contains("Key delivered: skd://\(uuid)/audio"))
+            #expect(output.components(separatedBy: "Key exchange failed for skd://\(uuid)/video").count == 4)
+            let descriptions = errors.withLock { $0 }.flatMap { ["\($0)", $0.localizedDescription] }
+            #expect(descriptions.count == 12)
+
+            var texts = [token, sessionPrefix, "forbidden"]
             for secret in secrets {
                 let base64 = secret.base64EncodedString()
                 let hex = secret.map { String(format: "%02x", $0) }.joined()
                 let spacedHex = secret.prefix(16).map { String(format: "%02x", $0) }.joined(separator: " ")
-                for text in [base64, base64.replacingOccurrences(of: "/", with: #"\/"#), hex, hex.uppercased(),
-                             String(hex.prefix(32)), String(base64.prefix(40)), spacedHex] {
-                    #expect(!output.contains(text))
-                }
+                texts += [base64, base64.replacingOccurrences(of: "/", with: #"\/"#), hex, hex.uppercased(),
+                          String(hex.prefix(32)), String(base64.prefix(40)), spacedHex]
+            }
+            for text in texts {
+                #expect(!output.contains(text), "printed: \(text.prefix(24))")
+                #expect(!descriptions.contains { $0.contains(text) }, "in an error: \(text.prefix(24))")
             }
         }
+    }
+}
+
+/// Answers a request to `platform.example` with a 307 to `elsewhere.example`, and any other request with 200, recording
+/// every URL it is asked for.
+final class RedirectingURLProtocol: URLProtocol {
+    private static let seen = Mutex<[URL]>([])
+
+    /// The URLs asked for whose path holds `marker`.
+    static func seen(_ marker: String) -> [URL] { seen.withLock { $0.filter { $0.path.contains(marker) } } }
+
+    override class func canInit(with _: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else { return }
+        Self.seen.withLock { $0.append(url) }
+        if url.host == "platform.example" {
+            let target = URL(string: "https://elsewhere.example\(url.path)")!
+            let response = HTTPURLResponse(url: url, statusCode: 307, httpVersion: "HTTP/1.1",
+                                           headerFields: ["Location": target.absoluteString])!
+            var redirect = request
+            redirect.url = target
+            client?.urlProtocol(self, wasRedirectedTo: redirect, redirectResponse: response)
+            // Refused, the redirect is the answer.
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocolDidFinishLoading(self)
+        } else {
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: Data("collected".utf8))
+            client?.urlProtocolDidFinishLoading(self)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+/// The delegate's requests carry the bearer token, the SPC and the manifest: a redirect must never re-send them.
+@Suite("FairPlay HTTP redirects")
+struct FairPlayHTTPRedirectTests {
+    @Test("A FairPlay request answered with a redirect is not redirected: the 3xx is the answer",
+          arguments: ["GET certificate", "POST session/start", "POST key-request", "DELETE session/s-1"])
+    func notFollowed(route: String) async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RedirectingURLProtocol.self]
+        let http = URLSessionFairPlayHTTP(configuration: configuration)
+        let parts = route.split(separator: " ")
+        let marker = UUID().uuidString
+        var request = URLRequest(url: URL(string: "https://platform.example/\(marker)/media/v1/\(parts[1])")!)
+        request.httpMethod = String(parts[0])
+        request.setValue("Bearer redirect-test-token", forHTTPHeaderField: "Authorization")
+        if request.httpMethod == "POST" { request.httpBody = Data(#"{"spcData":"AAAA"}"#.utf8) }
+
+        let (_, response) = try await http.data(for: request)
+
+        #expect((response as? HTTPURLResponse)?.statusCode == 307)
+        #expect(RedirectingURLProtocol.seen(marker).map(\.host) == ["platform.example"])
     }
 }

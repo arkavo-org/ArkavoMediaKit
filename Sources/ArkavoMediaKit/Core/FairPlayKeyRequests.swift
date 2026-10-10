@@ -71,8 +71,32 @@ protocol FairPlayHTTP: Sendable {
     func data(for request: URLRequest) async throws -> (Data, URLResponse)
 }
 
+/// URLSession, never following a redirect. Every request the delegate makes carries the bearer token, and the key
+/// request also the SPC and the archive manifest: a redirect (a 307 or 308 re-sends the body) would hand them to
+/// another server. Refused, the 3xx is the answer, which the delegate treats as a failure like any other non-2xx.
 struct URLSessionFairPlayHTTP: FairPlayHTTP {
+    /// The session every delegate shares. A session keeps its delegate until it is invalidated; this one never is.
+    private static let shared = URLSession(configuration: .default, delegate: RedirectRefusal(), delegateQueue: nil)
+
+    private let session: URLSession
+
+    init() { session = Self.shared }
+
+    /// A session of its own with `configuration`, which also refuses every redirect.
+    init(configuration: URLSessionConfiguration) {
+        session = URLSession(configuration: configuration, delegate: RedirectRefusal(), delegateQueue: nil)
+    }
+
     func data(for request: URLRequest) async throws -> (Data, URLResponse) {
-        try await URLSession.shared.data(for: request)
+        try await session.data(for: request)
+    }
+}
+
+/// Answers every redirect with nil: the task completes with the redirect response, and nothing is sent to its
+/// `Location`. Sendable: it has no state.
+final class RedirectRefusal: NSObject, URLSessionTaskDelegate, Sendable {
+    func urlSession(_: URLSession, task _: URLSessionTask, willPerformHTTPRedirection _: HTTPURLResponse,
+                    newRequest _: URLRequest) async -> URLRequest? {
+        nil
     }
 }
