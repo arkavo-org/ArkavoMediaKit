@@ -124,6 +124,19 @@ public final class FMP4Writer {
         }
     }
 
+    /// One track's samples in a media segment
+    public struct TrackFragment {
+        public let trackID: UInt32
+        public let samples: [Sample]
+        public let baseDecodeTime: UInt64
+
+        public init(trackID: UInt32, samples: [Sample], baseDecodeTime: UInt64) {
+            self.trackID = trackID
+            self.samples = samples
+            self.baseDecodeTime = baseDecodeTime
+        }
+    }
+
     // MARK: - Properties
 
     private let tracks: [TrackConfig]
@@ -318,11 +331,15 @@ public final class FMP4Writer {
 
         case .aac(let audioSpecificConfig):
             let esds = ElementaryStreamDescriptor(audioSpecificConfig: audioSpecificConfig)
+            // ISO/IEC 23001-7 cbcs: tracks other than video are whole-block full-sample encrypted, no pattern.
+            let fullSample = encryption.map {
+                SampleEncryptionInfo(keyID: $0.keyID, constantIV: $0.constantIV, cryptByteBlock: 0, skipByteBlock: 0)
+            }
             let mp4a = AACSampleEntry(
                 channelCount: track.channelCount ?? 2,
                 sampleRate: track.sampleRate ?? 48000,
                 esds: esds,
-                encrypted: encInfo
+                encrypted: fullSample
             )
             entries.append(mp4a)
 
@@ -339,6 +356,13 @@ public final class FMP4Writer {
     public func generateMediaSegment(trackID: UInt32,
                                      samples: [Sample],
                                      baseDecodeTime: UInt64) -> Data {
+        generateMediaSegment(fragments: [TrackFragment(trackID: trackID, samples: samples,
+                                                       baseDecodeTime: baseDecodeTime)])
+    }
+
+    /// Generate a media segment (styp + moof + mdat) holding a fragment of each track: one `moof` with a `traf` per
+    /// fragment, in order, and one `mdat` holding their samples in the same order.
+    public func generateMediaSegment(fragments: [TrackFragment]) -> Data {
         sequenceNumber += 1
 
         var data = Data()
@@ -350,76 +374,43 @@ public final class FMP4Writer {
         data.append(stypData)
         print("🎬 FMP4Writer: Added styp box (\(stypData.count) bytes) with brands: msdh, msix, cmfc, iso6")
 
-        // Calculate sample data size for offset calculation
-        let sampleDataSize = samples.reduce(0) { $0 + $1.data.count }
-
-        // moof - include styp size for correct data_offset calculation
-        let moof = generateMoof(
-            trackID: trackID,
-            samples: samples,
-            baseDecodeTime: baseDecodeTime,
-            sampleDataSize: sampleDataSize,
-            stypSize: stypData.count
-        )
-        let moofData = moof.serialize()
-        data.append(moofData)
+        data.append(generateMoof(fragments: fragments).serialize())
 
         // mdat
-        let mdat = generateMdat(samples: samples)
+        let mdat = generateMdat(samples: fragments.flatMap(\.samples))
         data.append(mdat.serialize())
 
         return data
     }
 
-    private func generateMoof(trackID: UInt32,
-                              samples: [Sample],
-                              baseDecodeTime: UInt64,
-                              sampleDataSize: Int,
-                              stypSize: Int = 0) -> ContainerBox {
-        var moof = ContainerBox(type: .moof)
-
-        // mfhd
+    /// The `moof`: `mfhd`, then a `traf` per fragment. With default-base-is-moof set in each `tfhd`, every
+    /// `trun` data_offset and `saio` offset counts from the first byte of the `moof` (ISO/IEC 14496-12).
+    private func generateMoof(fragments: [TrackFragment]) -> ContainerBox {
         let mfhd = MovieFragmentHeaderBox(sequenceNumber: sequenceNumber)
-        moof.append(mfhd)
+        let mfhdSize = mfhd.serialize().count
 
-        // traf
-        let traf = generateTraf(
-            trackID: trackID,
-            samples: samples,
-            baseDecodeTime: baseDecodeTime,
-            dataOffsetBase: 0, // Will be calculated
-            stypSize: stypSize
-        )
-        moof.append(traf)
-
-        // Recalculate with correct offset for data_offset
-        // When default-base-is-moof flag is set in tfhd, data_offset is relative to
-        // the first byte of moof (not segment start). This is per ISO 14496-12.
-        let moofSize = moof.serialize().count
+        // First pass, for the sizes: an offset's value never changes a box's size.
+        let trafSizes = fragments.map { fragment in
+            generateTraf(fragment: fragment, dataOffsetBase: 0, trafOffset: 0).serialize().count
+        }
+        let moofSize = 8 + mfhdSize + trafSizes.reduce(0, +)
         let mdatHeaderSize = 8 // mdat box header
-        let dataOffsetBase = moofSize + mdatHeaderSize
 
-        // Rebuild traf with correct offset
-        var correctedMoof = ContainerBox(type: .moof)
-        correctedMoof.append(mfhd)
-
-        let correctedTraf = generateTraf(
-            trackID: trackID,
-            samples: samples,
-            baseDecodeTime: baseDecodeTime,
-            dataOffsetBase: dataOffsetBase,
-            stypSize: stypSize
-        )
-        correctedMoof.append(correctedTraf)
-
-        return correctedMoof
+        var moof = ContainerBox(type: .moof)
+        moof.append(mfhd)
+        var trafOffset = 8 + mfhdSize
+        var dataOffset = moofSize + mdatHeaderSize
+        for (fragment, size) in zip(fragments, trafSizes) {
+            moof.append(generateTraf(fragment: fragment, dataOffsetBase: dataOffset, trafOffset: trafOffset))
+            trafOffset += size
+            dataOffset += fragment.samples.reduce(0) { $0 + $1.data.count }
+        }
+        return moof
     }
 
-    private func generateTraf(trackID: UInt32,
-                              samples: [Sample],
-                              baseDecodeTime: UInt64,
-                              dataOffsetBase: Int,
-                              stypSize: Int = 0) -> ContainerBox {
+    /// A `traf` that starts `trafOffset` bytes into its `moof`, whose samples start `dataOffsetBase` bytes into it.
+    private func generateTraf(fragment: TrackFragment, dataOffsetBase: Int, trafOffset: Int) -> ContainerBox {
+        let trackID = fragment.trackID, samples = fragment.samples, baseDecodeTime = fragment.baseDecodeTime
         var traf = ContainerBox(type: .traf)
 
         // tfhd
@@ -475,7 +466,13 @@ public final class FMP4Writer {
         traf.append(trun)
 
         // senc, saiz, saio for encryption (if enabled)
-        if encryption != nil {
+        let isFullSample = tracks.first { $0.trackID == trackID }?.mediaType == .audio
+        if encryption != nil && isFullSample {
+            // Whole-block full-sample encryption with a constant IV: each sample's auxiliary information is empty,
+            // so it is omitted (ISO/IEC 23001-7): a senc without entries, and no saiz or saio.
+            traf.append(SampleEncryptionBox(entries: samples.map { _ in SampleEncryptionEntry() },
+                                            useSubsampleEncryption: false))
+        } else if encryption != nil {
             // Calculate offset to senc sample data from moof start
             // When default-base-is-moof flag is set in tfhd, offsets are relative to moof start
             // Structure: moof(8) + mfhd(16) + traf(8) + tfhd + tfdt + trun + senc_header(8) + version_flags(4) + sample_count(4)
@@ -484,8 +481,8 @@ public final class FMP4Writer {
             let trunSize = trun.serialize().count
 
             // Offset from moof start to senc sample auxiliary data
-            // moof header (8) + mfhd (16) + traf header (8) + tfhd + tfdt + trun + senc overhead (16)
-            let sencDataOffset = 8 + 16 + 8 + tfhdSize + tfdtSize + trunSize + 16
+            // traf offset in the moof + traf header (8) + tfhd + tfdt + trun + senc overhead (16)
+            let sencDataOffset = trafOffset + 8 + tfhdSize + tfdtSize + trunSize + 16
 
             print("🐞 FMP4Writer: sencDataOffset = \(sencDataOffset) (tfhd=\(tfhdSize), tfdt=\(tfdtSize), trun=\(trunSize))")
 

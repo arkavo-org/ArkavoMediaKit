@@ -236,12 +236,11 @@ struct FMP4IntegrationTests {
         var sample = Data()
         // NAL length (4 bytes, big-endian)
         sample.append(contentsOf: [0x00, 0x00, 0x00, 0x30]) // 48 bytes
-        // NAL header (type 5 = IDR)
-        sample.append(0x65)
-        // NAL payload (47 bytes)
-        sample.append(Data(repeating: 0xAA, count: 47))
+        // IDR slice NAL unit (type 5): NAL header, slice header and payload
+        sample.append(H264TestStream.slice(isIDR: true, count: 48, filler: 0xAA))
 
-        let result = encryptor.encryptVideoSample(sample, nalLengthSize: 4)
+        let result = try encryptor.encryptVideoSample(sample, nalLengthSize: 4,
+                                                      sliceHeaders: H264TestStream.sliceHeaders())
 
         // Length prefix should be preserved
         #expect(result.encryptedData[0..<4] == sample[0..<4])
@@ -269,7 +268,8 @@ struct FMP4IntegrationTests {
         spsSample.append(0x67) // NAL type 7 (SPS)
         spsSample.append(Data(repeating: 0x11, count: 15))
 
-        let spsResult = encryptor.encryptVideoSample(spsSample, nalLengthSize: 4)
+        let sliceHeaders = try H264TestStream.sliceHeaders()
+        let spsResult = try encryptor.encryptVideoSample(spsSample, nalLengthSize: 4, sliceHeaders: sliceHeaders)
 
         // SPS should be unchanged (all clear)
         #expect(spsResult.encryptedData == spsSample)
@@ -283,7 +283,7 @@ struct FMP4IntegrationTests {
         ppsSample.append(0x68) // NAL type 8 (PPS)
         ppsSample.append(Data(repeating: 0x22, count: 7))
 
-        let ppsResult = encryptor.encryptVideoSample(ppsSample, nalLengthSize: 4)
+        let ppsResult = try encryptor.encryptVideoSample(ppsSample, nalLengthSize: 4, sliceHeaders: sliceHeaders)
 
         // PPS should be unchanged
         #expect(ppsResult.encryptedData == ppsSample)

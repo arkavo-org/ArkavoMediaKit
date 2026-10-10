@@ -20,6 +20,11 @@ public enum CBCSDebugConfig {
 public final class CBCSEncryptor {
     // MARK: - Types
 
+    public enum Failure: Error, Equatable {
+        /// The sample's NAL unit lengths do not cover it exactly.
+        case malformedSample
+    }
+
     /// Encryption result with subsample map
     public struct EncryptionResult {
         public let encryptedData: Data
@@ -59,15 +64,22 @@ public final class CBCSEncryptor {
         self.skipBlocks = skipBlocks
     }
 
-    // MARK: - Video Encryption (H.264/H.265)
+    // MARK: - Video Encryption (H.264)
 
     /// Encrypt video sample with NAL unit awareness
+    ///
+    /// Each slice NAL unit is one subsample whose clear bytes are its length prefix, NAL header and slice header,
+    /// so protection starts on the first byte after the slice header (ISO/IEC 23001-7 `cbcs`, as CMAF requires).
+    /// Every other NAL unit is clear.
     /// - Parameters:
     ///   - sample: Raw video sample data (with length-prefixed NAL units)
     ///   - nalLengthSize: Size of NAL unit length field (typically 4)
+    ///   - sliceHeaders: Measures slice headers, from the stream's parameter sets
     /// - Returns: Encrypted data and subsample map
-    public func encryptVideoSample(_ sample: Data, nalLengthSize: Int = 4) -> EncryptionResult {
-        let nalUnits = parseNALUnits(sample, lengthSize: nalLengthSize)
+    /// - Throws: `H264SliceHeaderParser.Failure` for a slice it cannot measure, rather than protect from a guess
+    public func encryptVideoSample(_ sample: Data, nalLengthSize: Int = 4,
+                                   sliceHeaders: H264SliceHeaderParser) throws -> EncryptionResult {
+        let nalUnits = try parseNALUnits(sample, lengthSize: nalLengthSize)
 
         var encryptedData = Data()
         var subsamples: [SubsampleEntry] = []
@@ -83,7 +95,8 @@ public final class CBCSEncryptor {
 
             if nal.isSlice {
                 // Encrypt slice NAL units
-                let (encrypted, subsample) = encryptNALUnit(nalData, lengthSize: nalLengthSize)
+                let (encrypted, subsample) = try encryptNALUnit(nalData, lengthSize: nalLengthSize,
+                                                                sliceHeaders: sliceHeaders)
                 encryptedData.append(encrypted)
                 subsamples.append(subsample)
             } else {
@@ -121,25 +134,11 @@ public final class CBCSEncryptor {
         return EncryptionResult(encryptedData: encryptedData, subsamples: subsamples)
     }
 
-    /// Encrypt a single NAL unit using CBCS pattern
-    private func encryptNALUnit(_ nalData: Data, lengthSize: Int) -> (Data, SubsampleEntry) {
-        guard nalData.count > lengthSize else {
-            return (nalData, SubsampleEntry(bytesOfClearData: UInt16(nalData.count), bytesOfProtectedData: 0))
-        }
-
-        // For CBCS, keep NAL header clear. The slice header can be encrypted.
-        // Apple FairPlay reference content uses ~12 bytes clear per NAL:
-        // - Length prefix (4 bytes)
-        // - NAL unit header (1-2 bytes)
-        // - Small safety margin
-        let minimumClearBytes = 12
-
-        // NAL header is: length prefix + NAL header byte(s)
-        let nalHeaderSize = lengthSize + 1 // For H.264. H.265 uses 2 bytes
-
-        // Use the larger of nalHeaderSize or minimumClearBytes for slice NAL units
-        // If the NAL unit is smaller than minimumClearBytes, keep it all clear
-        let clearBytes = min(max(nalHeaderSize, minimumClearBytes), nalData.count)
+    /// Encrypt a single slice NAL unit using CBCS pattern, from the first byte after its slice header
+    private func encryptNALUnit(_ nalData: Data, lengthSize: Int,
+                                sliceHeaders: H264SliceHeaderParser) throws -> (Data, SubsampleEntry) {
+        // Length prefix, NAL header and slice header stay clear.
+        let clearBytes = lengthSize + (try sliceHeaders.headerSize(ofSlice: nalData.dropFirst(lengthSize)))
 
         // Keep NAL header + slice header clear
         let clearPart = nalData.prefix(clearBytes)
@@ -176,116 +175,63 @@ public final class CBCSEncryptor {
         return (result, subsample)
     }
 
-    /// Apply CBCS pattern encryption (encrypt N blocks, skip M blocks)
+    /// Apply CBCS pattern encryption (encrypt N blocks, skip M blocks) to one subsample's protected bytes.
+    ///
+    /// The encrypted blocks form one CBC chain that starts from the constant IV (ISO/IEC 23001-7 `cbcs`): each takes
+    /// the previous encrypted block's ciphertext as its IV, across the skipped blocks between them. The skipped
+    /// blocks and a trailing partial block stay clear.
     private func encryptWithPattern(_ data: Data) -> Data {
-        let blockSize = 16
-        var result = Data()
-        var offset = 0
         let patternLength = cryptBlocks + skipBlocks
-
-        while offset < data.count {
-            // Determine position in pattern
-            let blockIndex = offset / blockSize
-            let patternPosition = blockIndex % patternLength
-
-            let remaining = data.count - offset
-            let chunkSize = min(blockSize, remaining)
-            let chunk = data.subdata(in: offset..<(offset + chunkSize))
-
-            if patternPosition < cryptBlocks && chunkSize == blockSize {
-                // Encrypt this block
-                let encrypted = encryptBlock(chunk)
-                result.append(encrypted)
-            } else {
-                // Keep clear (skip block or partial block)
-                result.append(chunk)
-            }
-
-            offset += chunkSize
-        }
-
-        return result
+        let blocks = (0 ..< data.count / 16).filter { $0 % patternLength < cryptBlocks }
+        return encryptChain(data, blocks: blocks)
     }
 
-    /// Encrypt a single 16-byte block with AES-128-CBC
-    private func encryptBlock(_ block: Data) -> Data {
-        precondition(block.count == 16, "Block must be 16 bytes")
-
-        var encrypted = Data(count: 16)
-        var numBytesEncrypted: size_t = 0
-
-        let status = encrypted.withUnsafeMutableBytes { encryptedPtr in
-            block.withUnsafeBytes { blockPtr in
-                key.withUnsafeBytes { keyPtr in
-                    iv.withUnsafeBytes { ivPtr in
-                        CCCrypt(
-                            CCOperation(kCCEncrypt),
-                            CCAlgorithm(kCCAlgorithmAES),
-                            CCOptions(0), // No padding for single block
-                            keyPtr.baseAddress, 16,
-                            ivPtr.baseAddress,
-                            blockPtr.baseAddress, 16,
-                            encryptedPtr.baseAddress, 16,
-                            &numBytesEncrypted
-                        )
-                    }
-                }
+    /// Encrypts the 16-byte blocks at `blocks` (indexes into `data`) as one AES-128-CBC chain from the constant IV,
+    /// leaving every other byte as it is.
+    private func encryptChain(_ data: Data, blocks: [Int]) -> Data {
+        guard !blocks.isEmpty else { return data }
+        var bytes = [UInt8](data)
+        let plain = blocks.flatMap { bytes[$0 * 16 ..< $0 * 16 + 16] }
+        var cipher = [UInt8](repeating: 0, count: plain.count)
+        var moved = 0
+        let status = key.withUnsafeBytes { keyBytes in
+            iv.withUnsafeBytes { ivBytes in
+                CCCrypt(CCOperation(kCCEncrypt), CCAlgorithm(kCCAlgorithmAES), CCOptions(0),
+                        keyBytes.baseAddress, key.count, ivBytes.baseAddress,
+                        plain, plain.count, &cipher, cipher.count, &moved)
             }
         }
-
-        guard status == kCCSuccess else {
-            // Return original block on error
-            return block
+        // Never fall back to the clear bytes: they would be written as protected.
+        precondition(status == kCCSuccess && moved == plain.count, "AES-128-CBC encryption failed: \(status)")
+        for (index, block) in blocks.enumerated() {
+            bytes.replaceSubrange(block * 16 ..< block * 16 + 16, with: cipher[index * 16 ..< index * 16 + 16])
         }
-
-        return encrypted
+        return Data(bytes)
     }
 
     // MARK: - Audio Encryption
 
-    /// Encrypt audio sample (full encryption, no pattern)
+    /// Encrypt audio sample (whole-block full-sample encryption, no pattern)
+    ///
+    /// ISO/IEC 23001-7 `cbcs` protects tracks other than video this way, so the sample has no subsamples: a player
+    /// decrypts every complete block of it as one chain.
     /// - Parameter sample: Raw audio sample data
-    /// - Returns: Encrypted data and subsample map
+    /// - Returns: Encrypted data, and no subsamples
     public func encryptAudioSample(_ sample: Data) -> EncryptionResult {
-        // Audio uses full encryption (all blocks encrypted)
-        let encrypted = encryptFullSample(sample)
-
-        let subsample = SubsampleEntry(
-            bytesOfClearData: 0,
-            bytesOfProtectedData: UInt32(encrypted.count)
-        )
-
-        return EncryptionResult(encryptedData: encrypted, subsamples: [subsample])
+        EncryptionResult(encryptedData: encryptFullSample(sample), subsamples: [])
     }
 
-    /// Encrypt entire sample with AES-128-CBC (for audio)
+    /// Encrypt entire sample with AES-128-CBC (for audio): every complete block, one chain from the constant IV.
+    /// A trailing partial block stays clear (CBCS doesn't pad).
     private func encryptFullSample(_ data: Data) -> Data {
-        let blockSize = 16
-        var result = Data()
-        var offset = 0
-
-        while offset < data.count {
-            let remaining = data.count - offset
-            let chunkSize = min(blockSize, remaining)
-            let chunk = data.subdata(in: offset..<(offset + chunkSize))
-
-            if chunkSize == blockSize {
-                result.append(encryptBlock(chunk))
-            } else {
-                // Partial block at end - keep clear (CBCS doesn't pad)
-                result.append(chunk)
-            }
-
-            offset += chunkSize
-        }
-
-        return result
+        encryptChain(data, blocks: Array(0 ..< data.count / 16))
     }
 
     // MARK: - NAL Parsing
 
     /// Parse NAL units from length-prefixed sample
-    private func parseNALUnits(_ data: Data, lengthSize: Int) -> [NALUnit] {
+    /// - Throws: `Failure.malformedSample` unless the NAL units cover the sample exactly, so no byte is dropped.
+    private func parseNALUnits(_ data: Data, lengthSize: Int) throws -> [NALUnit] {
         var nalUnits: [NALUnit] = []
         var offset = 0
 
@@ -317,6 +263,7 @@ public final class CBCSEncryptor {
             offset += totalLength
         }
 
+        guard offset == data.count else { throw Failure.malformedSample }
         return nalUnits
     }
 

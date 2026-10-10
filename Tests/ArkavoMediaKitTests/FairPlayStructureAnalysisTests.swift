@@ -248,7 +248,7 @@ struct FairPlayStructureAnalysisTests {
     }
 
     @Test("Verify CBCS encryption output structure")
-    func verifyCBCSOutput() {
+    func verifyCBCSOutput() throws {
         let key = Data(repeating: 0x3C, count: 16)
         let iv = Data([0xD5, 0xFB, 0xD6, 0xB8, 0x2E, 0xD9, 0x3E, 0x4E,
                        0xF9, 0x8A, 0xE4, 0x09, 0x31, 0xEE, 0x33, 0xB7])
@@ -269,8 +269,7 @@ struct FairPlayStructureAnalysisTests {
 
         // IDR NAL (type 5) - larger for encryption
         sample.append(contentsOf: [0x00, 0x00, 0x00, 0x60]) // Length = 96
-        sample.append(0x65) // NAL type 5 (IDR)
-        sample.append(Data(repeating: 0xCC, count: 95))
+        sample.append(H264TestStream.slice(isIDR: true, count: 96, filler: 0xCC))
 
         print("\n" + String(repeating: "=", count: 60))
         print("CBCS ENCRYPTION OUTPUT ANALYSIS")
@@ -280,7 +279,8 @@ struct FairPlayStructureAnalysisTests {
         print("\n--- Input Sample ---")
         print(hexDump(sample))
 
-        let result = encryptor.encryptVideoSample(sample, nalLengthSize: 4)
+        let result = try encryptor.encryptVideoSample(sample, nalLengthSize: 4,
+                                                      sliceHeaders: H264TestStream.sliceHeaders())
 
         print("\n--- Encrypted Output ---")
         print("Output size: \(result.encryptedData.count) bytes")
