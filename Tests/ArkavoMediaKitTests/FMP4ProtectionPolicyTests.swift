@@ -22,13 +22,14 @@ struct FMP4ProtectionPolicyTests {
         return out
     }
 
-    /// Protects a synthetic movie; `output` is everything printed to stdout meanwhile.
-    private func protect(policyJSON: Data?) async throws -> (files: [String: Data], kas: TestKASKeyPair, output: String) {
+    /// Protects a synthetic movie, with `sound` when given; `output` is everything printed to stdout meanwhile.
+    private func protect(policyJSON: Data?, sound: SyntheticMovie.Sound? = nil)
+        async throws -> (files: [String: Data], kas: TestKASKeyPair, output: String) {
         let kas = try TestKASKeyPair()
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("fmp4-policy-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let movie = try await SyntheticMovie.make(in: dir)
+        let movie = try await SyntheticMovie.make(in: dir, sound: sound)
         let service = FMP4RecordingProtectionService(kasURL: Self.kasURL, kasPublicKeyPEM: kas.spkiPublicKeyPEM)
         let (archive, output) = try await StdoutCapture.capture {
             try await service.protectVideo(videoURL: movie, assetID: "recording-asset-1", policyJSON: policyJSON)
@@ -42,31 +43,39 @@ struct FMP4ProtectionPolicyTests {
         return try #require(manifest["encryptionInformation"] as? [String: Any])
     }
 
-    @Test("tier policy is embedded, bound, and names the skd:// key URI")
+    @Test("tier policy is embedded with the component list, bound under the key, and names the skd:// key URI")
     func tierPolicyArchive() async throws {
         let (files, kas, _) = try await protect(policyJSON: Data(Self.tierPolicy.utf8))
         let info = try encryptionInformation(files)
         let policy = try #require(info["policy"] as? String)
-        #expect(Data(base64Encoded: policy) == Data(Self.tierPolicy.utf8))
-        let kao = try #require((info["keyAccess"] as? [[String: Any]])?.first)
+        // The synthetic movie has no sound: one component, video, under one key.
+        let accesses = try #require(info["keyAccess"] as? [[String: Any]])
+        try #require(accesses.count == 1)
+        let kao = accesses[0]
         let wrappedBase64 = try #require(kao["wrappedKey"] as? String)
         let dek = TDFCrypto.data(from: try TDFCrypto.unwrapSymmetricKeyWithRSA(
             privateKeyPEM: kas.privateKeyPEM, wrappedKey: wrappedBase64))
+        // The caller's policy with the packager's component list as its first member, and nothing else changed.
+        let expected = try FairPlayComponents.insert([FairPlayComponentKey(component: .video, key: dek)],
+                                                     intoPolicyJSON: Data(Self.tierPolicy.utf8))
+        #expect(Data(base64Encoded: policy) == expected)
         let binding = try #require((kao["policyBinding"] as? [String: Any])?["hash"] as? String)
         #expect(binding == FairPlayPolicy.binding(policyBase64: policy, dek: dek))
-        let playlistData = try #require(files["playlist.m3u8"])
+        let playlistData = try #require(files["video.m3u8"])
         let playlist = String(decoding: playlistData, as: UTF8.self)
-        #expect(playlist.contains(#"URI="skd://6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d""#))
+        #expect(playlist.contains(#"URI="skd://6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d/video""#))
         #expect(!playlist.contains("skd://recording-asset-1"))
-        // fMP4 metadata still names the recording's asset id.
+        // fMP4 metadata still names the recording's asset id, and names the master playlist.
         let metaBase64 = try #require(kao["encryptedMetadata"] as? String)
         let metaData = try #require(Data(base64Encoded: metaBase64))
         let meta = try #require(JSONSerialization.jsonObject(with: metaData) as? [String: Any])
         #expect(meta["type"] as? String == "fmp4-fairplay")
         #expect(meta["assetId"] as? String == "recording-asset-1")
-        // The segment list is in the playlist; in the KAO it only grew every key request.
+        #expect(meta["playlistFilename"] as? String == "master.m3u8")
+        #expect(meta["initFilename"] == nil)
+        // The segment list is in the playlists; in the KAO it only grew every key request.
         #expect(meta["segmentFilenames"] == nil)
-        // Readers find the key URI's id without decoding the policy.
+        // Readers find the key URIs' uuid without decoding the policy.
         #expect(meta["contentKeyId"] as? String == "6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d")
         let manifestData = try #require(files["manifest.json"])
         let manifest = try #require(JSONSerialization.jsonObject(with: manifestData) as? [String: Any])
@@ -82,9 +91,9 @@ struct FMP4ProtectionPolicyTests {
         let policyBase64 = try #require(info["policy"] as? String)
         let policyJSON = try #require(Data(base64Encoded: policyBase64))
         let uuid = try FairPlayPolicy.uuid(ofPolicyJSON: policyJSON)
-        let playlistData = try #require(files["playlist.m3u8"])
+        let playlistData = try #require(files["video.m3u8"])
         let playlist = String(decoding: playlistData, as: UTF8.self)
-        #expect(playlist.contains("URI=\"skd://\(uuid)\""))
+        #expect(playlist.contains("URI=\"skd://\(uuid)/video\""))
     }
 
     /// The PEM is not a key: parsing it before the policy check would throw
@@ -96,6 +105,17 @@ struct FMP4ProtectionPolicyTests {
             _ = try await service.protectVideo(
                 videoURL: URL(fileURLWithPath: "/nonexistent.mov"), assetID: "a",
                 policyJSON: Data(#"{"body":{}}"#.utf8))
+        }
+    }
+
+    /// The packager writes the component list from the keys it makes; a caller's list would name keys it did not.
+    @Test("a policy that already lists components is refused before any work")
+    func rejectsPolicyWithComponents() async throws {
+        let service = FMP4RecordingProtectionService(kasURL: Self.kasURL, kasPublicKeyPEM: "not a key")
+        await #expect(throws: FairPlayComponents.Error.componentsPresent) {
+            _ = try await service.protectVideo(
+                videoURL: URL(fileURLWithPath: "/nonexistent.mov"), assetID: "a",
+                policyJSON: Data(#"{"arkavo:components":[],"body":{},"uuid":"6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d"}"#.utf8))
         }
     }
 
@@ -167,20 +187,24 @@ struct FMP4ProtectionPolicyTests {
     }
 
     /// Nothing the protect path prints, from the service or anything it calls,
-    /// may carry the content key or IV, however formatted. Runs in a Debug
+    /// may carry a content key or the IV, however formatted. Runs in a Debug
     /// build, where the verbose logging is on.
-    @Test("the protect path never prints the content key or IV")
+    @Test("the protect path never prints a content key or the IV")
     func protectPathPrintsNoKeyMaterial() async throws {
-        let (files, kas, output) = try await protect(policyJSON: Data(Self.tierPolicy.utf8))
+        let (files, kas, output) = try await protect(policyJSON: Data(Self.tierPolicy.utf8), sound: .aac(tracks: 1))
         #expect(output.contains("Wrapping content key"), "the capture must see the service's progress logs")
         let info = try encryptionInformation(files)
-        let kao = try #require((info["keyAccess"] as? [[String: Any]])?.first)
-        let wrappedBase64 = try #require(kao["wrappedKey"] as? String)
-        let dek = TDFCrypto.data(from: try TDFCrypto.unwrapSymmetricKeyWithRSA(
-            privateKeyPEM: kas.privateKeyPEM, wrappedKey: wrappedBase64))
+        let accesses = try #require(info["keyAccess"] as? [[String: Any]])
+        #expect(accesses.count == 2, "a movie with sound has a video key and an audio key")
+        var secrets: [(name: String, bytes: Data)] = []
+        for access in accesses {
+            let wrappedBase64 = try #require(access["wrappedKey"] as? String)
+            secrets.append(("content key", TDFCrypto.data(from: try TDFCrypto.unwrapSymmetricKeyWithRSA(
+                privateKeyPEM: kas.privateKeyPEM, wrappedKey: wrappedBase64))))
+        }
         let ivBase64 = try #require((info["method"] as? [String: Any])?["iv"] as? String)
-        let iv = try #require(Data(base64Encoded: ivBase64))
-        for (name, secret) in [("content key", dek), ("IV", iv)] {
+        secrets.append(("IV", try #require(Data(base64Encoded: ivBase64))))
+        for (name, secret) in secrets {
             for (format, text) in Self.textForms(of: secret) {
                 #expect(!output.contains(text), "stdout carries the \(name) as \(format)")
             }

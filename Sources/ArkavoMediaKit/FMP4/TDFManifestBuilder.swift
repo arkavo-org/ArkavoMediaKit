@@ -343,6 +343,32 @@ public final class TDFManifestBuilder {
         return Manifest(encryptionInformation: encryptionInfo)
     }
 
+    /// Build a FairPlay package profile v2 manifest (ADR-0055 §3 in arkavo-ios): the policy with the component list
+    /// inserted, and one key access object per component, in component order. Each wraps its own key for this KAS
+    /// (RSA-OAEP-SHA1) and carries its own binding of the policy, `base64(HMAC-SHA256(key, utf8(policy)))`.
+    public func buildManifest(
+        componentKeys: [FairPlayComponentKey],
+        iv: Data,
+        policyJSON: Data,
+        publicKey: SecKey
+    ) throws -> Manifest {
+        let policyBase64 = try FairPlayComponents.insert(componentKeys, intoPolicyJSON: policyJSON).base64EncodedString()
+        let keyAccess = try componentKeys.map { componentKey in
+            KeyAccess(
+                url: kasURL.absoluteString,
+                wrappedKey: try wrapKey(componentKey.key, with: publicKey).base64EncodedString(),
+                policyBinding: PolicyBinding(
+                    hash: FairPlayPolicy.binding(policyBase64: policyBase64, dek: componentKey.key))
+            )
+        }
+        let encryptionInfo = EncryptionInformation(
+            keyAccess: keyAccess,
+            method: .aes128CBC(iv: iv),
+            policy: policyBase64
+        )
+        return Manifest(encryptionInformation: encryptionInfo)
+    }
+
     /// Serialize manifest to JSON data
     public func serializeManifest(_ manifest: Manifest) throws -> Data {
         let encoder = JSONEncoder()

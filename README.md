@@ -234,6 +234,46 @@ try await player.loadStream(
 player.play()
 ```
 
+## FairPlay package profile v2 (0.4.0)
+
+`FMP4RecordingProtectionService.protectVideo(videoURL:assetID:policyJSON:)` writes FairPlay package profile v2 (ADR-0055 in arkavo-ios):
+
+| Entry | Contents |
+|---|---|
+| `manifest.json` | The TDF manifest: the policy with `arkavo:components`, and one key access object per component, in component order. Never served to a player. |
+| `master.m3u8` | One variant, `video.m3u8`, and when the recording has sound one audio rendition, `audio.m3u8`. |
+| `<id>.m3u8` | The component's media playlist. Its key URI is `skd://<policy uuid>/<id>`. |
+| `<id>-init.mp4`, `<id>-segment<N>.m4s` | The component's one track. Segment N of each component covers the same time. |
+
+- **Components:** `video`, and `audio` when the source has sound. A recording without sound is a video-only package: `video` alone, one key, and a master playlist with no audio rendition.
+- **Keys:** each component has its own 16-byte content key, and one IV serves both. The keys and the IV come from the system's random source, and protection fails rather than use an unfilled one.
+- **`keyBinding`** = `base64(HMAC-SHA256(key, "arkavo:fps:component:v1:" + id))` ties each key to its component. The key service checks it before it issues a key.
+- **The audio** covers the video from its first presented frame to the end of its last (a B-frame video presents its last frame after its last decode), within one AAC packet, its decode times contiguous from segment to segment.
+  - One AAC-LC track of 1–6 or 8 channels (configuration 1–7) is packaged as it is.
+  - Anything else is mixed and re-encoded once as AAC-LC: several tracks, another format, sound that starts late or stops early (padded with silence), and a single AAC-LC track whose channel configuration is 0 (a program config element) or 8–15 (for example 6.1).
+  - CHANNELS in the master playlist is the channel count (configuration 7 is 8 channels).
+- **BANDWIDTH** is the video's peak segment bit rate plus the audio's; AVERAGE-BANDWIDTH is the sum of their averages.
+- **Refused** (`FMP4ProtectionError.packagingFailed`), never written as a package the viewer refuses or cannot decode:
+  - more than 4,093 segments per component (about six hours 49 minutes at six-second segments);
+  - an archive over 4,294,967,295 bytes, the most a ZIP without ZIP64 holds (about 71 minutes at 8 Mbit/s);
+  - NAL unit lengths other than 4 bytes, and a video sample of more than 42 NAL units.
+- **Refused before any work** (`FairPlayComponents.Error.componentsPresent`): a policy that already has `arkavo:components`. The packager writes that list itself, from the keys it makes.
+
+`TDFContentKeyDelegate` answers every component's key (`keyIdentifiers`):
+- each with its own session;
+- the content identifier `<policy uuid>/<id>`;
+- `component` in the key request.
+
+`onKeyDelivered` is called at most once, when AVFoundation has **accepted** every key (`contentKeySession(_:contentKeyRequestDidSucceed:)`); a CKC handed to AVFoundation is not yet a key accepted. `onKeyFailed` is called at most once, at the first failure before that, a CKC AVFoundation rejects included. Never both, never twice, and renewals never report. If the player asks for fewer keys than the package has components, neither is called, so callers keep their own timeout. An empty `keyIdentifiers` means the package is malformed: treat it as refused.
+
+A present-but-malformed `arkavo:components` list, a repeated JSON key, or an unknown key identifier is refused locally, with no request to the key service.
+
+- **Never sent:** no request body names the user. The `userId` init parameter is kept for source compatibility and is unused; the bearer token identifies the viewer.
+- **Redirects refused:** the certificate, session and key requests carry the bearer token (and the key request the SPC and the manifest), so none follows a redirect; a 3xx fails the key.
+- **Never logged:** SPC, CKC, wrapped keys, the IV, the token and the session id. Errors carry the HTTP status or a fixed reason, never the server's response.
+
+0.4.0 no longer writes profile v1 (`playlist.m3u8`, `init.mp4`, one key), which the viewer refuses.
+
 ## Policy Enforcement
 
 ```swift

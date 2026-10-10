@@ -204,8 +204,8 @@ public final class FMP4HLSGenerator {
 
     // MARK: - Master Playlist Generation
 
-    /// Generate master playlist with variants
-    public func generateMasterPlaylist(variants: [Variant]) -> String {
+    /// Generate master playlist with variants, after their audio renditions
+    public func generateMasterPlaylist(variants: [Variant], audio: [AudioRendition] = []) -> String {
         var lines: [String] = []
 
         // Header
@@ -217,6 +217,9 @@ public final class FMP4HLSGenerator {
             lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
         }
 
+        // Renditions, which the variants name by group
+        lines += audio.map(generateMedia)
+
         // Variants
         for variant in variants {
             lines.append(generateStreamInf(variant))
@@ -226,6 +229,29 @@ public final class FMP4HLSGenerator {
         return lines.joined(separator: "\n")
     }
 
+    /// An audio rendition: one `#EXT-X-MEDIA` line, the default and auto-selected rendition of its group.
+    public struct AudioRendition {
+        public let groupID: String
+        public let name: String
+        /// A BCP 47 tag; `und` when the language is unknown.
+        public let language: String
+        public let channels: Int
+        public let uri: String
+
+        public init(groupID: String, name: String, language: String, channels: Int, uri: String) {
+            self.groupID = groupID
+            self.name = name
+            self.language = language
+            self.channels = channels
+            self.uri = uri
+        }
+    }
+
+    private func generateMedia(_ rendition: AudioRendition) -> String {
+        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"\(rendition.groupID)\",NAME=\"\(rendition.name)\","
+            + "LANGUAGE=\"\(rendition.language)\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"\(rendition.channels)\","
+            + "URI=\"\(rendition.uri)\""
+    }
     /// Variant stream configuration
     public struct Variant {
         public let uri: String

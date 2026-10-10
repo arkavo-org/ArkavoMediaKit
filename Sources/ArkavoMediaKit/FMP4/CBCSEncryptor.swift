@@ -23,6 +23,8 @@ public final class CBCSEncryptor {
     public enum Failure: Error, Equatable {
         /// The sample's NAL unit lengths do not cover it exactly.
         case malformedSample
+        /// The system's random source failed, with this status: there is no key.
+        case randomBytesUnavailable(OSStatus)
     }
 
     /// Encryption result with subsample map
@@ -340,6 +342,37 @@ extension CBCSEncryptor {
         return derived
     }
 
+    /// A 16-byte AES-128 content key from the system's cryptographically secure random source.
+    /// - Throws: `Failure.randomBytesUnavailable` when the source fails, rather than return a key it did not fill.
+    public static func generateContentKey() throws -> Data {
+        try generateContentKey { count, bytes in SecRandomCopyBytes(kSecRandomDefault, count, bytes) }
+    }
+
+    /// A content key from `random`, which fills its count of bytes and returns a status (`errSecSuccess` on success).
+    static func generateContentKey(random: (Int, UnsafeMutableRawPointer) -> OSStatus) throws -> Data {
+        try randomBytes(16, from: random)
+    }
+
+    /// The package's constant IV: 16 bytes from the system's random source. Every sample's CBC chain starts from it.
+    /// - Throws: `Failure.randomBytesUnavailable` when the random source fails: there is no IV, never an unfilled one.
+    static func generateConstantIV() throws -> Data {
+        try generateConstantIV { count, bytes in SecRandomCopyBytes(kSecRandomDefault, count, bytes) }
+    }
+
+    /// A constant IV from `random`, which fills its count of bytes and returns a status (`errSecSuccess` on success).
+    static func generateConstantIV(random: (Int, UnsafeMutableRawPointer) -> OSStatus) throws -> Data {
+        try randomBytes(16, from: random)
+    }
+
+    /// `count` bytes from `random`, or `Failure.randomBytesUnavailable` with its status.
+    private static func randomBytes(_ count: Int, from random: (Int, UnsafeMutableRawPointer) -> OSStatus) throws
+        -> Data {
+        var bytes = Data(count: count)
+        let status = bytes.withUnsafeMutableBytes { random($0.count, $0.baseAddress!) }
+        guard status == errSecSuccess else { throw Failure.randomBytesUnavailable(status) }
+        return bytes
+    }
+
     /// Generate random key ID
     public static func generateKeyID() -> Data {
         var keyID = Data(count: 16)
@@ -349,7 +382,10 @@ extension CBCSEncryptor {
         return keyID
     }
 
-    /// Generate random IV
+    /// Generate random IV.
+    ///
+    /// Kept for source compatibility: it ignores the random source's status, so on a failure the IV may be left unfilled
+    /// (zero). `FMP4RecordingProtectionService` uses the status-checked `generateConstantIV()`.
     public static func generateIV() -> Data {
         var iv = Data(count: 16)
         _ = iv.withUnsafeMutableBytes { ptr in
@@ -363,6 +399,7 @@ extension CBCSEncryptor.Failure: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .malformedSample: "A video sample's NAL unit lengths do not match its size."
+        case let .randomBytesUnavailable(status): "The system's random source failed (status \(status))."
         }
     }
 }

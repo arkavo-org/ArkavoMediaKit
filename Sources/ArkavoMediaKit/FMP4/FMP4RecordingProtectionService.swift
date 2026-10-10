@@ -23,23 +23,27 @@ public actor FMP4RecordingProtectionService {
         self.kasPublicKeyPEM = kasPublicKeyPEM
     }
 
-    /// Protect video content with fMP4/CBCS encryption for FairPlay streaming
+    /// Protect video content with fMP4/CBCS encryption for FairPlay streaming, as FairPlay package profile v2
+    /// (ADR-0055 in arkavo-ios).
     ///
-    /// This produces true FairPlay-compatible content with:
-    /// - fMP4 (CMAF) container with encrypted sample entries (encv/enca)
-    /// - CBCS 1:9 pattern encryption for video
-    /// - HLS playlist with EXT-X-KEY using skd:// URI
-    /// - pssh/tenc/sinf boxes for encryption signaling
+    /// The archive holds `manifest.json` and `master.m3u8`. For each component it holds the media playlist
+    /// `<id>.m3u8`, the init segment `<id>-init.mp4` and the segments `<id>-segment<N>.m4s`. The components are
+    /// `video`, and `audio` when the source has sound. Each has its own content key, wrapped to the KAS in its own key
+    /// access object. The policy gains `arkavo:components`, which ties each key to its component.
     ///
     /// - Parameters:
     ///   - videoURL: URL to the source video file
     ///   - assetID: Unique asset identifier, recorded in the fMP4 metadata and `meta`
-    ///   - policyJSON: TDF policy JSON (`{"uuid", "body": {"dataAttributes", "dissem"}}`).
-    ///     BOM-less UTF-8 without duplicate keys; its `uuid` must be a lower-case
-    ///     UUID: it becomes the FairPlay content-key id
-    ///     (`skd://<uuid>` in the playlist). Nil embeds `FairPlayPolicy.placeholderJSON()`,
-    ///     which the post-#75 license service refuses (no data attributes).
-    /// - Returns: TDF ZIP archive data containing manifest, playlist, init.mp4, and encrypted segments
+    ///   - policyJSON: TDF policy JSON (`{"uuid", "body": {"dataAttributes", "dissem"}}`), without
+    ///     `arkavo:components`, which the packager adds.
+    ///     - BOM-less UTF-8 without duplicate keys.
+    ///     - Its `uuid` must be a lower-case UUID: each component's key URI is `skd://<uuid>/<id>`.
+    ///     - Nil embeds `FairPlayPolicy.placeholderJSON()`, which the license service refuses (no data attributes).
+    /// - Returns: The TDF ZIP archive.
+    /// - Throws: `FMP4ProtectionError.packagingFailed` for more than 4,093 segments, an archive over 4,294,967,295
+    ///   bytes (a ZIP without ZIP64), a source whose NAL unit lengths are not 4 bytes, or a video sample of more than 42
+    ///   subsamples; `unsupportedAudio` for sound that cannot be made into an audio component covering the video,
+    ///   rather than drop it.
     public func protectVideo(
         videoURL: URL,
         assetID: String,
@@ -47,6 +51,8 @@ public actor FMP4RecordingProtectionService {
     ) async throws -> Data {
         let policy = policyJSON ?? FairPlayPolicy.placeholderJSON()
         let contentKeyID = try FairPlayPolicy.uuid(ofPolicyJSON: policy)
+        // The packager writes the component list from the keys it makes: a policy that has one is refused first.
+        try FairPlayComponents.checkInsertable(policy)
 
         // Create temporary directory for fMP4 conversion
         let tempDir = FileManager.default.temporaryDirectory
@@ -57,16 +63,44 @@ public actor FMP4RecordingProtectionService {
             try? FileManager.default.removeItem(at: tempDir)
         }
 
-        // 1. Generate encryption key and IV
-        print("🔑 Generating content encryption key...")
-        let contentKey = CBCSEncryptor.generateKeyID()  // 16-byte AES-128 key
-        let constantIV = CBCSEncryptor.generateIV()     // 16-byte constant IV
-        // All-zero KID: FairPlay keys off the skd:// content-key id (the policy
-        // uuid), not the KID, which is CENC bookkeeping only
-        let keyID = Data(repeating: 0, count: 16)
+        // 1. Analyze the source
+        print("🎬 Analyzing source video...")
+        let asset = AVURLAsset(url: videoURL)
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        guard let videoTrack = tracks.first else {
+            throw FMP4ProtectionError.noVideoTrack
+        }
+        let formatDescriptions = try await videoTrack.load(.formatDescriptions)
+        guard let formatDesc = formatDescriptions.first else {
+            throw FMP4ProtectionError.noFormatDescription
+        }
+        let dimensions = try await videoTrack.load(.naturalSize)
+        let timescale = try await videoTrack.load(.naturalTimeScale)
+        let (trackSegments, totalSampleBytes) = try await videoTrack.load(.segments, .totalSampleDataLength)
+        guard let h264Params = extractParameterSets(from: formatDesc),
+              let videoCodec = h264Params.sps.first.flatMap(FairPlayPackage.avc1Codec(sps:)) else {
+            throw FMP4ProtectionError.noParameterSets
+        }
+        // The init's avcC declares 4-byte NAL unit lengths, and the samples are written as the source has them.
+        try Self.checkNALLengthSize(h264Params.nalLengthSize)
+        // Every video sample byte is written: an archive that would hold more than a ZIP can is refused now, before
+        // anything is encrypted.
+        try Self.checkArchiveSize(UInt64(max(totalSampleBytes, 0)))
+        // Profile v2 carries the sound as its own component whenever the source has sound (ADR-0055 §1).
+        let audioTracks = try await asset.loadTracks(withMediaType: .audio)
 
-        // 2. Fetch KAS public key and wrap content key
-        print("🔐 Wrapping content key with KAS public key...")
+        // 2. One independent 16-byte content key per component, and one constant IV for the package (ADR-0055 §3)
+        print("🔑 Generating content encryption keys...")
+        let videoKey = try CBCSEncryptor.generateContentKey()
+        let audioKey = audioTracks.isEmpty ? nil : try CBCSEncryptor.generateContentKey()
+        let constantIV = try CBCSEncryptor.generateConstantIV()
+        // All-zero KID: FairPlay keys off the skd:// URI, not the KID, which is CENC bookkeeping only
+        let keyID = Data(repeating: 0, count: 16)
+        let componentKeys = [FairPlayComponentKey(component: .video, key: videoKey)]
+            + (audioKey.map { [FairPlayComponentKey(component: .audio, key: $0)] } ?? [])
+
+        // 3. Wrap each key with the KAS public key, under the policy with its component list
+        print("🔐 Wrapping content keys with KAS public key...")
         let manifestBuilder = TDFManifestBuilder(kasURL: kasURL)
         let kasKey: SecKey
         if let pem = kasPublicKeyPEM {
@@ -75,68 +109,25 @@ public actor FMP4RecordingProtectionService {
             kasKey = try await manifestBuilder.fetchKASPublicKey()
         }
         let manifest = try manifestBuilder.buildManifest(
-            contentKey: contentKey,
+            componentKeys: componentKeys,
             iv: constantIV,
             policyJSON: policy,
             publicKey: kasKey
         )
         let manifestData = try manifestBuilder.serializeManifest(manifest)
 
-        // 3. Extract video info from source
-        print("🎬 Analyzing source video...")
-        let asset = AVURLAsset(url: videoURL)
-        let tracks = try await asset.loadTracks(withMediaType: .video)
-        guard let videoTrack = tracks.first else {
-            throw FMP4ProtectionError.noVideoTrack
-        }
-
-        // Get video parameters
-        let formatDescriptions = try await videoTrack.load(.formatDescriptions)
-        guard let formatDesc = formatDescriptions.first else {
-            throw FMP4ProtectionError.noFormatDescription
-        }
-
-        let dimensions = try await videoTrack.load(.naturalSize)
-        let timescale = try await videoTrack.load(.naturalTimeScale)
-        let (trackSegments, totalSampleBytes) = try await videoTrack.load(.segments, .totalSampleDataLength)
-
-        // Extract SPS/PPS and NAL length size from format description
-        guard let h264Params = extractParameterSets(from: formatDesc) else {
-            throw FMP4ProtectionError.noParameterSets
-        }
-
-        // Profile v1 carries the sound, as one AAC-LC track, whenever the source has sound.
-        let audioSource = try await Self.audioSource(of: asset, mixingIn: tempDir)
-
-        // 4. Create FMP4 writer with encryption config
-        print("📦 Creating fMP4 writer with CBCS encryption...")
-        let trackConfig = FMP4Writer.TrackConfig.h264Video(
-            width: UInt16(dimensions.width),
-            height: UInt16(dimensions.height),
-            timescale: UInt32(timescale),
-            sps: h264Params.sps,
-            pps: h264Params.pps
-        )
-
-        let encryptionConfig = FMP4Writer.EncryptionConfig(
-            keyID: keyID,
-            constantIV: constantIV
-        )
-
-        let writer = FMP4Writer(tracks: [trackConfig] + (audioSource.map { [$0.config] } ?? []),
-                                encryption: encryptionConfig)
-        let encryptor = CBCSEncryptor(key: contentKey, iv: constantIV)
+        // 4. The video component: one H.264 track, 1:9 pattern encrypted under the video key
+        print("📦 Creating fMP4 writers with CBCS encryption...")
+        let encryptionConfig = FMP4Writer.EncryptionConfig(keyID: keyID, constantIV: constantIV)
+        let videoWriter = FMP4Writer(
+            tracks: [.h264Video(trackID: 1, width: UInt16(dimensions.width), height: UInt16(dimensions.height),
+                                timescale: UInt32(timescale), sps: h264Params.sps, pps: h264Params.pps)],
+            encryption: encryptionConfig)
+        let encryptor = CBCSEncryptor(key: videoKey, iv: constantIV)
         let nalLengthSize = h264Params.nalLengthSize
         // Protection starts after each slice header, measured from the stream's own parameter sets.
         let sliceHeaders = try H264SliceHeaderParser(sps: h264Params.sps, pps: h264Params.pps)
 
-        // 5. Generate init segment
-        print("📝 Generating init segment...")
-        let initSegment = writer.generateInitSegment()
-        let initURL = tempDir.appendingPathComponent("init.mp4")
-        try initSegment.write(to: initURL)
-
-        // 6. Read and encrypt samples
         print("🔒 Encrypting video samples...")
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
@@ -164,6 +155,7 @@ public actor FMP4RecordingProtectionService {
             // Encrypt the sample using the actual NAL length size from the source video
             let encryptedResult = try encryptor.encryptVideoSample(sampleData, nalLengthSize: nalLengthSize,
                                                                    sliceHeaders: sliceHeaders)
+            try Self.checkSubsampleCount(encryptedResult.subsamples.count)
 
             // CRITICAL ALIGNMENT CHECK: sum(clear + protected) must equal sample_size
             let originalSize = sampleData.count
@@ -242,99 +234,122 @@ public actor FMP4RecordingProtectionService {
             throw FMP4ProtectionError.readFailed(
                 "read \(bytesRead) of \(totalSampleBytes) sample bytes, to \(readEnd.seconds) s of \(mediaEnd.seconds) s")
         }
-
-        // 6b. Read and encrypt the audio packets, whole-block full-sample, placed on the video's timeline: the
-        // package's time 0 is the first video sample's decode time, and both tracks' edits map media to presentation.
         let videoEnd = Double(samples.reduce(UInt64(0)) { $0 + UInt64($1.duration) }) / Double(timescale)
-        let audioOffset = Self.audioTimeOffset(videoPresentationOffset: Self.presentationOffset(of: trackSegments),
-                                               firstVideoDecodeTime: firstDecodeTime?.seconds ?? 0)
-        let audio = try audioSource.map {
-            Self.trim(try Self.readAudio($0, encryptor: encryptor, timeOffset: audioOffset),
-                      sampleRate: $0.sampleRate, to: videoEnd)
-        } ?? []
-        let audioSamples = audio.map(\.sample)
+        guard videoEnd > 0 else {
+            throw FMP4ProtectionError.readFailed("the video has no duration")
+        }
 
-        // 7. Generate media segments (about 6 seconds each)
-        print("📼 Generating media segments...")
+        // 5. Segment ranges, each opening on a sync sample (about 6 seconds each)
         let ranges = Self.segmentRanges(
             for: samples.map { SegmentSample(duration: $0.duration, isSync: $0.isSync) },
             targetDuration: UInt64(timescale) * 6  // not Int32 6 * timescale: overflows past 357,913,941
         )
-        // Each segment takes the audio packets that start within its video's time; the last takes the rest.
+        try Self.checkSegmentCount(ranges.count)
         let segmentStarts = ranges.map { range in
             Double(samples[..<range.lowerBound].reduce(UInt64(0)) { $0 + UInt64($1.duration) }) / Double(timescale)
         }
-        let audioRanges = Self.audioRanges(startTimes: audio.map(\.time), segmentStarts: segmentStarts)
-        var segments: [FMP4HLSGenerator.Segment] = []
+
+        // 6. The audio component: the sound as one AAC-LC track, whole-block full-sample encrypted under the audio
+        // key. It is placed on the video's timeline: the package's time 0 is the first video sample's decode time,
+        // and both tracks' edits map media to presentation. It covers the video's presented span, from the first
+        // presented frame (after time 0 for a B-frame stream) to the end of the last (after the last decode ends, for a
+        // B-frame stream), so every segment holds audio. EXTINF, the segments and FRAME-RATE stay on the decode
+        // durations.
+        var sound: (source: AudioSource, packets: [(sample: FMP4Writer.Sample, time: Double)])?
+        if let audioKey {
+            let audioOffset = Self.audioTimeOffset(videoPresentationOffset: Self.presentationOffset(of: trackSegments),
+                                                   firstVideoDecodeTime: firstDecodeTime?.seconds ?? 0)
+            sound = try await Self.coveringAudio(
+                of: asset, tracks: audioTracks, mixingIn: tempDir,
+                encryptor: CBCSEncryptor(key: audioKey, iv: constantIV),
+                timeOffset: audioOffset, videoStart: Self.firstPresentation(of: samples, timescale: timescale),
+                videoEnd: Self.presentedEnd(of: samples, timescale: timescale), segmentStarts: segmentStarts)
+        }
+        let audioWriter = sound.map { FMP4Writer(tracks: [$0.source.config], encryption: encryptionConfig) }
+        // Each audio segment's packets and decode time: contiguous from segment to segment (ADR-0055 §4).
+        let audioSegments = sound.map {
+            Self.audioSegments($0.packets, sampleRate: $0.source.sampleRate, segmentStarts: segmentStarts)
+        }
+
+        // 7. Each component's init segment and media segments: segment N of each names the video's segment N
+        print("📝 Generating init segments...")
+        try videoWriter.generateInitSegment().write(to: tempDir.appendingPathComponent(FairPlayPackage.initName(.video)))
+        try audioWriter?.generateInitSegment().write(to: tempDir.appendingPathComponent(FairPlayPackage.initName(.audio)))
+
+        print("📼 Generating media segments...")
+        var durations: [Double] = []
+        var videoBytes: [Int] = [], audioBytes: [Int] = []  // each component's segment sizes
         var baseDecodeTime: UInt64 = 0
-        var audioDecodeTime: UInt64 = 0  // where the previous audio fragment ended
 
         for (segmentIndex, range) in ranges.enumerated() {
             let segmentSamples = Array(samples[range])
             let segmentDuration = segmentSamples.reduce(UInt64(0)) { $0 + UInt64($1.duration) }
-            var fragments = [FMP4Writer.TrackFragment(trackID: 1, samples: segmentSamples,
-                                                      baseDecodeTime: baseDecodeTime)]
-            if let audioSource, let first = audioRanges[segmentIndex].first {
-                let segmentAudio = Array(audioSamples[audioRanges[segmentIndex]])
-                // Its first packet's time, so a gap before it is kept; never before the previous fragment's end.
-                let start = max(audioDecodeTime,
-                                UInt64((audio[first].time * Double(audioSource.sampleRate)).rounded()))
-                fragments.append(FMP4Writer.TrackFragment(trackID: audioSource.config.trackID, samples: segmentAudio,
-                                                          baseDecodeTime: start))
-                audioDecodeTime = start + segmentAudio.reduce(UInt64(0)) { $0 + UInt64($1.duration) }
+            let videoSegment = videoWriter.generateMediaSegment(fragments: [
+                FMP4Writer.TrackFragment(trackID: 1, samples: segmentSamples, baseDecodeTime: baseDecodeTime),
+            ])
+            try videoSegment.write(
+                to: tempDir.appendingPathComponent(FairPlayPackage.segmentName(.video, index: segmentIndex)))
+            videoBytes.append(videoSegment.count)
+            if let sound, let audioWriter, let audioSegments {
+                let packets = sound.packets[audioSegments.ranges[segmentIndex]]
+                guard !packets.isEmpty else {
+                    // coveringAudio checked every segment: never write components of unequal segments.
+                    throw FMP4ProtectionError.unsupportedAudio("audio segment \(segmentIndex) has no packets")
+                }
+                let audioSegment = audioWriter.generateMediaSegment(fragments: [
+                    FMP4Writer.TrackFragment(trackID: 1, samples: packets.map(\.sample),
+                                             baseDecodeTime: audioSegments.decodeTimes[segmentIndex]),
+                ])
+                try audioSegment.write(
+                    to: tempDir.appendingPathComponent(FairPlayPackage.segmentName(.audio, index: segmentIndex)))
+                audioBytes.append(audioSegment.count)
             }
-            let segmentData = writer.generateMediaSegment(fragments: fragments)
-
-            let segmentFilename = "segment\(segmentIndex).m4s"
-            let segmentURL = tempDir.appendingPathComponent(segmentFilename)
-            try segmentData.write(to: segmentURL)
-
-            let duration = Double(segmentDuration) / Double(timescale)
-            segments.append(FMP4HLSGenerator.Segment(uri: segmentFilename, duration: duration))
-
+            durations.append(Double(segmentDuration) / Double(timescale))
             baseDecodeTime += segmentDuration
         }
 
-        print("   Created \(segments.count) segments")
+        print("   Created \(durations.count) segments per component")
 
-        // 8. Generate HLS playlist
-        print("📋 Generating HLS playlist...")
-        let playlistConfig = FMP4HLSGenerator.PlaylistConfig(
-            targetDuration: Self.targetDuration(forSegmentDurations: segments.map(\.duration)),
-            playlistType: .vod,
-            initSegmentURI: "init.mp4"
-        )
-
-        // The license service matches the SPC against the policy uuid.
-        let fairPlayConfig = FMP4HLSGenerator.FairPlayConfig(
-            keyURI: "skd://\(contentKeyID)",
-            keyID: keyID,
-            iv: constantIV
-        )
-
-        let hlsGenerator = FMP4HLSGenerator(config: playlistConfig, encryption: fairPlayConfig)
-        let playlist = hlsGenerator.generateMediaPlaylist(segments: segments)
-
-        let playlistURL = tempDir.appendingPathComponent("playlist.m3u8")
-        try playlist.write(to: playlistURL, atomically: true, encoding: .utf8)
+        // 8. The playlists: one media playlist per component, each with the video's EXTINF values and target duration,
+        // and the master playlist (ADR-0055 §4)
+        print("📋 Generating HLS playlists...")
+        let components: [FairPlayComponent] = sound == nil ? [.video] : [.video, .audio]
+        let targetDuration = Self.targetDuration(forSegmentDurations: durations)
+        for component in components {
+            let playlist = FairPlayPackage.mediaPlaylist(component: component, policyUUID: contentKeyID, iv: constantIV,
+                                                         durations: durations, targetDuration: targetDuration)
+            try Data(playlist.utf8).write(to: tempDir.appendingPathComponent(FairPlayPackage.playlistName(component)))
+        }
+        let bandwidth = FairPlayPackage.bandwidth(segmentBytes: sound == nil ? [videoBytes] : [videoBytes, audioBytes],
+                                                  durations: durations)
+        guard let master = FairPlayPackage.masterPlaylist(FairPlayPackage.MasterPlaylist(
+            bandwidth: bandwidth.peak,
+            averageBandwidth: bandwidth.average,
+            videoCodec: videoCodec,
+            width: Int(dimensions.width),
+            height: Int(dimensions.height),
+            frameRate: Double(samples.count) / videoEnd,
+            audioChannels: sound?.source.channels
+        )) else {
+            // passThrough admitted only channel counts the master playlist states.
+            throw FMP4ProtectionError.packagingFailed("the master playlist cannot state the audio's channel count")
+        }
+        try Data(master.utf8).write(to: tempDir.appendingPathComponent(FairPlayPackage.masterPlaylistName))
 
         // 9. Package into TDF archive (ZIP)
         print("📦 Packaging into TDF archive...")
-
-        // Add fMP4-specific metadata to manifest (the segments are listed in the playlist)
         let enhancedManifestData = try addFMP4Metadata(
             to: manifestData,
             assetID: assetID,
             contentKeyID: contentKeyID,
-            playlistFilename: "playlist.m3u8",
-            initFilename: "init.mp4"
+            playlistFilename: FairPlayPackage.masterPlaylistName
         )
-
-        let archive = try createTDFArchive(
-            tempDir: tempDir,
-            manifestData: enhancedManifestData,
-            segments: segments
-        )
+        let entryNames = [FairPlayPackage.masterPlaylistName] + components.flatMap { component in
+            [FairPlayPackage.playlistName(component), FairPlayPackage.initName(component)]
+                + durations.indices.map { FairPlayPackage.segmentName(component, index: $0) }
+        }
+        let archive = try Self.createTDFArchive(tempDir: tempDir, manifestData: enhancedManifestData,
+                                                entryNames: entryNames)
 
         print("✅ fMP4 FairPlay protection complete: \(archive.count) bytes")
         return archive
@@ -342,13 +357,16 @@ public actor FMP4RecordingProtectionService {
 
     // MARK: - Audio
 
-    /// The source's sound: its one AAC-LC track, packaged as track 2 at its sample rate.
+    /// The source's sound: one AAC-LC track, packaged as track 1 of the audio component at its sample rate.
     struct AudioSource {
         /// The asset the track is read from: the source, or the mix of its audio.
         let asset: AVURLAsset
         let track: AVAssetTrack
         let config: FMP4Writer.TrackConfig
         let sampleRate: UInt32
+        /// The AudioSpecificConfig's channel count (`FairPlayPackage.channelCount(ofAudioSpecificConfig:)`: 1 to 6, or
+        /// 8): the master playlist's `CHANNELS`.
+        let channels: Int
         /// Seconds from a packet's media time to its presentation time: the track's first edit.
         let presentationOffset: Double
     }
@@ -367,55 +385,186 @@ public actor FMP4RecordingProtectionService {
         return edit.timeMapping.target.start.seconds - edit.timeMapping.source.start.seconds
     }
 
-    /// The packets of the package's span: those that end after its start and start before `end` (the video's), the
-    /// first moved to no earlier than 0.
+    /// Where the package presents its first frame, in seconds on its timeline: the earliest decode time plus
+    /// composition offset, with the decode times laid end to end from 0 as the segments place them. Never before 0. A
+    /// B-frame stream presents its first frame after its first decode (two frames later in the device spike's source).
+    static func firstPresentation(of samples: [FMP4Writer.Sample], timescale: CMTimeScale) -> Double {
+        guard !samples.isEmpty, timescale > 0 else { return 0 }
+        var decodeTime: Int64 = 0, earliest = Int64.max
+        for sample in samples {
+            earliest = min(earliest, decodeTime + Int64(sample.compositionTimeOffset))
+            decodeTime += Int64(sample.duration)
+        }
+        return Double(max(earliest, 0)) / Double(timescale)
+    }
+
+    /// Where the package stops presenting video, in seconds on its timeline: the latest decode time plus composition
+    /// offset plus duration, with the decode times laid end to end from 0 as the segments place them. A B-frame stream
+    /// presents its last frame after its last decode ends; without reordering this is the decode durations' sum. The
+    /// audio covers to here; EXTINF stays on the decode durations.
+    static func presentedEnd(of samples: [FMP4Writer.Sample], timescale: CMTimeScale) -> Double {
+        guard !samples.isEmpty, timescale > 0 else { return 0 }
+        var decodeTime: Int64 = 0, latest = Int64.min
+        for sample in samples {
+            latest = max(latest, decodeTime + Int64(sample.compositionTimeOffset) + Int64(sample.duration))
+            decodeTime += Int64(sample.duration)
+        }
+        return Double(max(latest, 0)) / Double(timescale)
+    }
+
+    /// The packets of the package's span: those that end after its start and that the segments emit before `end` (the
+    /// video's presented end), the first moved to no earlier than 0. A packet is cut by where it is emitted
+    /// (`laidTimes`), not by its own time: moving the first to 0 moves every later one by as much.
     static func trim(_ packets: [(sample: FMP4Writer.Sample, time: Double)], sampleRate: UInt32,
                      to end: Double) -> [(sample: FMP4Writer.Sample, time: Double)] {
-        packets
-            .filter { $0.time + Double($0.sample.duration) / Double(sampleRate) > 0 && $0.time < end }
-            .map { ($0.sample, max($0.time, 0)) }
+        guard sampleRate > 0 else { return [] }
+        let started = packets
+            .filter { $0.time + Double($0.sample.duration) / Double(sampleRate) > 0 }
+            .map { (sample: $0.sample, time: max($0.time, 0)) }
+        return zip(started, laidTimes(started, sampleRate: sampleRate)).filter { $0.1 < end }.map(\.0)
     }
 
-    /// The source's sound as one AAC-LC track, or nil when it has none.
-    ///
-    /// One AAC-LC track is packaged as it is. Anything else (several tracks, as a recorder writes one per source, or
-    /// audio in another format) is mixed and encoded once, as AAC-LC, into `directory`, and that track is packaged:
-    /// profile v1 carries one AAC-LC track, and sound is never dropped.
-    static func audioSource(of asset: AVURLAsset, mixingIn directory: URL) async throws -> AudioSource? {
-        let tracks = try await asset.loadTracks(withMediaType: .audio)
-        guard !tracks.isEmpty else { return nil }
-        if tracks.count == 1, let source = try await passThrough(tracks[0], of: asset) { return source }
-        let mixed = AVURLAsset(url: try await mix(tracks, of: asset,
-                                                  into: directory.appendingPathComponent("audio.m4a")))
-        guard let track = try await mixed.loadTracks(withMediaType: .audio).first,
-              let source = try await passThrough(track, of: mixed) else {
-            throw FMP4ProtectionError.unsupportedAudio("mixing the audio did not produce AAC-LC")
+    /// Where the segments emit each packet, in seconds on the package's timeline: laid end to end from the first
+    /// packet's time (never before 0), at the sample rate, as `audioDecodeTimes` writes them (ADR-0055 §4's contiguous
+    /// decode times). A packet's own time may differ from it by jitter, or by moving the first packet to 0.
+    static func laidTimes(_ packets: [(sample: FMP4Writer.Sample, time: Double)], sampleRate: UInt32) -> [Double] {
+        guard let first = packets.first, sampleRate > 0 else { return [] }
+        let rate = Double(sampleRate)
+        var tick = UInt64((max(first.time, 0) * rate).rounded())
+        return packets.map { packet in
+            defer { tick += UInt64(packet.sample.duration) }
+            return Double(tick) / rate
         }
-        return source
     }
 
-    /// `track` packaged as it is, when it is AAC-LC; otherwise nil.
+    /// The source's sound as one AAC-LC track, encrypted, placed on the package's timeline and cut to the video's
+    /// span, covering that span (`covers`) from the first presented frame (`videoStart`) to the end of the last
+    /// (`videoEnd`, `presentedEnd`).
+    ///
+    /// One AAC-LC track that covers it is packaged as it is. Anything else is mixed and encoded once, as AAC-LC, with
+    /// silence where there is no sound, into `directory`:
+    /// - several tracks, as a recorder writes one per source;
+    /// - audio in another format;
+    /// - AAC-LC whose channel configuration states no channel count a playlist may carry: 0 (a program config element
+    ///   sets the channels, as Apple's encoder writes a quadraphonic track) or 8 to 15 (11 for 6.1);
+    /// - a track that starts after the first presented frame or stops before the video's end;
+    /// - a track whose packets are not contiguous: a gap or an overlap of more than a packet.
+    ///
+    /// Profile v2 needs every segment of each component to name the same span, with the audio's decode times
+    /// contiguous (ADR-0055 §4), and sound is never dropped.
+    /// - Throws: `unsupportedAudio` when the mix is not AAC-LC of a supported channel count, or even the mix does not
+    ///   cover the video.
+    static func coveringAudio(of asset: AVURLAsset, tracks: [AVAssetTrack], mixingIn directory: URL,
+                              encryptor: CBCSEncryptor, timeOffset: Double, videoStart: Double, videoEnd: Double,
+                              segmentStarts: [Double]) async throws
+        -> (source: AudioSource, packets: [(sample: FMP4Writer.Sample, time: Double)]) {
+        if tracks.count == 1, let source = try await passThrough(tracks[0], of: asset) {
+            let packets = trim(try readAudio(source, encryptor: encryptor, timeOffset: timeOffset),
+                               sampleRate: source.sampleRate, to: videoEnd)
+            if covers(packets, sampleRate: source.sampleRate, segmentStarts: segmentStarts, start: videoStart,
+                      end: videoEnd) {
+                return (source, packets)
+            }
+        }
+        // The mix is on the source's timeline, where package time t is at t less the offset.
+        let mixed = try await mix(tracks, of: asset, into: directory.appendingPathComponent("audio.m4a"),
+                                  from: CMTime(seconds: videoStart - timeOffset, preferredTimescale: 48_000),
+                                  through: CMTime(seconds: videoEnd - timeOffset, preferredTimescale: 48_000))
+        let mixedAsset = AVURLAsset(url: mixed.url)
+        guard let track = try await mixedAsset.loadTracks(withMediaType: .audio).first,
+              let source = try await passThrough(track, of: mixedAsset) else {
+            throw FMP4ProtectionError.unsupportedAudio(
+                "mixing the audio did not produce AAC-LC with a channel count a playlist may state")
+        }
+        // The mix's time 0 is its origin on the source's timeline.
+        let packets = trim(try readAudio(source, encryptor: encryptor, timeOffset: timeOffset + mixed.origin.seconds),
+                           sampleRate: source.sampleRate, to: videoEnd)
+        guard covers(packets, sampleRate: source.sampleRate, segmentStarts: segmentStarts, start: videoStart,
+                     end: videoEnd) else {
+            throw FMP4ProtectionError.unsupportedAudio("the mixed audio does not cover the video")
+        }
+        return (source, packets)
+    }
+
+    /// Whether placed packets cover the video's span on the package's timeline, from `start` (where it presents its
+    /// first frame) to `end` (where it presents its last), measured where the segments emit them (`laidTimes`)
+    /// (ADR-0055 §4):
+    /// - the first packet starts within its own duration of `start` (sound may start before it), and the last ends
+    ///   within its own duration of `end`;
+    /// - every packet is emitted within its own duration of its own time: jitter is absorbed, and a gap or an overlap
+    ///   longer than that is not contiguous;
+    /// - every segment from `segmentStarts` emits at least one packet.
+    static func covers(_ packets: [(sample: FMP4Writer.Sample, time: Double)], sampleRate: UInt32,
+                       segmentStarts: [Double], start: Double, end: Double) -> Bool {
+        guard let first = packets.first, let last = packets.last, sampleRate > 0 else { return false }
+        let rate = Double(sampleRate)
+        let laid = laidTimes(packets, sampleRate: sampleRate)
+        guard let firstLaid = laid.first, let lastLaid = laid.last,
+              firstLaid <= max(start, 0) + Double(first.sample.duration) / rate,
+              lastLaid + 2 * Double(last.sample.duration) / rate >= end else { return false }
+        for (packet, emitted) in zip(packets, laid)
+        where abs(packet.time - emitted) > Double(packet.sample.duration) / rate {
+            return false
+        }
+        return audioRanges(startTimes: laid, segmentStarts: segmentStarts).allSatisfy { !$0.isEmpty }
+    }
+
+    /// Each audio segment's packets and decode time: the packets grouped by where the segments emit them
+    /// (`laidTimes`), so every packet's emitted time falls within its segment's range (ADR-0055 §4's ranges), and each
+    /// segment's `tfdt` (`audioDecodeTimes`).
+    static func audioSegments(_ packets: [(sample: FMP4Writer.Sample, time: Double)], sampleRate: UInt32,
+                              segmentStarts: [Double]) -> (ranges: [Range<Int>], decodeTimes: [UInt64]) {
+        let ranges = audioRanges(startTimes: laidTimes(packets, sampleRate: sampleRate), segmentStarts: segmentStarts)
+        return (ranges, audioDecodeTimes(packets, ranges: ranges, sampleRate: sampleRate))
+    }
+
+    /// Each segment's audio decode time (`tfdt`), at the sample rate, for the packets of each of `ranges`. The first
+    /// is its first packet's time (never before 0), and each later one where the one before it ends: the audio's decode
+    /// times are contiguous from segment to segment (ADR-0055 §4), the times `laidTimes` gives. `covers` has checked
+    /// that this keeps every packet within its own duration of its time.
+    static func audioDecodeTimes(_ packets: [(sample: FMP4Writer.Sample, time: Double)], ranges: [Range<Int>],
+                                 sampleRate: UInt32) -> [UInt64] {
+        var time = packets.first.map { UInt64((max($0.time, 0) * Double(sampleRate)).rounded()) } ?? 0
+        return ranges.map { range in
+            defer { time += packets[range].reduce(UInt64(0)) { $0 + UInt64($1.sample.duration) } }
+            return time
+        }
+    }
+
+    /// `track` packaged as it is, when it is AAC-LC whose channel configuration states a channel count a playlist may
+    /// carry (`FairPlayPackage.channelCount(ofAudioSpecificConfig:)`); otherwise nil, and the caller mixes it. Not
+    /// configuration 0 (a program config element sets the channels) or 8 to 15.
     private static func passThrough(_ track: AVAssetTrack, of asset: AVURLAsset) async throws -> AudioSource? {
         let descriptions = try await track.load(.formatDescriptions)
         guard descriptions.count == 1, let format = descriptions.first,
               CMFormatDescriptionGetMediaSubType(format) == kAudioFormatMPEG4AAC,
               let description = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
               description.mSampleRate > 0, description.mChannelsPerFrame > 0,
-              let config = audioSpecificConfig(of: format), config.count >= 2, config[config.startIndex] >> 3 == 2
+              let config = audioSpecificConfig(of: format), config.count >= 2, config[config.startIndex] >> 3 == 2,
+              let channels = FairPlayPackage.channelCount(ofAudioSpecificConfig: config)
         else { return nil }
         let sampleRate = UInt32(description.mSampleRate)
         return AudioSource(
             asset: asset,
             track: track,
-            config: .aacAudio(trackID: 2, channelCount: UInt16(description.mChannelsPerFrame),
+            // Track 1 of the audio component's own init segment (ADR-0055 §5).
+            config: .aacAudio(trackID: 1, channelCount: UInt16(description.mChannelsPerFrame),
                               sampleRate: sampleRate, audioSpecificConfig: config),
             sampleRate: sampleRate,
+            channels: channels,
             presentationOffset: presentationOffset(of: try await track.load(.segments)))
     }
 
-    /// `tracks` mixed (each through its own edits, on the asset's timeline from 0) and encoded as AAC-LC at 48 kHz,
-    /// stereo when any of them is, into an M4A at `url`.
-    static func mix(_ tracks: [AVAssetTrack], of asset: AVURLAsset, into url: URL) async throws -> URL {
+    /// `tracks` mixed and encoded into an M4A at `url`: each track through its own edits, on the asset's timeline, as
+    /// AAC-LC at 48 kHz, stereo when any of them is. The M4A covers `start` to at least `end` on that timeline:
+    /// - the mix renders a gap in a track's edits as silence;
+    /// - silence is added before the sound when it starts after `start`, which may be before the asset's 0 (a video
+    ///   whose edit starts into a group of pictures, whose earlier frames the package keeps and presents);
+    /// - and silence is added from where the sound ends to `end`.
+    /// - Returns: The M4A, and its origin: where its time 0 is on the asset's timeline, which is where its first sample
+    ///   is: the sound's start, or the silence's before it.
+    static func mix(_ tracks: [AVAssetTrack], of asset: AVURLAsset, into url: URL, from start: CMTime,
+                    through end: CMTime) async throws -> (url: URL, origin: CMTime) {
         var channels = 1
         for track in tracks {
             for format in try await track.load(.formatDescriptions)
@@ -445,7 +594,10 @@ public actor FMP4RecordingProtectionService {
             throw FMP4ProtectionError.encodingFailed(writer.error?.localizedDescription ?? "audio mix writer")
         }
         writer.startSession(atSourceTime: .zero)
-        while let buffer = output.copyNextSampleBuffer() {
+        var origin: CMTime?  // the M4A's time 0 on the asset's timeline: its first sample's time
+        // `buffer`, at its time on the asset's timeline less the origin.
+        func append(_ buffer: CMSampleBuffer) async throws {
+            let buffer = try retimed(buffer, by: origin ?? .zero)
             while !input.isReadyForMoreMediaData {
                 guard writer.status == .writing else {
                     throw FMP4ProtectionError.encodingFailed(writer.error?.localizedDescription ?? "audio mix writer")
@@ -456,15 +608,132 @@ public actor FMP4RecordingProtectionService {
                 throw FMP4ProtectionError.encodingFailed(writer.error?.localizedDescription ?? "audio mix append")
             }
         }
+        // `frames` frames of silence from `time` on the asset's timeline, appended in buffers of at most 4,096.
+        func appendSilence(frames: CMTimeValue, at time: CMTime, like format: CMFormatDescription) async throws {
+            var written: CMTimeValue = 0
+            while written < frames {
+                let count = min(4_096, frames - written)
+                try await append(try silence(frames: Int(count), like: format,
+                                             at: time + CMTime(value: written, timescale: 48_000)))
+                written += count
+            }
+        }
+        var written = CMTime.zero  // where the last buffer appended ends, on the asset's timeline
+        var format: CMFormatDescription?
+        while let buffer = output.copyNextSampleBuffer() {
+            let time = CMSampleBufferGetPresentationTimeStamp(buffer)
+            if origin == nil {
+                guard let first = CMSampleBufferGetFormatDescription(buffer) else {
+                    throw FMP4ProtectionError.encodingFailed("audio mix without a format")
+                }
+                // Silence before the sound, when it starts after `start`, ending where the sound starts.
+                let lead = max(0, (time - start).convertScale(48_000, method: .roundAwayFromZero).value)
+                let leadStart = time - CMTime(value: lead, timescale: 48_000)
+                origin = leadStart
+                try await appendSilence(frames: lead, at: leadStart, like: first)
+            }
+            try await append(buffer)
+            written = time + CMSampleBufferGetDuration(buffer)
+            format = CMSampleBufferGetFormatDescription(buffer)
+        }
         guard reader.status == .completed else {
             throw FMP4ProtectionError.readFailed(reader.error?.localizedDescription ?? "audio mix did not finish")
+        }
+        guard let origin, let format else { throw FMP4ProtectionError.unsupportedAudio("the audio mix is empty") }
+        // Silence to `end`, so a sound that stops before the video still covers its span.
+        if written < end {
+            try await appendSilence(frames: (end - written).convertScale(48_000, method: .roundAwayFromZero).value,
+                                    at: written, like: format)
         }
         input.markAsFinished()
         await writer.finishWriting()
         guard writer.status == .completed else {
             throw FMP4ProtectionError.encodingFailed(writer.error?.localizedDescription ?? "audio mix did not finish")
         }
-        return url
+        return (url, origin)
+    }
+
+    /// `buffer` with every timestamp `offset` earlier; `buffer` itself when `offset` is zero.
+    private static func retimed(_ buffer: CMSampleBuffer, by offset: CMTime) throws -> CMSampleBuffer {
+        guard offset != .zero else { return buffer }
+        var count = 0
+        guard CMSampleBufferGetSampleTimingInfoArray(buffer, entryCount: 0, arrayToFill: nil,
+                                                     entriesNeededOut: &count) == noErr, count > 0 else {
+            throw FMP4ProtectionError.encodingFailed("audio mix timing")
+        }
+        var timings = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: count)
+        guard CMSampleBufferGetSampleTimingInfoArray(buffer, entryCount: count, arrayToFill: &timings,
+                                                     entriesNeededOut: &count) == noErr else {
+            throw FMP4ProtectionError.encodingFailed("audio mix timing")
+        }
+        for index in timings.indices {
+            timings[index].presentationTimeStamp = timings[index].presentationTimeStamp - offset
+            if timings[index].decodeTimeStamp.isNumeric {
+                timings[index].decodeTimeStamp = timings[index].decodeTimeStamp - offset
+            }
+        }
+        var copy: CMSampleBuffer?
+        let status = CMSampleBufferCreateCopyWithNewTiming(allocator: nil, sampleBuffer: buffer,
+                                                           sampleTimingEntryCount: count, sampleTimingArray: &timings,
+                                                           sampleBufferOut: &copy)
+        guard status == noErr, let copy else { throw FMP4ProtectionError.encodingFailed("audio mix retiming \(status)") }
+        return copy
+    }
+
+    /// `frames` frames of silence at `time`, in the linear PCM format of `format`.
+    static func silence(frames: Int, like format: CMFormatDescription, at time: CMTime) throws -> CMSampleBuffer {
+        guard let description = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
+              description.mBytesPerFrame > 0 else {
+            throw FMP4ProtectionError.encodingFailed("silence needs linear PCM")
+        }
+        let length = frames * Int(description.mBytesPerFrame)
+        var block: CMBlockBuffer?
+        var status = CMBlockBufferCreateWithMemoryBlock(
+            allocator: nil, memoryBlock: nil, blockLength: length, blockAllocator: nil, customBlockSource: nil,
+            offsetToData: 0, dataLength: length, flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block)
+        guard status == noErr, let block else { throw FMP4ProtectionError.encodingFailed("silence block \(status)") }
+        status = CMBlockBufferFillDataBytes(with: 0, blockBuffer: block, offsetIntoDestination: 0, dataLength: length)
+        guard status == noErr else { throw FMP4ProtectionError.encodingFailed("silence fill \(status)") }
+        var buffer: CMSampleBuffer?
+        status = CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+            allocator: nil, dataBuffer: block, formatDescription: format, sampleCount: frames,
+            presentationTimeStamp: time, packetDescriptions: nil, sampleBufferOut: &buffer)
+        guard status == noErr, let buffer else { throw FMP4ProtectionError.encodingFailed("silence buffer \(status)") }
+        return buffer
+    }
+
+    // MARK: - Limits
+
+    /// Refuses NAL unit lengths other than 4 bytes: the init's avcC declares 4, and the samples are written as the
+    /// source has them, so shorter ones would be undecodable.
+    static func checkNALLengthSize(_ size: Int) throws {
+        guard size == 4 else {
+            throw FMP4ProtectionError.packagingFailed(
+                "the video's NAL unit lengths are \(size) bytes; profile v2 packages 4-byte lengths only")
+        }
+    }
+
+    /// The most subsamples a video sample may have: its `senc` entry is 2 bytes plus 6 a subsample, and `saiz` states
+    /// that size in one byte (at most 255), so 42.
+    static let maxSubsamples = (255 - 2) / 6
+
+    /// Refuses a video sample of more than 42 subsamples (NAL units): its `senc` entry would be larger than `saiz` can
+    /// state, which would leave the two disagreeing.
+    static func checkSubsampleCount(_ count: Int) throws {
+        guard count <= maxSubsamples else {
+            throw FMP4ProtectionError.packagingFailed(
+                "a video sample has \(count) NAL units; its senc entry would exceed saiz's 255 bytes (at most 42)")
+        }
+    }
+
+    // MARK: - Segment count
+
+    /// Refuses more than 4,093 segments. A component holds `<id>-segment0.m4s` to `<id>-segment4092.m4s`
+    /// (ADR-0055 §2), about six hours 49 minutes at six-second segments.
+    static func checkSegmentCount(_ count: Int) throws {
+        guard count <= FairPlayPackage.maxSegmentIndex + 1 else {
+            throw FMP4ProtectionError.packagingFailed("\(count) segments; profile v2 holds at most 4,093")
+        }
     }
 
     /// The AudioSpecificConfig of an AAC format description: its magic cookie, which is an MPEG-4 ES_Descriptor (the
@@ -715,14 +984,14 @@ public actor FMP4RecordingProtectionService {
         return sps.isEmpty ? nil : H264Parameters(sps: sps, pps: pps, nalLengthSize: nalLengthSize)
     }
 
-    /// Add fMP4-specific metadata to manifest using TDF spec's encryptedMetadata field
-    /// The metadata is base64-encoded JSON (unencrypted) per TDF spec allowance
+    /// Add fMP4-specific metadata to manifest using TDF spec's encryptedMetadata field.
+    /// The metadata is base64-encoded JSON (unencrypted) per TDF spec allowance. No reader decides anything from it
+    /// (ADR-0047 §2 in arkavo-ios). It names the master playlist for players that look the playlist up.
     private func addFMP4Metadata(
         to manifestData: Data,
         assetID: String,
         contentKeyID: String,
-        playlistFilename: String,
-        initFilename: String
+        playlistFilename: String
     ) throws -> Data {
         // Parse existing manifest
         guard var manifest = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any] else {
@@ -737,7 +1006,6 @@ public actor FMP4RecordingProtectionService {
             "assetId": assetID,
             "contentKeyId": contentKeyID,
             "playlistFilename": playlistFilename,
-            "initFilename": initFilename,
             "encryption": "cbcs-1-9",
             "protectedAt": protectedAtTimestamp
         ]
@@ -746,7 +1014,7 @@ public actor FMP4RecordingProtectionService {
         let metadataJSON = try JSONSerialization.data(withJSONObject: fmp4Meta, options: [.sortedKeys])
         let metadataBase64 = metadataJSON.base64EncodedString()
 
-        // Add encryptedMetadata to keyAccess (per TDF spec)
+        // Add encryptedMetadata to the first key access object (per TDF spec)
         if var encInfo = manifest["encryptionInformation"] as? [String: Any],
            var keyAccessArray = encInfo["keyAccess"] as? [[String: Any]],
            !keyAccessArray.isEmpty {
@@ -756,7 +1024,7 @@ public actor FMP4RecordingProtectionService {
         }
 
         // Add top-level meta section (required by IrohContentService). contentKeyId
-        // is the skd:// id (the policy uuid); assetId is the recording's id.
+        // is the key URIs' uuid (the policy uuid); assetId is the recording's id.
         manifest["meta"] = [
             "assetId": assetID,
             "contentKeyId": contentKeyID,
@@ -767,35 +1035,71 @@ public actor FMP4RecordingProtectionService {
         return try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])
     }
 
-    private func createTDFArchive(
+    // MARK: - Archive
+
+    /// The largest archive a ZIP without ZIP64 can describe: every size and offset in it is 32 bits.
+    static let maxArchiveSize = UInt64(UInt32.max)
+
+    /// The exact size of the stored ZIP of `entries` that `createTDFArchive` writes: for each entry its local header (30
+    /// bytes), name and data, then for each its central directory entry (46 bytes) and name, then the end record (22
+    /// bytes). No extra fields, comments or data descriptors.
+    static func archiveSize(entries: [(name: String, size: Int)]) -> UInt64 {
+        entries.reduce(22) { total, entry in
+            total + 30 + 46 + 2 * UInt64(entry.name.utf8.count) + UInt64(max(entry.size, 0))
+        }
+    }
+
+    /// Refuses an archive larger than a ZIP without ZIP64 can describe (4,294,967,295 bytes). At or below it, no size,
+    /// offset or count in the archive is 0xFFFFFFFF, which a reader would take for ZIP64.
+    static func checkArchiveSize(_ size: UInt64) throws {
+        guard size <= maxArchiveSize else {
+            throw FMP4ProtectionError.packagingFailed(
+                "the archive would be \(size) bytes; a ZIP without ZIP64 holds at most 4,294,967,295")
+        }
+    }
+
+    static func fileSize(_ url: URL) throws -> Int {
+        guard let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
+            throw FMP4ProtectionError.packagingFailed("the size of \(url.lastPathComponent) is unknown")
+        }
+        return size
+    }
+
+    /// A stored ZIP of `manifest.json` (`manifestData`), then each of `entryNames`, read from `tempDir`, in order.
+    /// - Parameter entrySize: An entry's size, before it is read (the file's size on disk).
+    /// - Throws: `packagingFailed` when the archive would be larger than 4,294,967,295 bytes (`archiveSize`), before any
+    ///   entry is read.
+    static func createTDFArchive(
         tempDir: URL,
         manifestData: Data,
-        segments: [FMP4HLSGenerator.Segment]
+        entryNames: [String],
+        entrySize: (URL) throws -> Int = fileSize
     ) throws -> Data {
+        // Its size first, from the entries' sizes: nothing is read for an archive a ZIP cannot hold.
+        let sizes = try entryNames.map { (name: $0, size: try entrySize(tempDir.appendingPathComponent($0))) }
+        try checkArchiveSize(archiveSize(entries: [(FairPlayPackage.manifestName, manifestData.count)] + sizes))
+
+        // Within the ceiling every field fits; a conversion that does not is a failure, never a trap.
+        func field32(_ value: Int) throws -> UInt32 {
+            guard let field = UInt32(exactly: value) else {
+                throw FMP4ProtectionError.packagingFailed("\(value) does not fit a ZIP field")
+            }
+            return field
+        }
+        func field16(_ value: Int) throws -> UInt16 {
+            guard let field = UInt16(exactly: value) else {
+                throw FMP4ProtectionError.packagingFailed("\(value) does not fit a ZIP field")
+            }
+            return field
+        }
+
         // Create ZIP archive manually (simplified implementation)
         var archive = Data()
 
-        // Files to include
-        var files: [(name: String, data: Data)] = []
-
-        // Add manifest
-        files.append(("manifest.json", manifestData))
-
-        // Add playlist
-        let playlistURL = tempDir.appendingPathComponent("playlist.m3u8")
-        let playlistData = try Data(contentsOf: playlistURL)
-        files.append(("playlist.m3u8", playlistData))
-
-        // Add init segment
-        let initURL = tempDir.appendingPathComponent("init.mp4")
-        let initData = try Data(contentsOf: initURL)
-        files.append(("init.mp4", initData))
-
-        // Add media segments
-        for segment in segments {
-            let segmentURL = tempDir.appendingPathComponent(segment.uri)
-            let segmentData = try Data(contentsOf: segmentURL)
-            files.append((segment.uri, segmentData))
+        // Files to include: the manifest, then the playlists, inits and segments
+        var files: [(name: String, data: Data)] = [(FairPlayPackage.manifestName, manifestData)]
+        for name in entryNames {
+            files.append((name, try Data(contentsOf: tempDir.appendingPathComponent(name))))
         }
 
         // Simple ZIP creation (no compression for media files)
@@ -817,14 +1121,16 @@ public actor FMP4RecordingProtectionService {
             localHeader.append(crc.littleEndianData)
 
             // Compressed size (same as uncompressed for store)
-            localHeader.append(UInt32(file.data.count).littleEndianData)
+            let size = try field32(file.data.count)
+            localHeader.append(size.littleEndianData)
 
             // Uncompressed size
-            localHeader.append(UInt32(file.data.count).littleEndianData)
+            localHeader.append(size.littleEndianData)
 
             // Filename length
-            let filenameData = file.name.data(using: .utf8) ?? Data()
-            localHeader.append(UInt16(filenameData.count).littleEndianData)
+            let filenameData = Data(file.name.utf8)
+            let filenameLength = try field16(filenameData.count)
+            localHeader.append(filenameLength.littleEndianData)
 
             // Extra field length
             localHeader.append(contentsOf: [0x00, 0x00])
@@ -846,9 +1152,9 @@ public actor FMP4RecordingProtectionService {
             cdEntry.append(contentsOf: [0x00, 0x00])            // Last mod time
             cdEntry.append(contentsOf: [0x00, 0x00])            // Last mod date
             cdEntry.append(crc.littleEndianData)
-            cdEntry.append(UInt32(file.data.count).littleEndianData)
-            cdEntry.append(UInt32(file.data.count).littleEndianData)
-            cdEntry.append(UInt16(filenameData.count).littleEndianData)
+            cdEntry.append(size.littleEndianData)
+            cdEntry.append(size.littleEndianData)
+            cdEntry.append(filenameLength.littleEndianData)
             cdEntry.append(contentsOf: [0x00, 0x00])            // Extra field length
             cdEntry.append(contentsOf: [0x00, 0x00])            // Comment length
             cdEntry.append(contentsOf: [0x00, 0x00])            // Disk number start
@@ -858,7 +1164,7 @@ public actor FMP4RecordingProtectionService {
             cdEntry.append(filenameData)
 
             centralDirectory.append(cdEntry)
-            localOffset = UInt32(archive.count)
+            localOffset = try field32(archive.count)
         }
 
         let cdOffset = archive.count
@@ -869,10 +1175,10 @@ public actor FMP4RecordingProtectionService {
         eocd.append(contentsOf: [0x50, 0x4B, 0x05, 0x06]) // Signature
         eocd.append(contentsOf: [0x00, 0x00])            // Disk number
         eocd.append(contentsOf: [0x00, 0x00])            // CD start disk
-        eocd.append(UInt16(files.count).littleEndianData)
-        eocd.append(UInt16(files.count).littleEndianData)
-        eocd.append(UInt32(centralDirectory.count).littleEndianData)
-        eocd.append(UInt32(cdOffset).littleEndianData)
+        eocd.append(try field16(files.count).littleEndianData)
+        eocd.append(try field16(files.count).littleEndianData)
+        eocd.append(try field32(centralDirectory.count).littleEndianData)
+        eocd.append(try field32(cdOffset).littleEndianData)
         eocd.append(contentsOf: [0x00, 0x00])            // Comment length
 
         archive.append(eocd)
@@ -881,7 +1187,7 @@ public actor FMP4RecordingProtectionService {
     }
 
     /// Simple CRC-32 implementation
-    private func crc32(_ data: Data) -> UInt32 {
+    private static func crc32(_ data: Data) -> UInt32 {
         var crc: UInt32 = 0xFFFFFFFF
         let table = makeCRCTable()
 
@@ -893,7 +1199,7 @@ public actor FMP4RecordingProtectionService {
         return ~crc
     }
 
-    private func makeCRCTable() -> [UInt32] {
+    private static func makeCRCTable() -> [UInt32] {
         var table = [UInt32](repeating: 0, count: 256)
         for n in 0..<256 {
             var c = UInt32(n)
@@ -937,7 +1243,8 @@ public enum FMP4ProtectionError: Error, LocalizedError {
     case packagingFailed(String)
     case manifestParsingFailed
     case readFailed(String)
-    /// Sound that could not be made into profile v1's AAC-LC track: refused rather than dropped.
+    /// Sound that could not be made into profile v2's audio component, one AAC-LC track covering the video: refused
+    /// rather than dropped.
     case unsupportedAudio(String)
 
     public var errorDescription: String? {

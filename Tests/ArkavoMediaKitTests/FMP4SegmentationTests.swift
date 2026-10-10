@@ -85,7 +85,7 @@ struct FMP4SegmentationTests {
             _ = try zip.extract(entry) { data.append($0) }
             files[entry.path] = data
         }
-        let playlist = String(decoding: try #require(files["playlist.m3u8"]), as: UTF8.self)
+        let playlist = String(decoding: try #require(files["video.m3u8"]), as: UTF8.self)
         let lines = playlist.components(separatedBy: .newlines)
         let target = try #require(lines.lazy.compactMap { line in
             line.hasPrefix("#EXT-X-TARGETDURATION:") ? Int(line.dropFirst("#EXT-X-TARGETDURATION:".count)) : nil
@@ -127,7 +127,7 @@ struct FMP4SegmentationTests {
             _ = try zip.extract(entry) { data.append($0) }
             files[entry.path] = data
         }
-        let playlist = String(decoding: try #require(files["playlist.m3u8"]), as: UTF8.self)
+        let playlist = String(decoding: try #require(files["video.m3u8"]), as: UTF8.self)
         let lines = playlist.components(separatedBy: .newlines)
         let total = lines.compactMap { line -> Double? in
             guard line.hasPrefix("#EXTINF:") else { return nil }
@@ -163,7 +163,7 @@ struct FMP4SegmentationTests {
         let archive = try await service.protectVideo(videoURL: movie, assetID: "short")
         let zip = try Archive(data: archive, accessMode: .read)
         var playlistData = Data()
-        _ = try zip.extract(try #require(zip["playlist.m3u8"])) { playlistData.append($0) }
+        _ = try zip.extract(try #require(zip["video.m3u8"])) { playlistData.append($0) }
         #expect(String(decoding: playlistData, as: UTF8.self).contains("#EXT-X-TARGETDURATION:1\n"))
     }
 

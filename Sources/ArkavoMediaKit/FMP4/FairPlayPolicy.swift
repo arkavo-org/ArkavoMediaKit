@@ -10,8 +10,8 @@ import Foundation
 /// (OpenTDFKit 4 emitted `base64(hex(...))`, which arks refuses); the FairPlay
 /// path still computes it here, pinned to the arks fixture.
 ///
-/// The policy `uuid` is the FairPlay content-key id: the playlist key URI is
-/// `skd://<uuid>` and the SPC content identifier is the uuid.
+/// The policy `uuid` names the package's keys. In profile v2 each component's key URI is `skd://<uuid>/<id>` and its
+/// SPC content identifier `<uuid>/<id>` (ADR-0055 §6 in arkavo-ios). In profile v1 they were `skd://<uuid>` and the uuid.
 public enum FairPlayPolicy {
     public enum Error: Swift.Error, Equatable {
         case notJSONObject
@@ -70,7 +70,7 @@ public enum FairPlayPolicy {
     }
 
     /// BOM-less UTF-8, no NUL bytes (so not UTF-16 or UTF-32), opening with `{`.
-    private static func isPlainUTF8Object(_ json: Data) -> Bool {
+    static func isPlainUTF8Object(_ json: Data) -> Bool {
         guard !json.contains(0), String(data: json, encoding: .utf8) != nil else { return false }
         let whitespace: Set<UInt8> = [0x20, 0x09, 0x0A, 0x0D]
         return json.first { !whitespace.contains($0) } == UInt8(ascii: "{")
@@ -80,7 +80,8 @@ public enum FairPlayPolicy {
     /// differently or not at all: a key repeated in one object (decoded, so
     /// `"uuid"` is `uuid`, and compared by code units as serde does), a
     /// trailing comma (JSONSerialization allows one), nesting deeper than 64.
-    private static func checkStructure(of json: Data) throws {
+    /// Call it only on bytes JSONSerialization has parsed: it does not check that a string is terminated.
+    static func checkStructure(of json: Data) throws {
         enum Container { case object(Set<[UInt8]>), array }
         let bytes = [UInt8](json)
         var stack: [Container] = []
