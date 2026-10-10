@@ -23,6 +23,8 @@ public final class CBCSEncryptor {
     public enum Failure: Error, Equatable {
         /// The sample's NAL unit lengths do not cover it exactly.
         case malformedSample
+        /// The system's random source failed, with this status: there is no key.
+        case randomBytesUnavailable(OSStatus)
     }
 
     /// Encryption result with subsample map
@@ -340,6 +342,20 @@ extension CBCSEncryptor {
         return derived
     }
 
+    /// A 16-byte AES-128 content key from the system's cryptographically secure random source.
+    /// - Throws: `Failure.randomBytesUnavailable` when the source fails, rather than return a key it did not fill.
+    public static func generateContentKey() throws -> Data {
+        try generateContentKey { count, bytes in SecRandomCopyBytes(kSecRandomDefault, count, bytes) }
+    }
+
+    /// A content key from `random`, which fills its count of bytes and returns a status (`errSecSuccess` on success).
+    static func generateContentKey(random: (Int, UnsafeMutableRawPointer) -> OSStatus) throws -> Data {
+        var key = Data(count: 16)
+        let status = key.withUnsafeMutableBytes { random($0.count, $0.baseAddress!) }
+        guard status == errSecSuccess else { throw Failure.randomBytesUnavailable(status) }
+        return key
+    }
+
     /// Generate random key ID
     public static func generateKeyID() -> Data {
         var keyID = Data(count: 16)
@@ -363,6 +379,7 @@ extension CBCSEncryptor.Failure: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .malformedSample: "A video sample's NAL unit lengths do not match its size."
+        case let .randomBytesUnavailable(status): "The system's random source failed (status \(status))."
         }
     }
 }

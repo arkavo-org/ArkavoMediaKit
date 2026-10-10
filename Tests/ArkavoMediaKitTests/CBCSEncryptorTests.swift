@@ -188,6 +188,23 @@ struct CBCSEncryptorTests {
         #expect(keyID1 != keyID2)
     }
 
+    /// A content key is built on the random source: when it fails, there is no key, never a zero or partial one.
+    @Test("A content key is 16 random bytes, and a failing random source throws instead")
+    func generateContentKey() throws {
+        let key1 = try CBCSEncryptor.generateContentKey()
+        let key2 = try CBCSEncryptor.generateContentKey()
+        #expect(key1.count == 16 && key2.count == 16 && key1 != key2)
+
+        var requested: [Int] = []
+        #expect(throws: CBCSEncryptor.Failure.randomBytesUnavailable(errSecAllocate)) {
+            _ = try CBCSEncryptor.generateContentKey { count, _ in
+                requested.append(count)
+                return errSecAllocate
+            }
+        }
+        #expect(requested == [16])
+    }
+
     @Test("Generate random IV produces unique values")
     func generateIVUnique() {
         let iv1 = CBCSEncryptor.generateIV()
