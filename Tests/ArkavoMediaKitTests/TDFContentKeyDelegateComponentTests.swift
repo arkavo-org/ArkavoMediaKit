@@ -235,12 +235,11 @@ struct TDFContentKeyDelegateComponentTests {
         ])
         // Exactly these members: never `userId` (ADR-0046 §4's never-sent list, kept by ADR-0055 §7).
         let starts = calls.filter { $0.route == "POST session/start" }
-        #expect(starts.map { $0.body } == [["assetId": Self.uuid, "protocol": "fairplay"],
-                                           ["assetId": Self.uuid, "protocol": "fairplay"]])
+        let startBody: [String: String] = ["assetId": Self.uuid, "protocol": "fairplay"]
+        #expect(starts.map(\.body) == [startBody, startBody])
         let keyRequests = calls.filter { $0.route == "POST key-request" }
-        #expect(keyRequests.allSatisfy {
-            Set($0.body.keys) == ["sessionId", "assetId", "spcData", "tdfManifest", "component"]
-        })
+        let keyRequestMembers: Set<String> = ["sessionId", "assetId", "spcData", "tdfManifest", "component"]
+        #expect(keyRequests.allSatisfy { Set($0.body.keys) == keyRequestMembers })
         #expect(keyRequests.map { $0.body["component"] } == ["video", "audio"])
         #expect(keyRequests.map { $0.body["assetId"] } == [Self.uuid, Self.uuid])
         #expect(keyRequests.map { $0.body["sessionId"] } == ["session-1", "session-2"])
