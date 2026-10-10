@@ -70,7 +70,7 @@ public enum FairPlayPolicy {
     }
 
     /// BOM-less UTF-8, no NUL bytes (so not UTF-16 or UTF-32), opening with `{`.
-    private static func isPlainUTF8Object(_ json: Data) -> Bool {
+    static func isPlainUTF8Object(_ json: Data) -> Bool {
         guard !json.contains(0), String(data: json, encoding: .utf8) != nil else { return false }
         let whitespace: Set<UInt8> = [0x20, 0x09, 0x0A, 0x0D]
         return json.first { !whitespace.contains($0) } == UInt8(ascii: "{")
@@ -80,7 +80,8 @@ public enum FairPlayPolicy {
     /// differently or not at all: a key repeated in one object (decoded, so
     /// `"uuid"` is `uuid`, and compared by code units as serde does), a
     /// trailing comma (JSONSerialization allows one), nesting deeper than 64.
-    private static func checkStructure(of json: Data) throws {
+    /// Call it only on bytes JSONSerialization has parsed: it does not check that a string is terminated.
+    static func checkStructure(of json: Data) throws {
         enum Container { case object(Set<[UInt8]>), array }
         let bytes = [UInt8](json)
         var stack: [Container] = []

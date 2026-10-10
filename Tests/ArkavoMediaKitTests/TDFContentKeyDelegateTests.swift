@@ -111,30 +111,37 @@ struct FairPlayErrorTests {
 
 // MARK: - FairPlayDebugConfig Tests
 
-@Suite("FairPlayDebugConfig Tests")
-struct FairPlayDebugConfigTests {
-    @Test("Debug config has correct default value")
-    func debugConfigDefault() {
-        // In DEBUG builds, should be true; in RELEASE, false
-        #if DEBUG
-            #expect(FairPlayDebugConfig.isVerboseLoggingEnabled == true)
-        #else
+/// Every suite that sets `FairPlayDebugConfig.isVerboseLoggingEnabled` or reads what it prints. The flag is one
+/// process-wide variable, so these suites run one test at a time: none can turn the log off while another reads it.
+@Suite("FairPlay verbose logging", .serialized)
+enum FairPlayVerboseLoggingTests {}
+
+extension FairPlayVerboseLoggingTests {
+    @Suite("FairPlayDebugConfig Tests")
+    struct FairPlayDebugConfigTests {
+        @Test("Debug config has correct default value")
+        func debugConfigDefault() {
+            // In DEBUG builds, should be true; in RELEASE, false
+            #if DEBUG
+                #expect(FairPlayDebugConfig.isVerboseLoggingEnabled == true)
+            #else
+                #expect(FairPlayDebugConfig.isVerboseLoggingEnabled == false)
+            #endif
+        }
+
+        @Test("Debug config can be toggled")
+        func debugConfigToggle() {
+            let original = FairPlayDebugConfig.isVerboseLoggingEnabled
+
+            FairPlayDebugConfig.isVerboseLoggingEnabled = false
             #expect(FairPlayDebugConfig.isVerboseLoggingEnabled == false)
-        #endif
-    }
 
-    @Test("Debug config can be toggled")
-    func debugConfigToggle() {
-        let original = FairPlayDebugConfig.isVerboseLoggingEnabled
+            FairPlayDebugConfig.isVerboseLoggingEnabled = true
+            #expect(FairPlayDebugConfig.isVerboseLoggingEnabled == true)
 
-        FairPlayDebugConfig.isVerboseLoggingEnabled = false
-        #expect(FairPlayDebugConfig.isVerboseLoggingEnabled == false)
-
-        FairPlayDebugConfig.isVerboseLoggingEnabled = true
-        #expect(FairPlayDebugConfig.isVerboseLoggingEnabled == true)
-
-        // Restore original value
-        FairPlayDebugConfig.isVerboseLoggingEnabled = original
+            // Restore original value
+            FairPlayDebugConfig.isVerboseLoggingEnabled = original
+        }
     }
 }
 
@@ -265,67 +272,69 @@ struct CustomManifestProtocolTests {
 
 // MARK: - FairPlayDebug Logger Tests
 
-@Suite("FairPlayDebug Logger Tests")
-struct FairPlayDebugLoggerTests {
-    @Test("Log functions don't crash when disabled")
-    func logFunctionsWhenDisabled() {
-        let originalValue = FairPlayDebugConfig.isVerboseLoggingEnabled
-        FairPlayDebugConfig.isVerboseLoggingEnabled = false
+extension FairPlayVerboseLoggingTests {
+    @Suite("FairPlayDebug Logger Tests")
+    struct FairPlayDebugLoggerTests {
+        @Test("Log functions don't crash when disabled")
+        func logFunctionsWhenDisabled() {
+            let originalValue = FairPlayDebugConfig.isVerboseLoggingEnabled
+            FairPlayDebugConfig.isVerboseLoggingEnabled = false
 
-        // These should not crash
-        FairPlayDebug.log("Test message")
-        FairPlayDebug.logData("Test data", data: Data([0x01, 0x02, 0x03]))
-        FairPlayDebug.logRequest("GET", url: URL(string: "https://example.com")!, body: nil)
-        FairPlayDebug.logResponse(200, data: Data())
+            // These should not crash
+            FairPlayDebug.log("Test message")
+            FairPlayDebug.logData("Test data", data: Data([0x01, 0x02, 0x03]))
+            FairPlayDebug.logRequest("GET", url: URL(string: "https://example.com")!, body: nil)
+            FairPlayDebug.logResponse(200, data: Data())
 
-        FairPlayDebugConfig.isVerboseLoggingEnabled = originalValue
-    }
+            FairPlayDebugConfig.isVerboseLoggingEnabled = originalValue
+        }
 
-    @Test("logData truncates long data")
-    func logDataTruncation() {
-        let originalValue = FairPlayDebugConfig.isVerboseLoggingEnabled
-        FairPlayDebugConfig.isVerboseLoggingEnabled = true
+        @Test("logData truncates long data")
+        func logDataTruncation() {
+            let originalValue = FairPlayDebugConfig.isVerboseLoggingEnabled
+            FairPlayDebugConfig.isVerboseLoggingEnabled = true
 
-        // Create data longer than maxBytes
-        let longData = Data(repeating: 0xAB, count: 100)
+            // Create data longer than maxBytes
+            let longData = Data(repeating: 0xAB, count: 100)
 
-        // Should not crash and should truncate
-        FairPlayDebug.logData("Long data", data: longData, maxBytes: 10)
+            // Should not crash and should truncate
+            FairPlayDebug.logData("Long data", data: longData, maxBytes: 10)
 
-        FairPlayDebugConfig.isVerboseLoggingEnabled = originalValue
-    }
+            FairPlayDebugConfig.isVerboseLoggingEnabled = originalValue
+        }
 
-    @Test("logRequest handles JSON body")
-    func logRequestWithJSON() {
-        let originalValue = FairPlayDebugConfig.isVerboseLoggingEnabled
-        FairPlayDebugConfig.isVerboseLoggingEnabled = true
+        @Test("logRequest handles JSON body")
+        func logRequestWithJSON() {
+            let originalValue = FairPlayDebugConfig.isVerboseLoggingEnabled
+            FairPlayDebugConfig.isVerboseLoggingEnabled = true
 
-        let body: [String: Any] = [
-            "key": "value",
-            "longValue": String(repeating: "x", count: 200),
-        ]
-        let jsonData = try? JSONSerialization.data(withJSONObject: body)
+            let body: [String: Any] = [
+                "key": "value",
+                "longValue": String(repeating: "x", count: 200),
+            ]
+            let jsonData = try? JSONSerialization.data(withJSONObject: body)
 
-        // Should not crash
-        FairPlayDebug.logRequest("POST", url: URL(string: "https://example.com")!, body: jsonData)
+            // Should not crash
+            FairPlayDebug.logRequest("POST", url: URL(string: "https://example.com")!, body: jsonData)
 
-        FairPlayDebugConfig.isVerboseLoggingEnabled = originalValue
-    }
+            FairPlayDebugConfig.isVerboseLoggingEnabled = originalValue
+        }
 
-    @Test("logResponse handles text and binary data")
-    func logResponseHandlesDataTypes() {
-        let originalValue = FairPlayDebugConfig.isVerboseLoggingEnabled
-        FairPlayDebugConfig.isVerboseLoggingEnabled = true
+        @Test("logResponse handles text and binary data")
+        func logResponseHandlesDataTypes() {
+            let originalValue = FairPlayDebugConfig.isVerboseLoggingEnabled
+            FairPlayDebugConfig.isVerboseLoggingEnabled = true
 
-        // Text response
-        let textData = "Hello, World!".data(using: .utf8)!
-        FairPlayDebug.logResponse(200, data: textData)
+            // Text response
+            let textData = "Hello, World!".data(using: .utf8)!
+            FairPlayDebug.logResponse(200, data: textData)
 
-        // Binary response (non-UTF8)
-        let binaryData = Data([0x00, 0x01, 0xFF, 0xFE])
-        FairPlayDebug.logResponse(200, data: binaryData)
+            // Binary response (non-UTF8)
+            let binaryData = Data([0x00, 0x01, 0xFF, 0xFE])
+            FairPlayDebug.logResponse(200, data: binaryData)
 
-        FairPlayDebugConfig.isVerboseLoggingEnabled = originalValue
+            FairPlayDebugConfig.isVerboseLoggingEnabled = originalValue
+        }
     }
 }
 

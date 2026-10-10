@@ -82,12 +82,16 @@ public enum FairPlayComponents {
     /// (profile v1). Throws `malformedComponents` when the member is present but is not the v2 list (a `video` entry,
     /// then optionally an `audio` entry, each exactly `id`, `kind` (equal to `id`) and `keyBinding`, standard base64 of
     /// 32 bytes), or when the manifest or its policy cannot be read: a present but malformed list is never profile v1.
+    ///
+    /// The manifest and its policy are each read only when the key service would read them the same way
+    /// (`FairPlayPolicy.checkStructure`): JSONSerialization keeps the first of a repeated key and the key service the
+    /// last, so a repeated `policy` or `arkavo:components` would otherwise give the two different component lists.
     public static func componentIDs(ofManifestJSON json: Data) throws -> [String]? {
-        guard let manifest = try? JSONSerialization.jsonObject(with: json) as? [String: Any],
+        guard let manifest = unambiguousObject(json),
               let information = manifest["encryptionInformation"] as? [String: Any],
               let policyBase64 = information["policy"] as? String,
               let policyData = Data(base64Encoded: policyBase64),
-              let policy = try? JSONSerialization.jsonObject(with: policyData) as? [String: Any]
+              let policy = unambiguousObject(policyData)
         else { throw Error.malformedComponents }
         guard let member = policy[policyKey] else { return nil }
         guard let list = member as? [Any], list.count == 1 || list.count == 2 else { throw Error.malformedComponents }
@@ -102,5 +106,16 @@ public enum FairPlayComponents {
             ids.append(expected.rawValue)
         }
         return ids
+    }
+
+    /// `json` as a JSON object, when it is BOM-less UTF-8 that has no repeated key, trailing comma or nesting deeper
+    /// than 64: nil otherwise.
+    private static func unambiguousObject(_ json: Data) -> [String: Any]? {
+        // Parsed before checkStructure, which assumes JSON that has already parsed.
+        guard FairPlayPolicy.isPlainUTF8Object(json),
+              let object = try? JSONSerialization.jsonObject(with: json) as? [String: Any],
+              (try? FairPlayPolicy.checkStructure(of: json)) != nil
+        else { return nil }
+        return object
     }
 }

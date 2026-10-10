@@ -54,6 +54,10 @@ struct FairPlayComponentsTests {
         #expect(throws: FairPlayComponents.Error.componentsPresent) {
             try FairPlayComponents.checkInsertable(Data(#"{"uuid":"\#(Self.uuid)","arkavo:components":[]}"#.utf8))
         }
+        // A null member is still a member: the packager never writes over one.
+        #expect(throws: FairPlayComponents.Error.componentsPresent) {
+            try FairPlayComponents.checkInsertable(Data(#"{"uuid":"\#(Self.uuid)","arkavo:components":null}"#.utf8))
+        }
         #expect(throws: FairPlayPolicy.Error.missingUUID) {
             try FairPlayComponents.checkInsertable(Data(#"{"body":{}}"#.utf8))
         }
@@ -77,6 +81,18 @@ struct FairPlayComponentsTests {
         #expect(throws: FairPlayComponents.Error.invalidKeySize(.audio)) {
             try FairPlayComponents.insert(
                 [Self.video, FairPlayComponentKey(component: .audio, key: Self.audioKey.prefix(15))], intoPolicyJSON: policy)
+        }
+        #expect(throws: FairPlayComponents.Error.invalidKeySize(.video)) {
+            try FairPlayComponents.insert(
+                [FairPlayComponentKey(component: .video, key: Self.videoKey.prefix(15)), Self.audio], intoPolicyJSON: policy)
+        }
+        #expect(throws: FairPlayComponents.Error.invalidKeySize(.video)) {
+            try FairPlayComponents.insert(
+                [FairPlayComponentKey(component: .video, key: Self.videoKey + Data([0x10]))], intoPolicyJSON: policy)
+        }
+        #expect(throws: FairPlayComponents.Error.invalidKeySize(.audio)) {
+            try FairPlayComponents.insert(
+                [Self.video, FairPlayComponentKey(component: .audio, key: Self.audioKey + Self.audioKey)], intoPolicyJSON: policy)
         }
         #expect(throws: FairPlayComponents.Error.sharedKey) {
             try FairPlayComponents.insert(
@@ -164,6 +180,8 @@ struct FairPlayComponentsTests {
               #"{"arkavo:components":[{"id":"video","kind":"video","keyBinding":"9n5YWFmN3MC7g9kJH_tZ98P5JMMEGIz1C-zwHbchEB4="}],"uuid":"u"}"#,
               #"{"arkavo:components":[{"id":"video","kind":"video","keyBinding":"9n5YWFmN3MC7g9kJH/tZ98P5JMMEGIz1C+zwHbchEB4"}],"uuid":"u"}"#,
               #"{"arkavo:components":[{"id":"video","kind":"video","keyBinding":"not base64!"}],"uuid":"u"}"#,
+              // Non-canonical: the last character's unused bits set, still decoding to the video binding's 32 bytes.
+              #"{"arkavo:components":[{"id":"video","kind":"video","keyBinding":"9n5YWFmN3MC7g9kJH/tZ98P5JMMEGIz1C+zwHbchEB5="}],"uuid":"u"}"#,
           ])
     func malformedLists(policy: String) {
         #expect(throws: FairPlayComponents.Error.malformedComponents) {
@@ -184,6 +202,29 @@ struct FairPlayComponentsTests {
             Self.manifestJSON(policy: "[]"),
         ]
         for json in unreadable {
+            #expect(throws: FairPlayComponents.Error.malformedComponents) {
+                try FairPlayComponents.componentIDs(ofManifestJSON: json)
+            }
+        }
+    }
+
+    /// JSONSerialization keeps the first of a repeated key and the key service the last, so a repeated member anywhere in
+    /// the manifest or its policy would let the two read different component lists.
+    @Test("A repeated member in the manifest or its policy throws, and is never read as either list")
+    func repeatedMembers() {
+        let videoOnly = Data(Self.videoOnly.utf8).base64EncodedString()
+        let after = Data(Self.after.utf8).base64EncodedString()
+        let repeated: [Data] = [
+            // The manifest's policy, twice: the first lists video alone, the second video and audio.
+            Data(#"{"encryptionInformation":{"policy":"\#(videoOnly)","policy":"\#(after)"}}"#.utf8),
+            // The policy's component list, twice.
+            Self.manifestJSON(policy: "{\"arkavo:components\":[\(Self.videoEntry)],\"arkavo:components\":[\(Self.videoEntry),\(Self.audioEntry)],\"uuid\":\"\(Self.uuid)\"}"),
+            // A component entry's id, twice.
+            Self.manifestJSON(policy: #"{"arkavo:components":[{"id":"video","id":"audio","kind":"video","keyBinding":"9n5YWFmN3MC7g9kJH/tZ98P5JMMEGIz1C+zwHbchEB4="}],"uuid":"u"}"#),
+            // Elsewhere in the manifest, outside the policy.
+            Data(#"{"encryptionInformation":{"policy":"\#(after)"},"meta":{"a":1,"a":2}}"#.utf8),
+        ]
+        for json in repeated {
             #expect(throws: FairPlayComponents.Error.malformedComponents) {
                 try FairPlayComponents.componentIDs(ofManifestJSON: json)
             }
