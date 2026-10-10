@@ -20,6 +20,11 @@ public enum CBCSDebugConfig {
 public final class CBCSEncryptor {
     // MARK: - Types
 
+    public enum Failure: Error, Equatable {
+        /// The sample's NAL unit lengths do not cover it exactly.
+        case malformedSample
+    }
+
     /// Encryption result with subsample map
     public struct EncryptionResult {
         public let encryptedData: Data
@@ -59,15 +64,22 @@ public final class CBCSEncryptor {
         self.skipBlocks = skipBlocks
     }
 
-    // MARK: - Video Encryption (H.264/H.265)
+    // MARK: - Video Encryption (H.264)
 
     /// Encrypt video sample with NAL unit awareness
+    ///
+    /// Each slice NAL unit is one subsample whose clear bytes are its length prefix, NAL header and slice header,
+    /// so protection starts on the first byte after the slice header (ISO/IEC 23001-7 `cbcs`, as CMAF requires).
+    /// Every other NAL unit is clear.
     /// - Parameters:
     ///   - sample: Raw video sample data (with length-prefixed NAL units)
     ///   - nalLengthSize: Size of NAL unit length field (typically 4)
+    ///   - sliceHeaders: Measures slice headers, from the stream's parameter sets
     /// - Returns: Encrypted data and subsample map
-    public func encryptVideoSample(_ sample: Data, nalLengthSize: Int = 4) -> EncryptionResult {
-        let nalUnits = parseNALUnits(sample, lengthSize: nalLengthSize)
+    /// - Throws: `H264SliceHeaderParser.Failure` for a slice it cannot measure, rather than protect from a guess
+    public func encryptVideoSample(_ sample: Data, nalLengthSize: Int = 4,
+                                   sliceHeaders: H264SliceHeaderParser) throws -> EncryptionResult {
+        let nalUnits = try parseNALUnits(sample, lengthSize: nalLengthSize)
 
         var encryptedData = Data()
         var subsamples: [SubsampleEntry] = []
@@ -83,7 +95,8 @@ public final class CBCSEncryptor {
 
             if nal.isSlice {
                 // Encrypt slice NAL units
-                let (encrypted, subsample) = encryptNALUnit(nalData, lengthSize: nalLengthSize)
+                let (encrypted, subsample) = try encryptNALUnit(nalData, lengthSize: nalLengthSize,
+                                                                sliceHeaders: sliceHeaders)
                 encryptedData.append(encrypted)
                 subsamples.append(subsample)
             } else {
@@ -121,25 +134,11 @@ public final class CBCSEncryptor {
         return EncryptionResult(encryptedData: encryptedData, subsamples: subsamples)
     }
 
-    /// Encrypt a single NAL unit using CBCS pattern
-    private func encryptNALUnit(_ nalData: Data, lengthSize: Int) -> (Data, SubsampleEntry) {
-        guard nalData.count > lengthSize else {
-            return (nalData, SubsampleEntry(bytesOfClearData: UInt16(nalData.count), bytesOfProtectedData: 0))
-        }
-
-        // For CBCS, keep NAL header clear. The slice header can be encrypted.
-        // Apple FairPlay reference content uses ~12 bytes clear per NAL:
-        // - Length prefix (4 bytes)
-        // - NAL unit header (1-2 bytes)
-        // - Small safety margin
-        let minimumClearBytes = 12
-
-        // NAL header is: length prefix + NAL header byte(s)
-        let nalHeaderSize = lengthSize + 1 // For H.264. H.265 uses 2 bytes
-
-        // Use the larger of nalHeaderSize or minimumClearBytes for slice NAL units
-        // If the NAL unit is smaller than minimumClearBytes, keep it all clear
-        let clearBytes = min(max(nalHeaderSize, minimumClearBytes), nalData.count)
+    /// Encrypt a single slice NAL unit using CBCS pattern, from the first byte after its slice header
+    private func encryptNALUnit(_ nalData: Data, lengthSize: Int,
+                                sliceHeaders: H264SliceHeaderParser) throws -> (Data, SubsampleEntry) {
+        // Length prefix, NAL header and slice header stay clear.
+        let clearBytes = lengthSize + (try sliceHeaders.headerSize(ofSlice: nalData.dropFirst(lengthSize)))
 
         // Keep NAL header + slice header clear
         let clearPart = nalData.prefix(clearBytes)
@@ -236,7 +235,8 @@ public final class CBCSEncryptor {
     // MARK: - NAL Parsing
 
     /// Parse NAL units from length-prefixed sample
-    private func parseNALUnits(_ data: Data, lengthSize: Int) -> [NALUnit] {
+    /// - Throws: `Failure.malformedSample` unless the NAL units cover the sample exactly, so no byte is dropped.
+    private func parseNALUnits(_ data: Data, lengthSize: Int) throws -> [NALUnit] {
         var nalUnits: [NALUnit] = []
         var offset = 0
 
@@ -268,6 +268,7 @@ public final class CBCSEncryptor {
             offset += totalLength
         }
 
+        guard offset == data.count else { throw Failure.malformedSample }
         return nalUnits
     }
 

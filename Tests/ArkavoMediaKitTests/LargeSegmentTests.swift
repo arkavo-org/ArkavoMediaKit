@@ -19,7 +19,7 @@ struct LargeSegmentTests {
 
     // MARK: - Helper Functions
 
-    /// Create a realistic video sample (H.264 NAL structure)
+    /// Create a realistic video sample (H.264 NAL structure), whose slices are `H264TestStream` slices
     func createVideoSample(isIDR: Bool, size: Int) -> Data {
         var sample = Data()
 
@@ -41,17 +41,15 @@ struct LargeSegmentTests {
             appendNALLength(testPPS.count)
             sample.append(testPPS)
 
-            // IDR slice NAL - fill remaining size
+            // IDR slice NAL (type 5) - fill remaining size
             let sliceSize = max(size - sample.count - 4, 100)
             appendNALLength(sliceSize)
-            sample.append(0x65) // NAL type 5 (IDR)
-            sample.append(Data(repeating: 0xAB, count: sliceSize - 1))
+            sample.append(H264TestStream.slice(isIDR: true, count: sliceSize, filler: 0xAB))
         } else {
-            // P-frame: just a non-IDR slice NAL
+            // P-frame: just a non-IDR slice NAL (type 1)
             let sliceSize = max(size - 4, 50)
             appendNALLength(sliceSize)
-            sample.append(0x41) // NAL type 1 (non-IDR)
-            sample.append(Data(repeating: 0xCD, count: sliceSize - 1))
+            sample.append(H264TestStream.slice(isIDR: false, count: sliceSize, filler: 0xCD))
         }
 
         return sample
@@ -60,7 +58,7 @@ struct LargeSegmentTests {
     // MARK: - Tests
 
     @Test("Large segment with 180 samples (6 seconds at 30fps)")
-    func largeSegmentWith180Samples() {
+    func largeSegmentWith180Samples() throws {
         let track = FMP4Writer.TrackConfig.h264Video(
             width: 1920, height: 1080, timescale: 90000,
             sps: [testSPS], pps: [testPPS]
@@ -68,6 +66,7 @@ struct LargeSegmentTests {
         let encryption = FMP4Writer.EncryptionConfig(keyID: testKeyID, constantIV: testIV)
         let writer = FMP4Writer(tracks: [track], encryption: encryption)
         let encryptor = CBCSEncryptor(key: testKey, iv: testIV)
+        let sliceHeaders = try H264TestStream.sliceHeaders()
 
         // Create 180 samples (6 seconds at 30fps)
         var samples: [FMP4Writer.Sample] = []
@@ -79,7 +78,8 @@ struct LargeSegmentTests {
             let size = isIDR ? 50000 : 5000 // IDR frames are larger
 
             let sampleData = createVideoSample(isIDR: isIDR, size: size)
-            let encryptedResult = encryptor.encryptVideoSample(sampleData, nalLengthSize: 4)
+            let encryptedResult = try encryptor.encryptVideoSample(sampleData, nalLengthSize: 4,
+                                                                   sliceHeaders: sliceHeaders)
 
             totalOriginalSize += sampleData.count
 
@@ -126,7 +126,7 @@ struct LargeSegmentTests {
     }
 
     @Test("Verify saio offset matches actual senc position")
-    func verifySaioOffsetMatchesSenc() {
+    func verifySaioOffsetMatchesSenc() throws {
         let track = FMP4Writer.TrackConfig.h264Video(
             width: 1920, height: 1080, timescale: 90000,
             sps: [testSPS], pps: [testPPS]
@@ -134,13 +134,14 @@ struct LargeSegmentTests {
         let encryption = FMP4Writer.EncryptionConfig(keyID: testKeyID, constantIV: testIV)
         let writer = FMP4Writer(tracks: [track], encryption: encryption)
         let encryptor = CBCSEncryptor(key: testKey, iv: testIV)
+        let sliceHeaders = try H264TestStream.sliceHeaders()
 
         // Create samples similar to real video
         var samples: [FMP4Writer.Sample] = []
         for i in 0..<10 {
             let isIDR = (i == 0)
             let sampleData = createVideoSample(isIDR: isIDR, size: isIDR ? 50000 : 5000)
-            let result = encryptor.encryptVideoSample(sampleData, nalLengthSize: 4)
+            let result = try encryptor.encryptVideoSample(sampleData, nalLengthSize: 4, sliceHeaders: sliceHeaders)
             samples.append(FMP4Writer.Sample(
                 data: result.encryptedData,
                 duration: 3000,
@@ -211,12 +212,13 @@ struct LargeSegmentTests {
     }
 
     @Test("Subsample info for large IDR frame")
-    func subsampleInfoForLargeIDRFrame() {
+    func subsampleInfoForLargeIDRFrame() throws {
         let encryptor = CBCSEncryptor(key: testKey, iv: testIV)
+        let sliceHeaders = try H264TestStream.sliceHeaders()
 
         // Create a large IDR frame (like real 1080p video)
         let sampleData = createVideoSample(isIDR: true, size: 100000)
-        let result = encryptor.encryptVideoSample(sampleData, nalLengthSize: 4)
+        let result = try encryptor.encryptVideoSample(sampleData, nalLengthSize: 4, sliceHeaders: sliceHeaders)
 
         print("\n=== Large IDR Frame Subsample Analysis ===")
         print("Original size: \(sampleData.count) bytes")
@@ -244,7 +246,7 @@ struct LargeSegmentTests {
     }
 
     @Test("saiz box sizes match actual subsample info")
-    func saizMatchesSubsampleInfo() {
+    func saizMatchesSubsampleInfo() throws {
         let track = FMP4Writer.TrackConfig.h264Video(
             width: 1920, height: 1080, timescale: 90000,
             sps: [testSPS], pps: [testPPS]
@@ -252,6 +254,7 @@ struct LargeSegmentTests {
         let encryption = FMP4Writer.EncryptionConfig(keyID: testKeyID, constantIV: testIV)
         let writer = FMP4Writer(tracks: [track], encryption: encryption)
         let encryptor = CBCSEncryptor(key: testKey, iv: testIV)
+        let sliceHeaders = try H264TestStream.sliceHeaders()
 
         // Create a few samples with different subsample counts
         var samples: [FMP4Writer.Sample] = []
@@ -259,7 +262,7 @@ struct LargeSegmentTests {
         for i in 0..<10 {
             let isIDR = (i == 0)
             let sampleData = createVideoSample(isIDR: isIDR, size: isIDR ? 50000 : 5000)
-            let result = encryptor.encryptVideoSample(sampleData, nalLengthSize: 4)
+            let result = try encryptor.encryptVideoSample(sampleData, nalLengthSize: 4, sliceHeaders: sliceHeaders)
 
             samples.append(FMP4Writer.Sample(
                 data: result.encryptedData,

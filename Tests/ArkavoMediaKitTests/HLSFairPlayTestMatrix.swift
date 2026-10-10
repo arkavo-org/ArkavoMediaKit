@@ -127,7 +127,8 @@ struct HLSFairPlayTestMatrix {
         FMP4Writer.EncryptionConfig(keyID: testKeyID, constantIV: testIV)
     }
 
-    /// Create a realistic video sample with NAL units (SPS, PPS, IDR or P-frame)
+    /// Create a realistic video sample with NAL units (SPS, PPS, IDR or P-frame), whose slices are
+    /// `H264TestStream` slices of `payloadSize` bytes
     private func createVideoSample(isIDR: Bool, payloadSize: Int = 500) -> Data {
         var sample = Data()
 
@@ -145,14 +146,12 @@ struct HLSFairPlayTestMatrix {
             // IDR NAL (type 5)
             let idrLength = UInt32(payloadSize)
             sample.append(idrLength.bigEndianData)
-            sample.append(0x65) // NAL type 5 (IDR)
-            sample.append(Data(repeating: 0xAB, count: payloadSize - 1))
+            sample.append(H264TestStream.slice(isIDR: true, count: payloadSize, filler: 0xAB))
         } else {
             // P-frame NAL (type 1)
             let pLength = UInt32(payloadSize)
             sample.append(pLength.bigEndianData)
-            sample.append(0x41) // NAL type 1 (non-IDR slice)
-            sample.append(Data(repeating: 0xCD, count: payloadSize - 1))
+            sample.append(H264TestStream.slice(isIDR: false, count: payloadSize, filler: 0xCD))
         }
 
         return sample
@@ -200,7 +199,7 @@ struct HLSFairPlayTestMatrix {
         }
 
         @Test("B2: Clear init + encrypted media (FairPlay CBCS) structure")
-        func b2ClearInitEncryptedMedia() {
+        func b2ClearInitEncryptedMedia() throws {
             let track = parent.createVideoTrack()
             let encryption = parent.createEncryption()
             let writer = FMP4Writer(tracks: [track], encryption: encryption)
@@ -221,7 +220,8 @@ struct HLSFairPlayTestMatrix {
             // Generate encrypted media segment
             let encryptor = CBCSEncryptor(key: parent.testKey, iv: parent.testIV)
             let rawSample = parent.createVideoSample(isIDR: true)
-            let encResult = encryptor.encryptVideoSample(rawSample, nalLengthSize: 4)
+            let encResult = try encryptor.encryptVideoSample(rawSample, nalLengthSize: 4,
+                                                             sliceHeaders: H264TestStream.sliceHeaders())
 
             let sample = FMP4Writer.Sample(
                 data: encResult.encryptedData,
@@ -273,7 +273,7 @@ struct HLSFairPlayTestMatrix {
         }
 
         @Test("B5: Clear to encrypted segment transition structure")
-        func b5ClearToEncryptedTransition() {
+        func b5ClearToEncryptedTransition() throws {
             let track = parent.createVideoTrack()
 
             // Create clear writer
@@ -286,7 +286,8 @@ struct HLSFairPlayTestMatrix {
             let encWriter = FMP4Writer(tracks: [track], encryption: encryption)
             let encryptor = CBCSEncryptor(key: parent.testKey, iv: parent.testIV)
             let rawSample = parent.createVideoSample(isIDR: true)
-            let encResult = encryptor.encryptVideoSample(rawSample, nalLengthSize: 4)
+            let encResult = try encryptor.encryptVideoSample(rawSample, nalLengthSize: 4,
+                                                             sliceHeaders: H264TestStream.sliceHeaders())
             let encSample = FMP4Writer.Sample(
                 data: encResult.encryptedData,
                 duration: 3000,
@@ -311,7 +312,7 @@ struct HLSFairPlayTestMatrix {
         }
 
         @Test("B6: Encrypted to clear segment transition structure")
-        func b6EncryptedToClearTransition() {
+        func b6EncryptedToClearTransition() throws {
             let track = parent.createVideoTrack()
 
             // Create encrypted segment first
@@ -319,7 +320,8 @@ struct HLSFairPlayTestMatrix {
             let encWriter = FMP4Writer(tracks: [track], encryption: encryption)
             let encryptor = CBCSEncryptor(key: parent.testKey, iv: parent.testIV)
             let rawSample = parent.createVideoSample(isIDR: true)
-            let encResult = encryptor.encryptVideoSample(rawSample, nalLengthSize: 4)
+            let encResult = try encryptor.encryptVideoSample(rawSample, nalLengthSize: 4,
+                                                             sliceHeaders: H264TestStream.sliceHeaders())
             let encSample = FMP4Writer.Sample(
                 data: encResult.encryptedData,
                 duration: 3000,
@@ -741,7 +743,7 @@ struct HLSFairPlayTestMatrix {
         }
 
         @Test("F3: Key change on IDR boundary structure")
-        func f3KeyChangeOnIDRBoundary() {
+        func f3KeyChangeOnIDRBoundary() throws {
             let track = parent.createVideoTrack()
 
             // First segment with key 1
@@ -750,7 +752,8 @@ struct HLSFairPlayTestMatrix {
             let encryptor1 = CBCSEncryptor(key: parent.testKey, iv: parent.testIV)
 
             let rawSample1 = parent.createVideoSample(isIDR: true)
-            let encResult1 = encryptor1.encryptVideoSample(rawSample1, nalLengthSize: 4)
+            let encResult1 = try encryptor1.encryptVideoSample(rawSample1, nalLengthSize: 4,
+                                                               sliceHeaders: H264TestStream.sliceHeaders())
             let sample1 = FMP4Writer.Sample(
                 data: encResult1.encryptedData,
                 duration: 3000,
@@ -765,7 +768,8 @@ struct HLSFairPlayTestMatrix {
             let encryptor2 = CBCSEncryptor(key: parent.testKey, iv: parent.testIV)
 
             let rawSample2 = parent.createVideoSample(isIDR: true)
-            let encResult2 = encryptor2.encryptVideoSample(rawSample2, nalLengthSize: 4)
+            let encResult2 = try encryptor2.encryptVideoSample(rawSample2, nalLengthSize: 4,
+                                                               sliceHeaders: H264TestStream.sliceHeaders())
             let sample2 = FMP4Writer.Sample(
                 data: encResult2.encryptedData,
                 duration: 3000,
@@ -1058,7 +1062,7 @@ struct HLSFairPlayTestMatrix {
         }
 
         @Test("P2: FairPlay fMP4 single key profile")
-        func p2FairPlaySingleKey() {
+        func p2FairPlaySingleKey() throws {
             let track = parent.createVideoTrack()
             let encryption = parent.createEncryption()
             let writer = FMP4Writer(tracks: [track], encryption: encryption)
@@ -1071,7 +1075,8 @@ struct HLSFairPlayTestMatrix {
             var segments: [Data] = []
             for i in 0..<3 {
                 let rawSample = parent.createVideoSample(isIDR: i == 0 || i == 1, payloadSize: 300)
-                let encResult = encryptor.encryptVideoSample(rawSample, nalLengthSize: 4)
+                let encResult = try encryptor.encryptVideoSample(rawSample, nalLengthSize: 4,
+                                                                 sliceHeaders: H264TestStream.sliceHeaders())
                 let sample = FMP4Writer.Sample(
                     data: encResult.encryptedData,
                     duration: 90000,
@@ -1115,7 +1120,7 @@ struct HLSFairPlayTestMatrix {
         }
 
         @Test("P3: FairPlay fMP4 rotating keys profile")
-        func p3FairPlayRotatingKeysProfile() {
+        func p3FairPlayRotatingKeysProfile() throws {
             // Complete end-to-end test combining M2 + B2 invariants
             let key1 = FMP4HLSGenerator.FairPlayConfig.fairPlay(assetID: "period-1", keyID: parent.testKeyID)
             let key2 = FMP4HLSGenerator.FairPlayConfig.fairPlay(assetID: "period-2", keyID: parent.testKeyID2)
@@ -1135,7 +1140,8 @@ struct HLSFairPlayTestMatrix {
             // Encrypt samples for segment 0 (key1)
             let encryptor1 = CBCSEncryptor(key: parent.testKey, iv: parent.testIV)
             let rawSample0 = parent.createVideoSample(isIDR: true, payloadSize: 400)
-            let encResult0 = encryptor1.encryptVideoSample(rawSample0, nalLengthSize: 4)
+            let encResult0 = try encryptor1.encryptVideoSample(rawSample0, nalLengthSize: 4,
+                                                               sliceHeaders: H264TestStream.sliceHeaders())
             let sample0 = FMP4Writer.Sample(
                 data: encResult0.encryptedData,
                 duration: 90000,
@@ -1147,7 +1153,8 @@ struct HLSFairPlayTestMatrix {
             // Encrypt samples for segment 1 (key2)
             let encryptor2 = CBCSEncryptor(key: parent.testKey, iv: parent.testIV)
             let rawSample1 = parent.createVideoSample(isIDR: true, payloadSize: 400)
-            let encResult1 = encryptor2.encryptVideoSample(rawSample1, nalLengthSize: 4)
+            let encResult1 = try encryptor2.encryptVideoSample(rawSample1, nalLengthSize: 4,
+                                                               sliceHeaders: H264TestStream.sliceHeaders())
             let sample1 = FMP4Writer.Sample(
                 data: encResult1.encryptedData,
                 duration: 90000,
@@ -1193,7 +1200,7 @@ struct HLSFairPlayTestMatrix {
         }
 
         @Test("P4: Clear preview + encrypted main content structure")
-        func p4ClearPreviewEncryptedMain() {
+        func p4ClearPreviewEncryptedMain() throws {
             let track = parent.createVideoTrack()
 
             // Clear preview segment
@@ -1212,7 +1219,8 @@ struct HLSFairPlayTestMatrix {
             var mainSegments: [Data] = []
             for i in 0..<2 {
                 let rawSample = parent.createVideoSample(isIDR: true, payloadSize: 400)
-                let encResult = encryptor.encryptVideoSample(rawSample, nalLengthSize: 4)
+                let encResult = try encryptor.encryptVideoSample(rawSample, nalLengthSize: 4,
+                                                                 sliceHeaders: H264TestStream.sliceHeaders())
                 let sample = FMP4Writer.Sample(
                     data: encResult.encryptedData,
                     duration: 90000,

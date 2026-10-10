@@ -123,6 +123,8 @@ public actor FMP4RecordingProtectionService {
         let writer = FMP4Writer(tracks: [trackConfig], encryption: encryptionConfig)
         let encryptor = CBCSEncryptor(key: contentKey, iv: constantIV)
         let nalLengthSize = h264Params.nalLengthSize
+        // Protection starts after each slice header, measured from the stream's own parameter sets.
+        let sliceHeaders = try H264SliceHeaderParser(sps: h264Params.sps, pps: h264Params.pps)
 
         // 5. Generate init segment
         print("📝 Generating init segment...")
@@ -155,7 +157,8 @@ public actor FMP4RecordingProtectionService {
             bytesRead += Int64(length)
 
             // Encrypt the sample using the actual NAL length size from the source video
-            let encryptedResult = encryptor.encryptVideoSample(sampleData, nalLengthSize: nalLengthSize)
+            let encryptedResult = try encryptor.encryptVideoSample(sampleData, nalLengthSize: nalLengthSize,
+                                                                   sliceHeaders: sliceHeaders)
 
             // CRITICAL ALIGNMENT CHECK: sum(clear + protected) must equal sample_size
             let originalSize = sampleData.count

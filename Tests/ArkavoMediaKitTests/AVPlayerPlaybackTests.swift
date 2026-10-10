@@ -18,6 +18,7 @@ struct AVPlayerPlaybackTests {
 
     // MARK: - Helper to create realistic video sample
 
+    /// SPS, PPS and an `H264TestStream` IDR slice, or one `H264TestStream` P slice.
     func createVideoSample(isIDR: Bool, size: Int) -> Data {
         var sample = Data()
 
@@ -35,13 +36,11 @@ struct AVPlayerPlaybackTests {
             sample.append(testPPS)
             let sliceSize = max(size - sample.count - 4, 100)
             appendNALLength(sliceSize)
-            sample.append(0x65)
-            sample.append(Data(repeating: 0xAB, count: sliceSize - 1))
+            sample.append(H264TestStream.slice(isIDR: true, count: sliceSize, filler: 0xAB))
         } else {
             let sliceSize = max(size - 4, 50)
             appendNALLength(sliceSize)
-            sample.append(0x41)
-            sample.append(Data(repeating: 0xCD, count: sliceSize - 1))
+            sample.append(H264TestStream.slice(isIDR: false, count: sliceSize, filler: 0xCD))
         }
 
         return sample
@@ -121,7 +120,7 @@ struct AVPlayerPlaybackTests {
     }
 
     @Test("Validate moof structure with mp4dump equivalent")
-    func validateMoofStructure() {
+    func validateMoofStructure() throws {
         let track = FMP4Writer.TrackConfig.h264Video(
             width: 1920, height: 1080, timescale: 90000,
             sps: [testSPS], pps: [testPPS]
@@ -129,13 +128,14 @@ struct AVPlayerPlaybackTests {
         let encryption = FMP4Writer.EncryptionConfig(keyID: testKeyID, constantIV: testIV)
         let writer = FMP4Writer(tracks: [track], encryption: encryption)
         let encryptor = CBCSEncryptor(key: testKey, iv: testIV)
+        let sliceHeaders = try H264TestStream.sliceHeaders()
 
         // Create samples
         var samples: [FMP4Writer.Sample] = []
         for i in 0..<10 {
             let isIDR = (i == 0)
             let sampleData = createVideoSample(isIDR: isIDR, size: isIDR ? 10000 : 2000)
-            let result = encryptor.encryptVideoSample(sampleData, nalLengthSize: 4)
+            let result = try encryptor.encryptVideoSample(sampleData, nalLengthSize: 4, sliceHeaders: sliceHeaders)
             samples.append(FMP4Writer.Sample(
                 data: result.encryptedData,
                 duration: 3000,
@@ -252,7 +252,7 @@ struct AVPlayerPlaybackTests {
     }
 
     @Test("Check trun sample entries match encrypted sample sizes")
-    func trunSampleEntriesMatchSampleSizes() {
+    func trunSampleEntriesMatchSampleSizes() throws {
         let track = FMP4Writer.TrackConfig.h264Video(
             width: 1920, height: 1080, timescale: 90000,
             sps: [testSPS], pps: [testPPS]
@@ -260,6 +260,7 @@ struct AVPlayerPlaybackTests {
         let encryption = FMP4Writer.EncryptionConfig(keyID: testKeyID, constantIV: testIV)
         let writer = FMP4Writer(tracks: [track], encryption: encryption)
         let encryptor = CBCSEncryptor(key: testKey, iv: testIV)
+        let sliceHeaders = try H264TestStream.sliceHeaders()
 
         // Create samples and track sizes
         var samples: [FMP4Writer.Sample] = []
@@ -268,7 +269,7 @@ struct AVPlayerPlaybackTests {
         for i in 0..<10 {
             let isIDR = (i == 0)
             let sampleData = createVideoSample(isIDR: isIDR, size: isIDR ? 10000 : 2000)
-            let result = encryptor.encryptVideoSample(sampleData, nalLengthSize: 4)
+            let result = try encryptor.encryptVideoSample(sampleData, nalLengthSize: 4, sliceHeaders: sliceHeaders)
             samples.append(FMP4Writer.Sample(
                 data: result.encryptedData,
                 duration: 3000,

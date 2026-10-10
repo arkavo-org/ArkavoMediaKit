@@ -14,7 +14,7 @@ struct CBCSEncryptorTests {
     // MARK: - Pattern Encryption Tests
 
     @Test("1:9 pattern encrypts first block, skips next 9")
-    func patternEncryption1_9() {
+    func patternEncryption1_9() throws {
         let encryptor = CBCSEncryptor(key: testKey, iv: testIV, cryptBlocks: 1, skipBlocks: 9)
 
         // Create 160 bytes (10 blocks of 16 bytes)
@@ -29,32 +29,22 @@ struct CBCSEncryptorTests {
         // For pattern encryption, blocks 0, 10, 20, ... are encrypted
         // Blocks 1-9, 11-19, ... are clear
 
-        // Create video sample with NAL header simulation
-        var videoSample = Data(count: 165) // 4 byte length + 1 byte NAL header + 160 bytes
-        videoSample[0] = 0x00
-        videoSample[1] = 0x00
-        videoSample[2] = 0x00
-        videoSample[3] = 0xA0 // Length = 160
-        videoSample[4] = 0x65 // NAL type 5 (IDR slice)
-        for i in 0..<160 {
-            videoSample[5 + i] = UInt8(i % 256)
-        }
+        // Create video sample: 4 byte length + a 160-byte IDR slice NAL unit (real slice header, then filler)
+        var videoSample = Data([0x00, 0x00, 0x00, 0xA0]) // Length = 160
+        videoSample.append(H264TestStream.slice(isIDR: true, count: 160))
+        let headerSize = H264TestStream.headerSize(isIDR: true)
 
-        let result = encryptor.encryptVideoSample(videoSample, nalLengthSize: 4)
+        let result = try encryptor.encryptVideoSample(videoSample, nalLengthSize: 4,
+                                                      sliceHeaders: H264TestStream.sliceHeaders())
 
         // Should have subsample info
         #expect(!result.subsamples.isEmpty)
 
-        // First subsample should have clear bytes to cover slice header
-        // Apple FairPlay reference content uses ~12 bytes clear per NAL:
-        // - Length prefix (4 bytes)
-        // - NAL unit header (1-2 bytes)
-        // - Small safety margin
+        // The length prefix, NAL header and slice header are clear; protection starts on the next byte
         if let first = result.subsamples.first {
-            #expect(first.bytesOfClearData >= 5, "Should have at least NAL header clear")
-            #expect(first.bytesOfClearData <= 164, "Should not exceed NAL size")
-            // With 12 bytes minimum clear and 164-byte NAL (4 prefix + 160 data), protected = 152 bytes
-            #expect(first.bytesOfProtectedData == 152, "Protected region should be 152 bytes")
+            #expect(Int(first.bytesOfClearData) == 4 + headerSize, "Length prefix and slice header should be clear")
+            #expect(Int(first.bytesOfProtectedData) == 160 - headerSize,
+                    "Protected region should be the slice data after the slice header")
         }
     }
 
@@ -93,7 +83,7 @@ struct CBCSEncryptorTests {
     // MARK: - NAL Unit Parsing Tests
 
     @Test("Parses length-prefixed NAL units")
-    func nalUnitParsing() {
+    func nalUnitParsing() throws {
         let encryptor = CBCSEncryptor(key: testKey, iv: testIV)
 
         // Create sample with 2 NAL units
@@ -106,10 +96,10 @@ struct CBCSEncryptorTests {
 
         // NAL 2: IDR slice (type 5) - 20 bytes
         sample.append(contentsOf: [0x00, 0x00, 0x00, 0x14]) // Length = 20
-        sample.append(0x65) // NAL type 5 (IDR)
-        sample.append(contentsOf: [UInt8](repeating: 0x22, count: 19))
+        sample.append(H264TestStream.slice(isIDR: true, count: 20, filler: 0x22))
 
-        let result = encryptor.encryptVideoSample(sample, nalLengthSize: 4)
+        let result = try encryptor.encryptVideoSample(sample, nalLengthSize: 4,
+                                                      sliceHeaders: H264TestStream.sliceHeaders())
 
         // Should have 2 subsamples (one per NAL)
         #expect(result.subsamples.count >= 1)
@@ -119,7 +109,7 @@ struct CBCSEncryptorTests {
     }
 
     @Test("Non-VCL NAL units stay clear")
-    func nonVCLNALsClear() {
+    func nonVCLNALsClear() throws {
         let encryptor = CBCSEncryptor(key: testKey, iv: testIV)
 
         // SPS NAL unit (type 7) - should not be encrypted
@@ -128,7 +118,8 @@ struct CBCSEncryptorTests {
         spsNAL.append(0x67) // NAL type 7 (SPS)
         spsNAL.append(contentsOf: [UInt8](repeating: 0x33, count: 15))
 
-        let result = encryptor.encryptVideoSample(spsNAL, nalLengthSize: 4)
+        let result = try encryptor.encryptVideoSample(spsNAL, nalLengthSize: 4,
+                                                      sliceHeaders: H264TestStream.sliceHeaders())
 
         // SPS should remain unchanged (all clear)
         #expect(result.encryptedData == spsNAL)
@@ -140,28 +131,31 @@ struct CBCSEncryptorTests {
     }
 
     @Test("Slice NAL units are encrypted")
-    func sliceNALsEncrypted() {
+    func sliceNALsEncrypted() throws {
         let encryptor = CBCSEncryptor(key: testKey, iv: testIV)
 
-        // IDR slice NAL unit (type 5) - should be encrypted
-        // Using 500 bytes to ensure we have data beyond the 12-byte clear region
+        // IDR slice NAL unit (type 5) - should be encrypted after its slice header
+        // Using 500 bytes to ensure we have data well beyond the clear slice header
         // Real video NALs are typically 1KB+ for SD and multiple KB for HD
         var idrNAL = Data()
         idrNAL.append(contentsOf: [0x00, 0x00, 0x01, 0xF0]) // Length = 496
-        idrNAL.append(0x65) // NAL type 5 (IDR)
-        idrNAL.append(contentsOf: [UInt8](repeating: 0x44, count: 495))
+        idrNAL.append(H264TestStream.slice(isIDR: true, count: 496, filler: 0x44))
+        let clearBytes = 4 + H264TestStream.headerSize(isIDR: true)
 
-        let result = encryptor.encryptVideoSample(idrNAL, nalLengthSize: 4)
+        let result = try encryptor.encryptVideoSample(idrNAL, nalLengthSize: 4,
+                                                      sliceHeaders: H264TestStream.sliceHeaders())
 
-        // Should have protected bytes (500 - 12 = 488 bytes in protected region)
-        // Apple FairPlay reference uses ~12 bytes clear per NAL
+        // Everything after the length prefix, NAL header and slice header is in the protected region
         let totalProtected = result.subsamples.reduce(0) { $0 + Int($1.bytesOfProtectedData) }
         #expect(totalProtected > 0, "Slice NAL should have protected bytes")
-        #expect(totalProtected == 488, "Expected 488 bytes in protected region")
+        #expect(totalProtected == idrNAL.count - clearBytes,
+                "Expected \(idrNAL.count - clearBytes) bytes in protected region")
 
-        // Header should be preserved (first 12 bytes are clear)
-        #expect(result.encryptedData[0...3] == idrNAL[0...3]) // Length prefix
+        // Length prefix, NAL header and slice header are preserved
+        #expect(result.encryptedData.prefix(clearBytes) == idrNAL.prefix(clearBytes))
         #expect(result.encryptedData[4] == 0x65) // NAL type
+        // The first block after the slice header is encrypted
+        #expect(result.encryptedData[clearBytes ..< clearBytes + 16] != idrNAL[clearBytes ..< clearBytes + 16])
     }
 
     // MARK: - Key Derivation Tests
@@ -209,7 +203,7 @@ struct CBCSEncryptorTests {
     // MARK: - Subsample Merging Tests
 
     @Test("Consecutive clear subsamples are merged")
-    func subsampleMerging() {
+    func subsampleMerging() throws {
         let encryptor = CBCSEncryptor(key: testKey, iv: testIV)
 
         // Multiple small non-VCL NALs that should merge
@@ -225,7 +219,8 @@ struct CBCSEncryptorTests {
         sample.append(0x68)
         sample.append(contentsOf: [UInt8](repeating: 0x22, count: 3))
 
-        let result = encryptor.encryptVideoSample(sample, nalLengthSize: 4)
+        let result = try encryptor.encryptVideoSample(sample, nalLengthSize: 4,
+                                                      sliceHeaders: H264TestStream.sliceHeaders())
 
         // Merged subsamples should have fewer entries than NAL count
         // Both NALs are non-VCL, so all clear, should merge

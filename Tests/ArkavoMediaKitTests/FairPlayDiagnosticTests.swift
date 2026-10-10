@@ -553,7 +553,7 @@ struct FairPlayDiagnosticTests {
     // MARK: - 8. CBCS Encryption Validation
 
     @Test("CBCS encryption preserves NAL structure")
-    func cbcsPreservesNALStructure() {
+    func cbcsPreservesNALStructure() throws {
         let encryptor = CBCSEncryptor(key: testKey, iv: testIV)
 
         // Create sample with multiple NAL units
@@ -569,12 +569,12 @@ struct FairPlayDiagnosticTests {
         sample.append(0x68) // NAL type 8
         sample.append(Data(repeating: 0x22, count: 7))
 
-        // IDR NAL (type 5) - should be encrypted
+        // IDR NAL (type 5) - should be encrypted after its slice header
         sample.append(contentsOf: [0x00, 0x00, 0x00, 0x40]) // Length = 64
-        sample.append(0x65) // NAL type 5
-        sample.append(Data(repeating: 0x33, count: 63))
+        sample.append(H264TestStream.slice(isIDR: true, count: 64, filler: 0x33))
 
-        let result = encryptor.encryptVideoSample(sample, nalLengthSize: 4)
+        let result = try encryptor.encryptVideoSample(sample, nalLengthSize: 4,
+                                                      sliceHeaders: H264TestStream.sliceHeaders())
 
         // Verify output size matches input
         #expect(result.encryptedData.count == sample.count, "Encrypted size should match input size")
@@ -656,7 +656,7 @@ struct FairPlayDiagnosticTests {
     // MARK: - 10. CRITICAL: Single-Sample Alignment Verification
 
     @Test("Single-sample alignment: sum(clear+protected) == sample_size")
-    func singleSampleAlignmentVerification() {
+    func singleSampleAlignmentVerification() throws {
         // This is the most decisive test for CENC correctness
         // Most homegrown packagers fail here: the senc subsample entries
         // must sum to exactly the sample size in trun
@@ -689,8 +689,7 @@ struct FairPlayDiagnosticTests {
         let idrPayloadSize = 500
         let idrLength = UInt32(idrPayloadSize)
         sample.append(idrLength.bigEndianData)
-        sample.append(0x65) // NAL type 5 (IDR)
-        sample.append(Data(repeating: 0xAB, count: idrPayloadSize - 1))
+        sample.append(H264TestStream.slice(isIDR: true, count: idrPayloadSize, filler: 0xAB))
         let idrTotal = 4 + idrPayloadSize
 
         let originalSampleSize = sample.count
@@ -703,7 +702,8 @@ struct FairPlayDiagnosticTests {
         print("  - IDR NAL: \(idrTotal) bytes (4 + \(idrPayloadSize))")
 
         // Encrypt the sample
-        let encryptResult = encryptor.encryptVideoSample(sample, nalLengthSize: 4)
+        let encryptResult = try encryptor.encryptVideoSample(sample, nalLengthSize: 4,
+                                                             sliceHeaders: H264TestStream.sliceHeaders())
         let encryptedSampleSize = encryptResult.encryptedData.count
         print("\nEncrypted sample size: \(encryptedSampleSize) bytes")
         #expect(encryptedSampleSize == originalSampleSize, "Encryption must not change sample size")
