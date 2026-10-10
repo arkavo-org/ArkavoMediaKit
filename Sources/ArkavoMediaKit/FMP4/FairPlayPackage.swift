@@ -72,12 +72,14 @@ public enum FairPlayPackage {
         let width: Int
         let height: Int
         let frameRate: Double
-        /// The AudioSpecificConfig's channel configuration; nil for a package without sound.
+        /// The audio's channel count (`channelCount(ofAudioSpecificConfig:)`: 1-6 or 8); nil for a package without sound.
         let audioChannels: Int?
     }
 
     /// The master playlist: one variant, `video.m3u8`, and with sound one audio rendition, `audio.m3u8`.
-    static func masterPlaylist(_ master: MasterPlaylist) -> String {
+    /// Nil when `audioChannels` is not a supported count (1-6 or 8): CHANNELS is never written for another number.
+    static func masterPlaylist(_ master: MasterPlaylist) -> String? {
+        if let channels = master.audioChannels, !supportedChannelCounts.contains(channels) { return nil }
         let audio = master.audioChannels.map { channels in
             [FMP4HLSGenerator.AudioRendition(groupID: "audio", name: "Audio", language: "und", channels: channels,
                                              uri: playlistName(.audio))]
@@ -117,7 +119,8 @@ public enum FairPlayPackage {
 
     /// An AudioSpecificConfig's channelConfiguration (ISO/IEC 14496-3 §1.6.2.1): after the 5-bit object type (and its
     /// 6-bit escape) and the 4-bit sampling frequency index (and its 24-bit explicit frequency). 0 means a program
-    /// config element sets the channels. Nil when the bytes end first.
+    /// config element sets the channels. Nil when the bytes end first. This is the raw index, not a count: see
+    /// `channelCount(ofAudioSpecificConfig:)`.
     static func channelConfiguration(ofAudioSpecificConfig config: Data) -> Int? {
         let bytes = [UInt8](config)
         var position = 0
@@ -135,5 +138,19 @@ public enum FairPlayPackage {
         guard let frequencyIndex = read(4) else { return nil }
         if frequencyIndex == 15, read(24) == nil { return nil }
         return read(4)
+    }
+
+    /// The channel counts a package's audio may state (ADR-0055 §4): 1-6 and 8 (7.1).
+    static let supportedChannelCounts: Set<Int> = [1, 2, 3, 4, 5, 6, 8]
+
+    /// An AudioSpecificConfig's channel count, which is what the master playlist's CHANNELS states: channelConfiguration
+    /// 1-6 are 1-6 channels and 7 is 8 (7.1). Nil for configuration 0 (a program config element sets the channels),
+    /// the reserved 8-15, and bytes that end first; the caller refuses the audio before writing any playlist.
+    static func channelCount(ofAudioSpecificConfig config: Data) -> Int? {
+        switch channelConfiguration(ofAudioSpecificConfig: config) {
+        case let configuration? where (1 ... 6).contains(configuration): configuration
+        case 7?: 8
+        default: nil
+        }
     }
 }

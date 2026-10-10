@@ -11,10 +11,10 @@ struct FairPlayPackageTests {
     static let durations = [6.0, 6.0, 4.5]
 
     @Test("The master playlist of a package with sound is the shared vector")
-    func masterWithAudio() {
-        let master = FairPlayPackage.masterPlaylist(.init(
+    func masterWithAudio() throws {
+        let master = try #require(FairPlayPackage.masterPlaylist(.init(
             bandwidth: 2_500_000, averageBandwidth: 2_000_000, videoCodec: "avc1.640028",
-            width: 1920, height: 1080, frameRate: 30, audioChannels: 2))
+            width: 1920, height: 1080, frameRate: 30, audioChannels: 2)))
         #expect(master == [
             "#EXTM3U",
             "#EXT-X-VERSION:7",
@@ -26,10 +26,10 @@ struct FairPlayPackageTests {
     }
 
     @Test("The master playlist of a package without sound has no rendition, no audio codec and no AUDIO")
-    func masterWithoutAudio() {
-        let master = FairPlayPackage.masterPlaylist(.init(
+    func masterWithoutAudio() throws {
+        let master = try #require(FairPlayPackage.masterPlaylist(.init(
             bandwidth: 2_400_000, averageBandwidth: 1_900_000, videoCodec: "avc1.640028",
-            width: 1920, height: 1080, frameRate: 30, audioChannels: nil))
+            width: 1920, height: 1080, frameRate: 30, audioChannels: nil)))
         #expect(master == [
             "#EXTM3U",
             "#EXT-X-VERSION:7",
@@ -107,7 +107,7 @@ struct FairPlayPackageTests {
         #expect(FairPlayPackage.avc1Codec(sps: Data([0x67, 0x4D])) == nil)
     }
 
-    @Test("CHANNELS is the AudioSpecificConfig's channel configuration")
+    @Test("channelConfiguration is the raw AudioSpecificConfig index")
     func channels() {
         #expect(FairPlayPackage.channelConfiguration(ofAudioSpecificConfig: Data([0x11, 0x88])) == 1)  // 48 kHz mono
         #expect(FairPlayPackage.channelConfiguration(ofAudioSpecificConfig: Data([0x11, 0x90])) == 2)  // 48 kHz stereo
@@ -116,5 +116,42 @@ struct FairPlayPackageTests {
         #expect(FairPlayPackage.channelConfiguration(ofAudioSpecificConfig: Data([0x17, 0x80, 0x5D, 0xC0, 0x10])) == 2)
         #expect(FairPlayPackage.channelConfiguration(ofAudioSpecificConfig: Data([0x11, 0x80])) == 0)  // set by a PCE
         #expect(FairPlayPackage.channelConfiguration(ofAudioSpecificConfig: Data([0x11])) == nil)
+    }
+
+    /// One ASC at 48 kHz, AAC-LC, with `configuration` as its 4-bit channelConfiguration.
+    static func asc(channelConfiguration configuration: Int) -> Data {
+        Data([0x11, UInt8(0x80 | configuration << 3)])
+    }
+
+    @Test("CHANNELS is the channel count: configurations 1-6 are 1-6 and 7 is 8 (7.1)")
+    func channelCount() {
+        for (configuration, count) in [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 8)] {
+            #expect(FairPlayPackage.channelCount(ofAudioSpecificConfig: Self.asc(channelConfiguration: configuration)) == count,
+                    "configuration \(configuration)")
+        }
+    }
+
+    @Test("A program config element (0), the reserved configurations (8-15) and a truncated config have no channel count")
+    func channelCountRefused() {
+        for configuration in [0] + Array(8 ... 15) {
+            #expect(FairPlayPackage.channelCount(ofAudioSpecificConfig: Self.asc(channelConfiguration: configuration)) == nil,
+                    "configuration \(configuration)")
+        }
+        #expect(FairPlayPackage.channelCount(ofAudioSpecificConfig: Data([0x11])) == nil)
+    }
+
+    @Test("The master playlist states the count 8 for 7.1 and is never written for a count outside 1-6 and 8")
+    func masterChannels() throws {
+        func master(_ channels: Int) -> String? {
+            FairPlayPackage.masterPlaylist(.init(
+                bandwidth: 2_500_000, averageBandwidth: 2_000_000, videoCodec: "avc1.640028",
+                width: 1920, height: 1080, frameRate: 30, audioChannels: channels))
+        }
+        for channels in [1, 2, 3, 4, 5, 6, 8] {
+            #expect(try #require(master(channels)).contains(#"CHANNELS="\#(channels)","#))
+        }
+        for channels in [-1, 0, 7, 9, 15] {
+            #expect(master(channels) == nil, "count \(channels)")
+        }
     }
 }
