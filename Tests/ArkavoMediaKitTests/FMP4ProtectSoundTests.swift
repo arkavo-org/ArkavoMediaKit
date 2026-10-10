@@ -186,25 +186,65 @@ struct FMP4ProtectSoundTests {
         return try await track.load(.naturalTimeScale)
     }
 
-    @Test("A recording with two audio tracks is refused until they are mixed")
+    /// The package's audio, decrypted and decoded to mono PCM at 48 kHz.
+    private func decodedAudio(_ protected: Protected) throws -> (track: FMP4PackageReader.Track, pcm: [Float]) {
+        let reader = try FMP4PackageReader(initSegment: try #require(protected.files["init.mp4"]),
+                                           segments: try segments(protected.files), key: protected.key)
+        let audio = try #require(reader.tracks[2])
+        let pcm = try AACDecoder.decode(try #require(reader.samples[2]),
+                                        magicCookie: try #require(audio.esDescriptor), sampleRate: 48_000,
+                                        channels: UInt32(try #require(audio.channelCount)))
+        return (audio, pcm)
+    }
+
+    /// Strong at each of `tones`, and not at an unrelated frequency.
+    private func expectTones(_ tones: [Double], in pcm: [Float]) {
+        #expect(pcm.count > 48_000)
+        // A pure tone of amplitude 8,000/32,768 has power about 0.015; mixing keeps each tone's share.
+        for tone in tones {
+            #expect(AACDecoder.power(of: tone, in: pcm, sampleRate: 48_000) > 0.003, "\(tone) Hz")
+        }
+        #expect(AACDecoder.power(of: 1_234, in: pcm, sampleRate: 48_000) < 0.000_3)
+    }
+
+    @Test("The packaged AAC track decodes to the source's tone")
+    func aacTone() async throws {
+        let dir = try directory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let protected = try await protect(.aac(tracks: 1), frames: 90, in: dir)
+
+        let (_, pcm) = try decodedAudio(protected)
+
+        expectTones([440], in: pcm)
+        #expect(AACDecoder.power(of: 660, in: pcm, sampleRate: 48_000) < 0.000_3)
+    }
+
+    @Test("A recording with two audio tracks is protected with them mixed into one AAC-LC track")
     func twoAudioTracks() async throws {
         let dir = try directory()
         defer { try? FileManager.default.removeItem(at: dir) }
-        await #expect {
-            try await protect(.aac(tracks: 2), frames: 30, in: dir)
-        } throws: { error in
-            if case .unsupportedAudio = error as? FMP4ProtectionError { true } else { false }
-        }
+        let protected = try await protect(.aac(tracks: 2), frames: 90, in: dir)
+
+        let (audio, pcm) = try decodedAudio(protected)
+
+        #expect(audio.sampleEntry == "enca" && audio.audioObjectType == 2)
+        expectTones([440, 660], in: pcm)
+        // The mix keeps the source's timeline: it starts with the video and ends with it.
+        let span = try audioSpan(try FMP4PackageReader(initSegment: try #require(protected.files["init.mp4"]),
+                                                       segments: try segments(protected.files), key: protected.key))
+        #expect(span.start < 3 * 1_024 / 48_000)
+        #expect(abs(span.end - 3) <= 2 * 1_024 / 48_000)
     }
 
-    @Test("A recording whose audio is not AAC-LC is refused")
+    @Test("A recording whose audio is not AAC is protected with it encoded as AAC-LC")
     func pcmAudio() async throws {
         let dir = try directory()
         defer { try? FileManager.default.removeItem(at: dir) }
-        await #expect {
-            try await protect(.pcm, frames: 30, in: dir)
-        } throws: { error in
-            if case .unsupportedAudio = error as? FMP4ProtectionError { true } else { false }
-        }
+        let protected = try await protect(.pcm, frames: 90, in: dir)
+
+        let (audio, pcm) = try decodedAudio(protected)
+
+        #expect(audio.sampleEntry == "enca" && audio.audioObjectType == 2)
+        expectTones([440], in: pcm)
     }
 }

@@ -27,6 +27,10 @@ struct FMP4PackageReader {
         let constantIV: Data
         /// The `esds` AudioSpecificConfig's audio object type, for an audio track.
         let audioObjectType: Int?
+        /// The `esds` ES_Descriptor (its payload after version and flags): an AAC decoder's magic cookie.
+        let esDescriptor: Data?
+        /// The audio sample entry's channel count.
+        let channelCount: Int?
     }
 
     struct Fragment {
@@ -82,7 +86,11 @@ struct FMP4PackageReader {
         let start = tenc.payload.lowerBound
         let ivSize = Int(bytes[start + 24])
         var objectType: Int?
+        var esDescriptor: Data?
+        var channelCount: Int?
+        if handler == "soun" { channelCount = Int(be16(bytes, entry.payload.lowerBound + 16)) }
         if let esds = children.first(where: { $0.type == "esds" }) {
+            esDescriptor = Data(bytes[esds.payload.lowerBound + 4 ..< esds.end])
             // The DecoderSpecificInfo (tag 5) is the AudioSpecificConfig, whose first 5 bits are the object type.
             let body = Array(bytes[esds.payload])
             if let tag = body.firstIndex(of: 0x05), tag + 2 < body.count { objectType = Int(body[tag + 2] >> 3) }
@@ -90,7 +98,8 @@ struct FMP4PackageReader {
         return Track(trackID: trackID, handler: handler, sampleEntry: entry.type,
                      originalFormat: fourCC(bytes, frma.payload.lowerBound), tencVersion: bytes[start],
                      cryptBlocks: Int(bytes[start + 5] >> 4), skipBlocks: Int(bytes[start + 5] & 0x0F),
-                     constantIV: Data(bytes[start + 25 ..< start + 25 + ivSize]), audioObjectType: objectType)
+                     constantIV: Data(bytes[start + 25 ..< start + 25 + ivSize]), audioObjectType: objectType,
+                     esDescriptor: esDescriptor, channelCount: channelCount)
     }
 
     // MARK: - Media segments

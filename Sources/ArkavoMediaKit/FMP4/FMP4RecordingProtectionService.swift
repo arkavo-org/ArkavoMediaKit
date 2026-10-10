@@ -106,7 +106,7 @@ public actor FMP4RecordingProtectionService {
         }
 
         // Profile v1 carries the sound, as one AAC-LC track, whenever the source has sound.
-        let audioSource = try await Self.audioSource(of: asset)
+        let audioSource = try await Self.audioSource(of: asset, mixingIn: tempDir)
 
         // 4. Create FMP4 writer with encryption config
         print("📦 Creating fMP4 writer with CBCS encryption...")
@@ -248,7 +248,7 @@ public actor FMP4RecordingProtectionService {
         let videoEnd = Double(samples.reduce(UInt64(0)) { $0 + UInt64($1.duration) }) / Double(timescale)
         let videoOffset = Self.presentationOffset(of: trackSegments) - (firstDecodeTime?.seconds ?? 0)
         let audio = try audioSource.map {
-            Self.trim(try Self.readAudio($0, of: asset, encryptor: encryptor, timeOffset: -videoOffset),
+            Self.trim(try Self.readAudio($0, encryptor: encryptor, timeOffset: -videoOffset),
                       sampleRate: $0.sampleRate, to: videoEnd)
         } ?? []
         let audioSamples = audio.map(\.sample)
@@ -343,6 +343,8 @@ public actor FMP4RecordingProtectionService {
 
     /// The source's sound: its one AAC-LC track, packaged as track 2 at its sample rate.
     struct AudioSource {
+        /// The asset the track is read from: the source, or the mix of its audio.
+        let asset: AVURLAsset
         let track: AVAssetTrack
         let config: FMP4Writer.TrackConfig
         let sampleRate: UInt32
@@ -366,31 +368,95 @@ public actor FMP4RecordingProtectionService {
             .map { ($0.sample, max($0.time, 0)) }
     }
 
-    /// The source's audio track, or nil when it has none.
-    /// - Throws: `FMP4ProtectionError.unsupportedAudio` for more than one audio track (they would need mixing) or for
-    ///   audio other than AAC-LC, which profile v1 does not carry: refused rather than dropped.
-    static func audioSource(of asset: AVURLAsset) async throws -> AudioSource? {
+    /// The source's sound as one AAC-LC track, or nil when it has none.
+    ///
+    /// One AAC-LC track is packaged as it is. Anything else (several tracks, as a recorder writes one per source, or
+    /// audio in another format) is mixed and encoded once, as AAC-LC, into `directory`, and that track is packaged:
+    /// profile v1 carries one AAC-LC track, and sound is never dropped.
+    static func audioSource(of asset: AVURLAsset, mixingIn directory: URL) async throws -> AudioSource? {
         let tracks = try await asset.loadTracks(withMediaType: .audio)
-        guard let track = tracks.first else { return nil }
-        guard tracks.count == 1 else {
-            throw FMP4ProtectionError.unsupportedAudio("\(tracks.count) audio tracks; profile v1 carries one")
+        guard !tracks.isEmpty else { return nil }
+        if tracks.count == 1, let source = try await passThrough(tracks[0], of: asset) { return source }
+        let mixed = AVURLAsset(url: try await mix(tracks, of: asset,
+                                                  into: directory.appendingPathComponent("audio.m4a")))
+        guard let track = try await mixed.loadTracks(withMediaType: .audio).first,
+              let source = try await passThrough(track, of: mixed) else {
+            throw FMP4ProtectionError.unsupportedAudio("mixing the audio did not produce AAC-LC")
         }
+        return source
+    }
+
+    /// `track` packaged as it is, when it is AAC-LC; otherwise nil.
+    private static func passThrough(_ track: AVAssetTrack, of asset: AVURLAsset) async throws -> AudioSource? {
         let descriptions = try await track.load(.formatDescriptions)
         guard descriptions.count == 1, let format = descriptions.first,
               CMFormatDescriptionGetMediaSubType(format) == kAudioFormatMPEG4AAC,
               let description = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
               description.mSampleRate > 0, description.mChannelsPerFrame > 0,
               let config = audioSpecificConfig(of: format), config.count >= 2, config[config.startIndex] >> 3 == 2
-        else {
-            throw FMP4ProtectionError.unsupportedAudio("the audio is not AAC-LC")
-        }
+        else { return nil }
         let sampleRate = UInt32(description.mSampleRate)
         return AudioSource(
+            asset: asset,
             track: track,
             config: .aacAudio(trackID: 2, channelCount: UInt16(description.mChannelsPerFrame),
                               sampleRate: sampleRate, audioSpecificConfig: config),
             sampleRate: sampleRate,
             presentationOffset: presentationOffset(of: try await track.load(.segments)))
+    }
+
+    /// `tracks` mixed (each through its own edits, on the asset's timeline from 0) and encoded as AAC-LC at 48 kHz,
+    /// stereo when any of them is, into an M4A at `url`.
+    static func mix(_ tracks: [AVAssetTrack], of asset: AVURLAsset, into url: URL) async throws -> URL {
+        var channels = 1
+        for track in tracks {
+            for format in try await track.load(.formatDescriptions)
+            where (CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee.mChannelsPerFrame ?? 1) > 1 {
+                channels = 2
+            }
+        }
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderAudioMixOutput(audioTracks: tracks, audioSettings: [
+            AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: channels,
+            AVLinearPCMBitDepthKey: 32, AVLinearPCMIsFloatKey: true, AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+        ])
+        reader.add(output)
+        let writer = try AVAssetWriter(outputURL: url, fileType: .m4a)
+        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+            AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: channels,
+            AVEncoderBitRateKey: channels == 1 ? 96_000 : 160_000,
+        ])
+        input.expectsMediaDataInRealTime = false
+        guard writer.canAdd(input) else { throw FMP4ProtectionError.encodingFailed("the audio mix cannot be written") }
+        writer.add(input)
+        guard reader.startReading() else {
+            throw FMP4ProtectionError.readFailed(reader.error?.localizedDescription ?? "audio mix did not start")
+        }
+        guard writer.startWriting() else {
+            throw FMP4ProtectionError.encodingFailed(writer.error?.localizedDescription ?? "audio mix writer")
+        }
+        writer.startSession(atSourceTime: .zero)
+        while let buffer = output.copyNextSampleBuffer() {
+            while !input.isReadyForMoreMediaData {
+                guard writer.status == .writing else {
+                    throw FMP4ProtectionError.encodingFailed(writer.error?.localizedDescription ?? "audio mix writer")
+                }
+                try await Task.sleep(nanoseconds: 1_000_000)
+            }
+            guard input.append(buffer) else {
+                throw FMP4ProtectionError.encodingFailed(writer.error?.localizedDescription ?? "audio mix append")
+            }
+        }
+        guard reader.status == .completed else {
+            throw FMP4ProtectionError.readFailed(reader.error?.localizedDescription ?? "audio mix did not finish")
+        }
+        input.markAsFinished()
+        await writer.finishWriting()
+        guard writer.status == .completed else {
+            throw FMP4ProtectionError.encodingFailed(writer.error?.localizedDescription ?? "audio mix did not finish")
+        }
+        return url
     }
 
     /// The AudioSpecificConfig of an AAC format description: its magic cookie, which is an MPEG-4 ES_Descriptor (the
@@ -447,9 +513,9 @@ public actor FMP4RecordingProtectionService {
     /// Every AAC packet of the audio track, each encrypted whole-block full-sample, with its duration at the sample
     /// rate and its presentation time plus `timeOffset`, in seconds. A sample buffer of compressed audio holds several
     /// packets; each is its own sample.
-    static func readAudio(_ source: AudioSource, of asset: AVURLAsset, encryptor: CBCSEncryptor,
+    static func readAudio(_ source: AudioSource, encryptor: CBCSEncryptor,
                           timeOffset: Double) throws -> [(sample: FMP4Writer.Sample, time: Double)] {
-        let reader = try AVAssetReader(asset: asset)
+        let reader = try AVAssetReader(asset: source.asset)
         let output = AVAssetReaderTrackOutput(track: source.track, outputSettings: nil)
         reader.add(output)
         guard reader.startReading() else {
@@ -863,7 +929,7 @@ public enum FMP4ProtectionError: Error, LocalizedError {
     case packagingFailed(String)
     case manifestParsingFailed
     case readFailed(String)
-    /// Sound that profile v1 does not carry: refused rather than dropped.
+    /// Sound that could not be made into profile v1's AAC-LC track: refused rather than dropped.
     case unsupportedAudio(String)
 
     public var errorDescription: String? {
