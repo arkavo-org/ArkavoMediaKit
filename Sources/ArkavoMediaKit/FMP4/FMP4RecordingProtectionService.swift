@@ -246,9 +246,10 @@ public actor FMP4RecordingProtectionService {
         // 6b. Read and encrypt the audio packets, whole-block full-sample, placed on the video's timeline: the
         // package's time 0 is the first video sample's decode time, and both tracks' edits map media to presentation.
         let videoEnd = Double(samples.reduce(UInt64(0)) { $0 + UInt64($1.duration) }) / Double(timescale)
-        let videoOffset = Self.presentationOffset(of: trackSegments) - (firstDecodeTime?.seconds ?? 0)
+        let audioOffset = Self.audioTimeOffset(videoPresentationOffset: Self.presentationOffset(of: trackSegments),
+                                               firstVideoDecodeTime: firstDecodeTime?.seconds ?? 0)
         let audio = try audioSource.map {
-            Self.trim(try Self.readAudio($0, encryptor: encryptor, timeOffset: -videoOffset),
+            Self.trim(try Self.readAudio($0, encryptor: encryptor, timeOffset: audioOffset),
                       sampleRate: $0.sampleRate, to: videoEnd)
         } ?? []
         let audioSamples = audio.map(\.sample)
@@ -350,6 +351,13 @@ public actor FMP4RecordingProtectionService {
         let sampleRate: UInt32
         /// Seconds from a packet's media time to its presentation time: the track's first edit.
         let presentationOffset: Double
+    }
+
+    /// Seconds to add to an audio packet's presentation time to place it on the package's timeline, which starts at
+    /// the first video sample's decode time: a video sample of media presentation time p is presented at p plus the
+    /// video's edit offset, and in the package at p less that decode time.
+    static func audioTimeOffset(videoPresentationOffset: Double, firstVideoDecodeTime: Double) -> Double {
+        -(videoPresentationOffset + firstVideoDecodeTime)
     }
 
     /// Seconds from media time to presentation time in a track's first edit that shows media (an empty edit before

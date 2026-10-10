@@ -248,3 +248,27 @@ struct FMP4ProtectSoundTests {
         expectTones([440], in: pcm)
     }
 }
+
+/// Where audio lands on the package's timeline, which starts at the first video sample's decode time.
+@Suite("fMP4 audio timeline")
+struct FMP4AudioTimelineTests {
+    /// The video's edit offset and first decode time: none; a reordering delay; a stream that also decodes from before
+    /// 0, as B-frame streams do; a leading empty edit; and both at once.
+    static let videoTimings: [(Double, Double)] = [
+        (0, 0), (-2.0 / 30, 0), (-2.0 / 30, -2.0 / 30), (0.5, 1.0 / 30), (-0.1, 0.25),
+    ]
+
+    @Test("An audio packet lands where the video frame shown at the same moment lands", arguments: videoTimings)
+    func sameMoment(videoPresentationOffset: Double, firstVideoDecodeTime: Double) {
+        // A video frame of media presentation time p is presented at p + the edit's offset, and in the package at
+        // p - the first decode time (tfdt counts from it, and its composition offset is p - its decode time).
+        let p = 0.4
+        let presented = p + videoPresentationOffset
+        let inPackage = p - firstVideoDecodeTime
+
+        let offset = FMP4RecordingProtectionService.audioTimeOffset(
+            videoPresentationOffset: videoPresentationOffset, firstVideoDecodeTime: firstVideoDecodeTime)
+
+        #expect(abs(presented + offset - inPackage) < 1e-9)
+    }
+}
