@@ -358,3 +358,11 @@ extension CBCSEncryptor {
         return iv
     }
 }
+
+extension CBCSEncryptor.Failure: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .malformedSample: "A video sample's NAL unit lengths do not match its size."
+        }
+    }
+}

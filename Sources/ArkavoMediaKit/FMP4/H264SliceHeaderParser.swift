@@ -300,3 +300,13 @@ struct RBSPReader {
         return code % 2 == 1 ? (code + 1) / 2 : -(code / 2)
     }
 }
+
+extension H264SliceHeaderParser.Failure: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .malformed: "An H.264 slice header in the video could not be read."
+        case .unknownParameterSet: "An H.264 slice in the video names a parameter set the video does not carry."
+        case let .unsupported(feature): "The video uses H.264 \(feature), which FairPlay protection does not support."
+        }
+    }
+}
