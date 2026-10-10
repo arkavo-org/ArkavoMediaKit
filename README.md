@@ -254,10 +254,10 @@ player.play()
   - CHANNELS in the master playlist is the channel count (configuration 7 is 8 channels).
 - **BANDWIDTH** is the video's peak segment bit rate plus the audio's; AVERAGE-BANDWIDTH is the sum of their averages.
 - **Refused** (`FMP4ProtectionError.packagingFailed`), never written as a package the viewer refuses or cannot decode:
-  - a policy that already has `arkavo:components`;
   - more than 4,093 segments per component (about six hours 49 minutes at six-second segments);
   - an archive over 4,294,967,295 bytes, the most a ZIP without ZIP64 holds (about 71 minutes at 8 Mbit/s);
   - NAL unit lengths other than 4 bytes, and a video sample of more than 42 NAL units.
+- **Refused before any work** (`FairPlayComponents.Error.componentsPresent`): a policy that already has `arkavo:components`. The packager writes that list itself, from the keys it makes.
 
 `TDFContentKeyDelegate` answers every component's key (`keyIdentifiers`):
 - each with its own session;
