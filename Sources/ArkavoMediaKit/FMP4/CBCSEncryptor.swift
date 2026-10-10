@@ -211,19 +211,14 @@ public final class CBCSEncryptor {
 
     // MARK: - Audio Encryption
 
-    /// Encrypt audio sample (full encryption, no pattern)
+    /// Encrypt audio sample (whole-block full-sample encryption, no pattern)
+    ///
+    /// ISO/IEC 23001-7 `cbcs` protects tracks other than video this way, so the sample has no subsamples: a player
+    /// decrypts every complete block of it as one chain.
     /// - Parameter sample: Raw audio sample data
-    /// - Returns: Encrypted data and subsample map
+    /// - Returns: Encrypted data, and no subsamples
     public func encryptAudioSample(_ sample: Data) -> EncryptionResult {
-        // Audio uses full encryption (all blocks encrypted)
-        let encrypted = encryptFullSample(sample)
-
-        let subsample = SubsampleEntry(
-            bytesOfClearData: 0,
-            bytesOfProtectedData: UInt32(encrypted.count)
-        )
-
-        return EncryptionResult(encryptedData: encrypted, subsamples: [subsample])
+        EncryptionResult(encryptedData: encryptFullSample(sample), subsamples: [])
     }
 
     /// Encrypt entire sample with AES-128-CBC (for audio): every complete block, one chain from the constant IV.

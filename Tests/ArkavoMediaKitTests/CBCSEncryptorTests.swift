@@ -62,10 +62,8 @@ struct CBCSEncryptorTests {
         // Result should be different (encrypted)
         #expect(result.encryptedData != input)
 
-        // Should have single subsample with all protected
-        #expect(result.subsamples.count == 1)
-        #expect(result.subsamples[0].bytesOfClearData == 0)
-        #expect(result.subsamples[0].bytesOfProtectedData == 48)
+        // Whole-block full-sample encryption: no subsamples, the whole sample is protected
+        #expect(result.subsamples.isEmpty)
     }
 
     @Test("Partial blocks remain clear")

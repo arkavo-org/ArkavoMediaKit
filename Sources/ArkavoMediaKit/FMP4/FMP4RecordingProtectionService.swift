@@ -105,6 +105,9 @@ public actor FMP4RecordingProtectionService {
             throw FMP4ProtectionError.noParameterSets
         }
 
+        // Profile v1 carries the sound, as one AAC-LC track, whenever the source has sound.
+        let audioSource = try await Self.audioSource(of: asset)
+
         // 4. Create FMP4 writer with encryption config
         print("📦 Creating fMP4 writer with CBCS encryption...")
         let trackConfig = FMP4Writer.TrackConfig.h264Video(
@@ -120,7 +123,8 @@ public actor FMP4RecordingProtectionService {
             constantIV: constantIV
         )
 
-        let writer = FMP4Writer(tracks: [trackConfig], encryption: encryptionConfig)
+        let writer = FMP4Writer(tracks: [trackConfig] + (audioSource.map { [$0.config] } ?? []),
+                                encryption: encryptionConfig)
         let encryptor = CBCSEncryptor(key: contentKey, iv: constantIV)
         let nalLengthSize = h264Params.nalLengthSize
         // Protection starts after each slice header, measured from the stream's own parameter sets.
@@ -237,23 +241,38 @@ public actor FMP4RecordingProtectionService {
                 "read \(bytesRead) of \(totalSampleBytes) sample bytes, to \(readEnd.seconds) s of \(mediaEnd.seconds) s")
         }
 
+        // 6b. Read and encrypt the audio packets, whole-block full-sample
+        let audioSamples = try audioSource.map { try Self.readAudio($0, of: asset, encryptor: encryptor) } ?? []
+
         // 7. Generate media segments (about 6 seconds each)
         print("📼 Generating media segments...")
         let ranges = Self.segmentRanges(
             for: samples.map { SegmentSample(duration: $0.duration, isSync: $0.isSync) },
             targetDuration: UInt64(timescale) * 6  // not Int32 6 * timescale: overflows past 357,913,941
         )
+        // Each segment takes the audio packets that start within its video's time; the last takes the rest.
+        let segmentStarts = ranges.map { range in
+            Double(samples[..<range.lowerBound].reduce(UInt64(0)) { $0 + UInt64($1.duration) }) / Double(timescale)
+        }
+        let audioRanges = Self.audioRanges(startTimes: Self.startTimes(of: audioSamples,
+                                                                       timescale: audioSource?.sampleRate ?? 1),
+                                           segmentStarts: segmentStarts)
         var segments: [FMP4HLSGenerator.Segment] = []
         var baseDecodeTime: UInt64 = 0
+        var audioDecodeTime: UInt64 = 0
 
         for (segmentIndex, range) in ranges.enumerated() {
             let segmentSamples = Array(samples[range])
             let segmentDuration = segmentSamples.reduce(UInt64(0)) { $0 + UInt64($1.duration) }
-            let segmentData = writer.generateMediaSegment(
-                trackID: 1,
-                samples: segmentSamples,
-                baseDecodeTime: baseDecodeTime
-            )
+            var fragments = [FMP4Writer.TrackFragment(trackID: 1, samples: segmentSamples,
+                                                      baseDecodeTime: baseDecodeTime)]
+            if let audioSource, !audioRanges[segmentIndex].isEmpty {
+                let segmentAudio = Array(audioSamples[audioRanges[segmentIndex]])
+                fragments.append(FMP4Writer.TrackFragment(trackID: audioSource.config.trackID, samples: segmentAudio,
+                                                          baseDecodeTime: audioDecodeTime))
+                audioDecodeTime += segmentAudio.reduce(UInt64(0)) { $0 + UInt64($1.duration) }
+            }
+            let segmentData = writer.generateMediaSegment(fragments: fragments)
 
             let segmentFilename = "segment\(segmentIndex).m4s"
             let segmentURL = tempDir.appendingPathComponent(segmentFilename)
@@ -308,6 +327,172 @@ public actor FMP4RecordingProtectionService {
 
         print("✅ fMP4 FairPlay protection complete: \(archive.count) bytes")
         return archive
+    }
+
+    // MARK: - Audio
+
+    /// The source's sound: its one AAC-LC track, packaged as track 2 at its sample rate.
+    struct AudioSource {
+        let track: AVAssetTrack
+        let config: FMP4Writer.TrackConfig
+        let sampleRate: UInt32
+    }
+
+    /// The source's audio track, or nil when it has none.
+    /// - Throws: `FMP4ProtectionError.unsupportedAudio` for more than one audio track (they would need mixing) or for
+    ///   audio other than AAC-LC, which profile v1 does not carry: refused rather than dropped.
+    static func audioSource(of asset: AVURLAsset) async throws -> AudioSource? {
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        guard let track = tracks.first else { return nil }
+        guard tracks.count == 1 else {
+            throw FMP4ProtectionError.unsupportedAudio("\(tracks.count) audio tracks; profile v1 carries one")
+        }
+        let descriptions = try await track.load(.formatDescriptions)
+        guard descriptions.count == 1, let format = descriptions.first,
+              CMFormatDescriptionGetMediaSubType(format) == kAudioFormatMPEG4AAC,
+              let description = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
+              description.mSampleRate > 0, description.mChannelsPerFrame > 0,
+              let config = audioSpecificConfig(of: format), config.count >= 2, config[config.startIndex] >> 3 == 2
+        else {
+            throw FMP4ProtectionError.unsupportedAudio("the audio is not AAC-LC")
+        }
+        let sampleRate = UInt32(description.mSampleRate)
+        return AudioSource(
+            track: track,
+            config: .aacAudio(trackID: 2, channelCount: UInt16(description.mChannelsPerFrame),
+                              sampleRate: sampleRate, audioSpecificConfig: config),
+            sampleRate: sampleRate)
+    }
+
+    /// The AudioSpecificConfig of an AAC format description: its magic cookie, which is an MPEG-4 ES_Descriptor (the
+    /// body of an `esds`, perhaps with the full box's version and flags first) or the bare AudioSpecificConfig.
+    static func audioSpecificConfig(of format: CMAudioFormatDescription) -> Data? {
+        var size = 0
+        guard let cookie = CMAudioFormatDescriptionGetMagicCookie(format, sizeOut: &size), size > 0 else { return nil }
+        var bytes = [UInt8](UnsafeRawBufferPointer(start: cookie, count: size))
+        if bytes.count > 4, bytes[0 ..< 4] == [0, 0, 0, 0], bytes[4] == 0x03 { bytes.removeFirst(4) }
+        guard bytes.first == 0x03 else { return Data(bytes) }
+        // ES_Descriptor: ES_ID, flags and their optional fields, then the DecoderConfigDescriptor (tag 4), whose
+        // 13 fixed bytes precede the DecoderSpecificInfo (tag 5).
+        guard let stream = descriptor(bytes, at: 0), stream.tag == 0x03, stream.body.count >= 3 else { return nil }
+        let flags = bytes[stream.body.lowerBound + 2]
+        var cursor = stream.body.lowerBound + 3 + (flags & 0x80 != 0 ? 2 : 0) + (flags & 0x20 != 0 ? 2 : 0)
+        if flags & 0x40 != 0 {
+            guard cursor < stream.body.upperBound else { return nil }
+            cursor += 1 + Int(bytes[cursor])
+        }
+        while cursor < stream.body.upperBound {
+            guard let next = descriptor(bytes, at: cursor), next.body.upperBound <= stream.body.upperBound else {
+                return nil
+            }
+            if next.tag == 0x04, next.body.count > 13 {
+                var inner = next.body.lowerBound + 13
+                while inner < next.body.upperBound {
+                    guard let info = descriptor(bytes, at: inner), info.body.upperBound <= next.body.upperBound else {
+                        return nil
+                    }
+                    if info.tag == 0x05 { return Data(bytes[info.body]) }
+                    inner = info.body.upperBound
+                }
+            }
+            cursor = next.body.upperBound
+        }
+        return nil
+    }
+
+    /// An MPEG-4 descriptor at `offset`: its tag and its body, whose length is the expandable size (ISO/IEC 14496-1).
+    private static func descriptor(_ bytes: [UInt8], at offset: Int) -> (tag: UInt8, body: Range<Int>)? {
+        guard offset < bytes.count else { return nil }
+        var length = 0, cursor = offset + 1
+        for _ in 0 ..< 4 {
+            guard cursor < bytes.count else { return nil }
+            let byte = bytes[cursor]
+            cursor += 1
+            length = length << 7 | Int(byte & 0x7F)
+            if byte & 0x80 == 0 { break }
+        }
+        guard cursor + length <= bytes.count else { return nil }
+        return (bytes[offset], cursor ..< cursor + length)
+    }
+
+    /// Every AAC packet of the audio track, each encrypted whole-block full-sample, with its duration at the sample
+    /// rate. A sample buffer of compressed audio holds several packets; each is its own sample.
+    static func readAudio(_ source: AudioSource, of asset: AVURLAsset,
+                          encryptor: CBCSEncryptor) throws -> [FMP4Writer.Sample] {
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: source.track, outputSettings: nil)
+        reader.add(output)
+        guard reader.startReading() else {
+            throw FMP4ProtectionError.readFailed(reader.error?.localizedDescription ?? "audio reader did not start")
+        }
+        var samples: [FMP4Writer.Sample] = []
+        while let buffer = output.copyNextSampleBuffer() {
+            let count = CMSampleBufferGetNumSamples(buffer)
+            guard count > 0, let block = CMSampleBufferGetDataBuffer(buffer) else { continue }
+            var bytes = [UInt8](repeating: 0, count: CMBlockBufferGetDataLength(block))
+            guard CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: bytes.count,
+                                             destination: &bytes) == noErr else {
+                throw FMP4ProtectionError.readFailed("audio sample data")
+            }
+            // One size or one timing entry stands for every packet of the buffer.
+            var sizes = [Int](repeating: 0, count: count), sizeEntries = 0
+            guard CMSampleBufferGetSampleSizeArray(buffer, entryCount: count, arrayToFill: &sizes,
+                                                   entriesNeededOut: &sizeEntries) == noErr else {
+                throw FMP4ProtectionError.readFailed("audio packet sizes")
+            }
+            if sizeEntries == 1 { sizes = Array(repeating: sizes[0], count: count) }
+            var timings = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: count), timingEntries = 0
+            guard CMSampleBufferGetSampleTimingInfoArray(buffer, entryCount: count, arrayToFill: &timings,
+                                                         entriesNeededOut: &timingEntries) == noErr else {
+                throw FMP4ProtectionError.readFailed("audio packet timing")
+            }
+            if timingEntries == 1 { timings = Array(repeating: timings[0], count: count) }
+            guard sizes.reduce(0, +) == bytes.count else {
+                throw FMP4ProtectionError.readFailed("audio packet sizes do not cover the buffer")
+            }
+            var offset = 0
+            for index in 0 ..< count {
+                let packet = Data(bytes[offset ..< offset + sizes[index]])
+                offset += sizes[index]
+                let duration = timings[index].duration
+                guard duration.isNumeric, duration.value > 0 else {
+                    throw FMP4ProtectionError.readFailed("audio packet without a duration")
+                }
+                samples.append(FMP4Writer.Sample(
+                    data: encryptor.encryptAudioSample(packet).encryptedData,
+                    duration: UInt32((duration.seconds * Double(source.sampleRate)).rounded()),
+                    isSync: true))
+            }
+        }
+        guard reader.status == .completed else {
+            throw FMP4ProtectionError.readFailed(reader.error?.localizedDescription ?? "audio reader did not finish")
+        }
+        return samples
+    }
+
+    /// Each sample's start, in seconds: the sum of the durations before it, at `timescale`.
+    static func startTimes(of samples: [FMP4Writer.Sample], timescale: UInt32) -> [Double] {
+        var elapsed: UInt64 = 0
+        return samples.map { sample in
+            defer { elapsed += UInt64(sample.duration) }
+            return Double(elapsed) / Double(timescale)
+        }
+    }
+
+    /// The audio packets of each segment: those that start at or after its start and before the next segment's, so
+    /// the last segment takes every packet left, and the first every packet before the second.
+    static func audioRanges(startTimes: [Double], segmentStarts: [Double]) -> [Range<Int>] {
+        var ranges: [Range<Int>] = []
+        var start = 0
+        for (index, _) in segmentStarts.enumerated() {
+            var end = startTimes.count
+            if index + 1 < segmentStarts.count {
+                end = startTimes[start...].firstIndex { $0 >= segmentStarts[index + 1] } ?? startTimes.count
+            }
+            ranges.append(start ..< end)
+            start = end
+        }
+        return ranges
     }
 
     // MARK: - Segmentation
@@ -649,6 +834,8 @@ public enum FMP4ProtectionError: Error, LocalizedError {
     case packagingFailed(String)
     case manifestParsingFailed
     case readFailed(String)
+    /// Sound that profile v1 does not carry: refused rather than dropped.
+    case unsupportedAudio(String)
 
     public var errorDescription: String? {
         switch self {
@@ -666,6 +853,8 @@ public enum FMP4ProtectionError: Error, LocalizedError {
             "Failed to parse manifest JSON"
         case let .readFailed(reason):
             "Reading the source video failed: \(reason)"
+        case let .unsupportedAudio(reason):
+            "The source's audio cannot be protected: \(reason)"
         }
     }
 }
