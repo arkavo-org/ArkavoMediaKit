@@ -172,7 +172,9 @@ public final class FMP4Writer {
 
         // mvhd - use first track's timescale
         let timescale = tracks.first?.timescale ?? 90000
-        let mvhd = MovieHeaderBox(timescale: timescale, duration: 0, nextTrackID: UInt32(tracks.count + 1))
+        // One more than the highest track id: a single track need not be track 1.
+        let mvhd = MovieHeaderBox(timescale: timescale, duration: 0,
+                                  nextTrackID: (tracks.map(\.trackID).max() ?? 0) + 1)
         moov.append(mvhd)
 
         // trak for each track
