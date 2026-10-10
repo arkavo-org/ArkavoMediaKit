@@ -186,3 +186,24 @@ struct BitWriter {
         return out
     }
 }
+
+/// A protect that fails on the video shows `localizedDescription` (Creator's "Protection Error" alert), so each
+/// failure says what it was.
+@Suite("Video protection failure descriptions")
+struct VideoProtectionFailureDescriptionTests {
+    @Test("Slice header failures describe themselves")
+    func sliceHeaderFailures() {
+        #expect(H264SliceHeaderParser.Failure.malformed.localizedDescription
+                    == "An H.264 slice header in the video could not be read.")
+        #expect(H264SliceHeaderParser.Failure.unknownParameterSet.localizedDescription
+                    == "An H.264 slice in the video names a parameter set the video does not carry.")
+        #expect(H264SliceHeaderParser.Failure.unsupported("slice groups").localizedDescription
+                    == "The video uses H.264 slice groups, which FairPlay protection does not support.")
+    }
+
+    @Test("A malformed sample describes itself")
+    func malformedSample() {
+        #expect(CBCSEncryptor.Failure.malformedSample.localizedDescription
+                    == "A video sample's NAL unit lengths do not match its size.")
+    }
+}
