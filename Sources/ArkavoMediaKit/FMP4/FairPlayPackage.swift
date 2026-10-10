@@ -63,7 +63,7 @@ public enum FairPlayPackage {
 
     /// What the master playlist states about the media (ADR-0055 §4).
     struct MasterPlaylist: Equatable {
-        /// The peak segment bit rate, video and audio together.
+        /// The video's peak segment bit rate plus the audio's (`bandwidth(segmentBytes:durations:)`).
         let bandwidth: Int
         /// The whole presentation's bit rate, video and audio together.
         let averageBandwidth: Int
@@ -99,13 +99,19 @@ public enum FairPlayPackage {
     // MARK: - Measurements
 
     /// `BANDWIDTH` and `AVERAGE-BANDWIDTH` in bits per second, each rounded up and at least 1.
-    /// - `segmentBytes[N]`: segment N's size, summed over every component.
-    /// - The peak is the highest segment rate, never below the average. A segment without duration has no rate.
-    static func bandwidth(segmentBytes: [Int], durations: [Double]) -> (peak: Int, average: Int) {
+    /// - `segmentBytes[C][N]`: component C's segment N's size; every component's segment N spans `durations[N]`.
+    /// - Each component is its own rendition, so (RFC 8216 §4.3.4.2) the peak is the sum of each component's peak
+    ///   segment rate, wherever each falls, and the average the sum of their averages: video plus audio.
+    /// - A component's peak is never below its average. A segment without duration has no rate.
+    static func bandwidth(segmentBytes components: [[Int]], durations: [Double]) -> (peak: Int, average: Int) {
         let total = durations.reduce(0, +)
-        let average = total > 0 ? Double(segmentBytes.reduce(0, +) * 8) / total : 0
-        let rates = zip(segmentBytes, durations).filter { $0.1 > 0 }.map { Double($0.0 * 8) / $0.1 }
-        let peak = max(rates.max() ?? 0, average)
+        var peak = 0.0, average = 0.0
+        for segmentBytes in components {
+            let componentAverage = total > 0 ? Double(segmentBytes.reduce(0, +) * 8) / total : 0
+            let rates = zip(segmentBytes, durations).filter { $0.1 > 0 }.map { Double($0.0 * 8) / $0.1 }
+            peak += max(rates.max() ?? 0, componentAverage)
+            average += componentAverage
+        }
         return (max(1, Int(peak.rounded(.up))), max(1, Int(average.rounded(.up))))
     }
 

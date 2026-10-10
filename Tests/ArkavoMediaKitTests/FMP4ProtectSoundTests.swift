@@ -179,6 +179,25 @@ struct FMP4ProtectSoundTests {
         return (try #require(earliest) - (try #require(firstDecode))).seconds
     }
 
+    /// Seconds from the source video's first decode time to the end of its last presented frame (the latest presentation
+    /// time plus duration): where the package's video stops presenting.
+    private func presentedEnd(_ movie: URL) async throws -> Double {
+        let asset = AVURLAsset(url: movie)
+        let track = try #require(try await asset.loadTracks(withMediaType: .video).first)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        reader.add(output)
+        #expect(reader.startReading())
+        var firstDecode: CMTime?, end: CMTime?
+        while let buffer = output.copyNextSampleBuffer() {
+            guard CMSampleBufferGetNumSamples(buffer) > 0 else { continue }
+            let pts = CMSampleBufferGetPresentationTimeStamp(buffer), dts = CMSampleBufferGetDecodeTimeStamp(buffer)
+            if firstDecode == nil { firstDecode = dts.isNumeric ? dts : pts }
+            end = max(end ?? .zero, pts + CMSampleBufferGetDuration(buffer))
+        }
+        return (try #require(end) - (try #require(firstDecode))).seconds
+    }
+
     /// Where the package's video ends on its timeline: its samples' durations, laid end to end from 0.
     private func videoEnd(_ protected: Protected) async throws -> Double {
         let frames = try fragments(try reader(.video, of: protected))
@@ -323,20 +342,20 @@ struct FMP4ProtectSoundTests {
         #expect(streamInf.hasSuffix(#",AUDIO="audio""#))
         let frameRate = try #require(streamInf.firstMatch(of: /FRAME-RATE=(\d+\.\d{3}),/))
         #expect(abs(try #require(Double(frameRate.1)) - 30) < 0.5)
-        // BANDWIDTH is the peak segment bit rate and AVERAGE-BANDWIDTH the presentation's, video and audio together.
+        // BANDWIDTH is the video's peak segment bit rate plus the audio's (each rendition's own, RFC 8216 §4.3.4.2), and
+        // AVERAGE-BANDWIDTH the presentation's, video and audio together.
         let stated = try #require(streamInf.firstMatch(of: /^#EXT-X-STREAM-INF:BANDWIDTH=(\d+),AVERAGE-BANDWIDTH=(\d+),/))
         let peak = try #require(Double(stated.1)), average = try #require(Double(stated.2))
-        let sizes: [Int] = try (0 ..< 2).map { (index: Int) -> Int in
-            let videoSize = try #require(protected.files["video-segment\(index).m4s"]).count
-            let audioSize = try #require(protected.files["audio-segment\(index).m4s"]).count
-            return videoSize + audioSize
-        }
         let durations: [Double] = video.compactMap { (line: String) -> Double? in
             line.hasPrefix("#EXTINF:") ? Double(line.dropFirst("#EXTINF:".count).prefix { $0 != "," }) : nil
         }
-        let rates: [Double] = zip(sizes, durations).map { (size: Int, duration: Double) in Double(size * 8) / duration }
-        let expectedPeak = try #require(rates.max())
-        let expectedAverage = Double(sizes.reduce(0, +) * 8) / durations.reduce(0, +)
+        var expectedPeak = 0.0, totalBytes = 0
+        for component in ["video", "audio"] {
+            let sizes: [Int] = try (0 ..< 2).map { try #require(protected.files["\(component)-segment\($0).m4s"]).count }
+            expectedPeak += try #require(zip(sizes, durations).map { Double($0 * 8) / $1 }.max())
+            totalBytes += sizes.reduce(0, +)
+        }
+        let expectedAverage = Double(totalBytes * 8) / durations.reduce(0, +)
         #expect(abs(peak / expectedPeak - 1) < 1e-4 && abs(average / expectedAverage - 1) < 1e-4)
         #expect(average <= peak)
     }
@@ -463,9 +482,29 @@ struct FMP4ProtectSoundTests {
         #expect(!audioSamples.isEmpty && Array(sourceAudio.prefix(audioSamples.count)) == audioSamples)
         let start = presented + (try await editOffset(protected.movie, .audio))
         #expect(abs(try audioSpan(protected).start - start) <= 1.0 / 48_000)
-        // Every packet that starts before the video's end.
-        let end = try await videoEnd(protected)
+        // Every packet that starts before the video's last presented frame ends.
+        let end = try await presentedEnd(protected.movie)
         #expect(audioSamples.count == min(sourceAudio.count, Int(((end - start) / (1_024.0 / 48_000)).rounded(.up))))
+    }
+
+    /// A B-frame video presents its last frames after its last decode: the sound covers them (ADR-0055 §4, the last
+    /// audio packet ends within one packet of the video's end), while EXTINF stays on the decode durations.
+    @Test("A B-frame video's sound runs to its last presented frame, within one packet")
+    func reorderingDelayPresentedEnd() async throws {
+        let dir = try directory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let protected = try await protect(.aac(tracks: 1), frames: 240, in: dir, frameReordering: true)
+        let presentedEnd = try await presentedEnd(protected.movie), decodeEnd = try await videoEnd(protected)
+        try #require(presentedEnd - decodeEnd > 0.03, "the fixture must present its last frame after its last decode")
+
+        let span = try audioSpan(protected)
+        #expect(span.end >= presentedEnd - 1_024 / 48_000, "audio ends at \(span.end) s, the video at \(presentedEnd) s")
+        #expect(span.end <= presentedEnd + 1_024 / 48_000, "audio ends at \(span.end) s, the video at \(presentedEnd) s")
+        // EXTINF: the decode durations.
+        let extinf = try lines(protected, "video.m3u8").compactMap { line -> Double? in
+            line.hasPrefix("#EXTINF:") ? Double(line.dropFirst("#EXTINF:".count).prefix { $0 != "," }) : nil
+        }
+        #expect(abs(extinf.reduce(0, +) - decodeEnd) < 0.001 * Double(extinf.count))
     }
 
     @Test("Sound that starts after a B-frame video's first presented frame is mixed with silence from that frame")
@@ -482,7 +521,8 @@ struct FMP4ProtectSoundTests {
         #expect(video.count == 2 && audio.count == 2)
         let span = try audioSpan(protected)
         #expect(span.start <= presented + 1_024 / 48_000)
-        let end = try await videoEnd(protected)
+        // To the last presented frame's end, past the last decode's.
+        let end = try await presentedEnd(protected.movie)
         #expect(span.end >= end - 2 * 1_024 / 48_000 && span.end <= end + 1_024 / 48_000)
         // The PCM starts at the first packet: silence until the sound, 1 s after the first presented frame.
         let (_, pcm) = try decodedAudio(protected)
@@ -608,6 +648,39 @@ struct FMP4AudioCoverageTests {
 /// Each audio fragment's decode time (ADR-0055 §4): contiguous from segment to segment.
 @Suite("fMP4 audio decode times")
 struct FMP4AudioDecodeTimeTests {
+    /// Codex's reproduction: 48 kHz AAC whose first packet starts 19.2 ms before the video, which `trim` moves to 0.
+    /// The segments emit every packet after it 19.2 ms later than its own time, so the packets are grouped, cut and
+    /// checked by the times they are emitted at: none falls outside its segment, and the last ends within one packet of
+    /// the video's end.
+    @Test("Audio is grouped and cut by the times the segments emit it, not the packets' own")
+    func emittedTimeline() throws {
+        let packet = 1_024.0 / 48_000, end = 13.3, segmentStarts = [0.0, 6, 12]
+        let source = (0 ..< 700).map { index in
+            (sample: FMP4Writer.Sample(data: Data([0]), duration: 1_024, isSync: true),
+             time: -0.0192 + Double(index) * packet)
+        }
+        let packets = FMP4RecordingProtectionService.trim(source, sampleRate: 48_000, to: end)
+        try #require(FMP4RecordingProtectionService.covers(packets, sampleRate: 48_000, segmentStarts: segmentStarts,
+                                                           start: 0, end: end))
+
+        let placed = FMP4RecordingProtectionService.audioSegments(packets, sampleRate: 48_000,
+                                                                  segmentStarts: segmentStarts)
+
+        try #require(placed.ranges.count == 3 && placed.decodeTimes.count == 3)
+        var emittedEnd = 0.0
+        for (index, range) in placed.ranges.enumerated() {
+            let upper = index + 1 < segmentStarts.count ? segmentStarts[index + 1] : .infinity
+            var tick = placed.decodeTimes[index]
+            for packet in packets[range] {
+                let time = Double(tick) / 48_000
+                #expect(time >= segmentStarts[index] && time < upper, "segment \(index) emits a packet at \(time) s")
+                tick += UInt64(packet.sample.duration)
+            }
+            emittedEnd = Double(tick) / 48_000
+        }
+        #expect(emittedEnd <= end + packet && emittedEnd >= end - packet, "the audio ends at \(emittedEnd) s")
+    }
+
     @Test("The first audio fragment starts at its first packet; each later one where the one before it ends")
     func contiguous() throws {
         let packet = 1_024.0 / 48_000
@@ -730,6 +803,20 @@ struct FMP4AudioTimelineTests {
             videoPresentationOffset: videoPresentationOffset, firstVideoDecodeTime: firstVideoDecodeTime)
 
         #expect(abs(presented + offset - inPackage) < 1e-9)
+    }
+
+    @Test("The presented end is the latest decode time plus composition offset plus duration")
+    func presentedEnd() {
+        func samples(_ offsets: [Int32]) -> [FMP4Writer.Sample] {
+            offsets.map { FMP4Writer.Sample(data: Data([0]), duration: 512, isSync: true, compositionTimeOffset: $0) }
+        }
+        // I P B B, decoded I P B B and shown I B B P one frame late: the P frame ends five frames in, a frame after the
+        // last decode ends.
+        #expect(FMP4RecordingProtectionService.presentedEnd(of: samples([512, 1_536, 0, 0]), timescale: 15_360)
+            == 2_560.0 / 15_360)
+        // Without reordering, the decode end.
+        #expect(FMP4RecordingProtectionService.presentedEnd(of: samples([0, 0, 0]), timescale: 15_360) == 1_536.0 / 15_360)
+        #expect(FMP4RecordingProtectionService.presentedEnd(of: [], timescale: 15_360) == 0)
     }
 
     @Test("The first presented frame is the earliest decode time plus composition offset, never before 0")

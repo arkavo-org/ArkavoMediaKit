@@ -91,12 +91,25 @@ struct FairPlayPackageTests {
 
     @Test("BANDWIDTH is the peak segment bit rate and AVERAGE-BANDWIDTH the presentation's, rounded up")
     func bandwidth() {
-        let rates = FairPlayPackage.bandwidth(segmentBytes: [750_000, 750_000, 400_000], durations: [6, 6, 4.5])
+        let rates = FairPlayPackage.bandwidth(segmentBytes: [[750_000, 750_000, 400_000]], durations: [6, 6, 4.5])
         #expect(rates.peak == 1_000_000)
         #expect(rates.average == 921_213)  // 15,200,000 bits over 16.5 s
         // A zero-length segment has no rate of its own; the peak is never below the average.
-        let degenerate = FairPlayPackage.bandwidth(segmentBytes: [100, 200], durations: [0, 2])
+        let degenerate = FairPlayPackage.bandwidth(segmentBytes: [[100, 200]], durations: [0, 2])
         #expect(degenerate.peak == 1_200 && degenerate.average == 1_200)
+    }
+
+    /// RFC 8216 §4.3.4.2: with the audio in its own rendition, BANDWIDTH is the sum of each rendition's peak segment
+    /// bit rate, wherever each peak falls, and AVERAGE-BANDWIDTH the sum of their averages.
+    @Test("With sound, BANDWIDTH sums the video's and the audio's own peaks, even in different segments")
+    func bandwidthPerRendition() {
+        // The video peaks in segment 0 (800,000 bit/s), the audio in segment 1 (66,666.7 bit/s).
+        let rates = FairPlayPackage.bandwidth(segmentBytes: [[600_000, 150_000], [10_000, 50_000]], durations: [6, 6])
+        #expect(rates.peak == 866_667)
+        #expect(rates.average == 540_000)  // (6,000,000 + 480,000) bits over 12 s
+        // Peaks in the same segment: the same sum as the segment's combined rate.
+        let together = FairPlayPackage.bandwidth(segmentBytes: [[600_000, 150_000], [50_000, 10_000]], durations: [6, 6])
+        #expect(together.peak == 866_667 && together.average == 540_000)
     }
 
     @Test("CODECS names the SPS's profile, constraints and level in upper-case hexadecimal")

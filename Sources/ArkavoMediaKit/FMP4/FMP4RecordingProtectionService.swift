@@ -243,8 +243,10 @@ public actor FMP4RecordingProtectionService {
 
         // 6. The audio component: the sound as one AAC-LC track, whole-block full-sample encrypted under the audio
         // key. It is placed on the video's timeline: the package's time 0 is the first video sample's decode time,
-        // and both tracks' edits map media to presentation. It covers the video's span, from the first presented
-        // frame (after time 0 for a B-frame stream) to the end, so every segment holds audio.
+        // and both tracks' edits map media to presentation. It covers the video's presented span, from the first
+        // presented frame (after time 0 for a B-frame stream) to the end of the last (after the last decode ends, for a
+        // B-frame stream), so every segment holds audio. EXTINF, the segments and FRAME-RATE stay on the decode
+        // durations.
         var sound: (source: AudioSource, packets: [(sample: FMP4Writer.Sample, time: Double)])?
         if let audioKey {
             let audioOffset = Self.audioTimeOffset(videoPresentationOffset: Self.presentationOffset(of: trackSegments),
@@ -253,15 +255,12 @@ public actor FMP4RecordingProtectionService {
                 of: asset, tracks: audioTracks, mixingIn: tempDir,
                 encryptor: CBCSEncryptor(key: audioKey, iv: constantIV),
                 timeOffset: audioOffset, videoStart: Self.firstPresentation(of: samples, timescale: timescale),
-                videoEnd: videoEnd, segmentStarts: segmentStarts)
+                videoEnd: Self.presentedEnd(of: samples, timescale: timescale), segmentStarts: segmentStarts)
         }
         let audioWriter = sound.map { FMP4Writer(tracks: [$0.source.config], encryption: encryptionConfig) }
-        let audioRanges = sound.map {
-            Self.audioRanges(startTimes: $0.packets.map(\.time), segmentStarts: segmentStarts)
-        }
-        // Each audio fragment's decode time: contiguous from segment to segment (ADR-0055 §4).
-        let audioStarts = sound.flatMap { sound in
-            audioRanges.map { Self.audioDecodeTimes(sound.packets, ranges: $0, sampleRate: sound.source.sampleRate) }
+        // Each audio segment's packets and decode time: contiguous from segment to segment (ADR-0055 §4).
+        let audioSegments = sound.map {
+            Self.audioSegments($0.packets, sampleRate: $0.source.sampleRate, segmentStarts: segmentStarts)
         }
 
         // 7. Each component's init segment and media segments: segment N of each names the video's segment N
@@ -271,7 +270,7 @@ public actor FMP4RecordingProtectionService {
 
         print("📼 Generating media segments...")
         var durations: [Double] = []
-        var segmentBytes: [Int] = []  // segment N's size, over every component
+        var videoBytes: [Int] = [], audioBytes: [Int] = []  // each component's segment sizes
         var baseDecodeTime: UInt64 = 0
 
         for (segmentIndex, range) in ranges.enumerated() {
@@ -282,23 +281,22 @@ public actor FMP4RecordingProtectionService {
             ])
             try videoSegment.write(
                 to: tempDir.appendingPathComponent(FairPlayPackage.segmentName(.video, index: segmentIndex)))
-            var bytes = videoSegment.count
-            if let sound, let audioWriter, let audioRanges, let audioStarts {
-                let packets = sound.packets[audioRanges[segmentIndex]]
+            videoBytes.append(videoSegment.count)
+            if let sound, let audioWriter, let audioSegments {
+                let packets = sound.packets[audioSegments.ranges[segmentIndex]]
                 guard !packets.isEmpty else {
                     // coveringAudio checked every segment: never write components of unequal segments.
                     throw FMP4ProtectionError.unsupportedAudio("audio segment \(segmentIndex) has no packets")
                 }
                 let audioSegment = audioWriter.generateMediaSegment(fragments: [
                     FMP4Writer.TrackFragment(trackID: 1, samples: packets.map(\.sample),
-                                             baseDecodeTime: audioStarts[segmentIndex]),
+                                             baseDecodeTime: audioSegments.decodeTimes[segmentIndex]),
                 ])
                 try audioSegment.write(
                     to: tempDir.appendingPathComponent(FairPlayPackage.segmentName(.audio, index: segmentIndex)))
-                bytes += audioSegment.count
+                audioBytes.append(audioSegment.count)
             }
             durations.append(Double(segmentDuration) / Double(timescale))
-            segmentBytes.append(bytes)
             baseDecodeTime += segmentDuration
         }
 
@@ -314,7 +312,8 @@ public actor FMP4RecordingProtectionService {
                                                          durations: durations, targetDuration: targetDuration)
             try Data(playlist.utf8).write(to: tempDir.appendingPathComponent(FairPlayPackage.playlistName(component)))
         }
-        let bandwidth = FairPlayPackage.bandwidth(segmentBytes: segmentBytes, durations: durations)
+        let bandwidth = FairPlayPackage.bandwidth(segmentBytes: sound == nil ? [videoBytes] : [videoBytes, audioBytes],
+                                                  durations: durations)
         guard let master = FairPlayPackage.masterPlaylist(FairPlayPackage.MasterPlaylist(
             bandwidth: bandwidth.peak,
             averageBandwidth: bandwidth.average,
@@ -390,17 +389,48 @@ public actor FMP4RecordingProtectionService {
         return Double(max(earliest, 0)) / Double(timescale)
     }
 
-    /// The packets of the package's span: those that end after its start and start before `end` (the video's), the
-    /// first moved to no earlier than 0.
+    /// Where the package stops presenting video, in seconds on its timeline: the latest decode time plus composition
+    /// offset plus duration, with the decode times laid end to end from 0 as the segments place them. A B-frame stream
+    /// presents its last frame after its last decode ends; without reordering this is the decode durations' sum. The
+    /// audio covers to here; EXTINF stays on the decode durations.
+    static func presentedEnd(of samples: [FMP4Writer.Sample], timescale: CMTimeScale) -> Double {
+        guard !samples.isEmpty, timescale > 0 else { return 0 }
+        var decodeTime: Int64 = 0, latest = Int64.min
+        for sample in samples {
+            latest = max(latest, decodeTime + Int64(sample.compositionTimeOffset) + Int64(sample.duration))
+            decodeTime += Int64(sample.duration)
+        }
+        return Double(max(latest, 0)) / Double(timescale)
+    }
+
+    /// The packets of the package's span: those that end after its start and that the segments emit before `end` (the
+    /// video's presented end), the first moved to no earlier than 0. A packet is cut by where it is emitted
+    /// (`laidTimes`), not by its own time: moving the first to 0 moves every later one by as much.
     static func trim(_ packets: [(sample: FMP4Writer.Sample, time: Double)], sampleRate: UInt32,
                      to end: Double) -> [(sample: FMP4Writer.Sample, time: Double)] {
-        packets
-            .filter { $0.time + Double($0.sample.duration) / Double(sampleRate) > 0 && $0.time < end }
-            .map { ($0.sample, max($0.time, 0)) }
+        guard sampleRate > 0 else { return [] }
+        let started = packets
+            .filter { $0.time + Double($0.sample.duration) / Double(sampleRate) > 0 }
+            .map { (sample: $0.sample, time: max($0.time, 0)) }
+        return zip(started, laidTimes(started, sampleRate: sampleRate)).filter { $0.1 < end }.map(\.0)
+    }
+
+    /// Where the segments emit each packet, in seconds on the package's timeline: laid end to end from the first
+    /// packet's time (never before 0), at the sample rate, as `audioDecodeTimes` writes them (ADR-0055 §4's contiguous
+    /// decode times). A packet's own time may differ from it by jitter, or by moving the first packet to 0.
+    static func laidTimes(_ packets: [(sample: FMP4Writer.Sample, time: Double)], sampleRate: UInt32) -> [Double] {
+        guard let first = packets.first, sampleRate > 0 else { return [] }
+        let rate = Double(sampleRate)
+        var tick = UInt64((max(first.time, 0) * rate).rounded())
+        return packets.map { packet in
+            defer { tick += UInt64(packet.sample.duration) }
+            return Double(tick) / rate
+        }
     }
 
     /// The source's sound as one AAC-LC track, encrypted, placed on the package's timeline and cut to the video's
-    /// span, covering that span (`covers`) from the first presented frame (`videoStart`) to `videoEnd`.
+    /// span, covering that span (`covers`) from the first presented frame (`videoStart`) to the end of the last
+    /// (`videoEnd`, `presentedEnd`).
     ///
     /// One AAC-LC track that covers it is packaged as it is. Anything else is mixed and encoded once, as AAC-LC, with
     /// silence where there is no sound, into `directory`:
@@ -445,36 +475,44 @@ public actor FMP4RecordingProtectionService {
     }
 
     /// Whether placed packets cover the video's span on the package's timeline, from `start` (where it presents its
-    /// first frame) to `end` (ADR-0055 §4):
+    /// first frame) to `end` (where it presents its last), measured where the segments emit them (`laidTimes`)
+    /// (ADR-0055 §4):
     /// - the first packet starts within its own duration of `start` (sound may start before it), and the last ends
     ///   within its own duration of `end`;
-    /// - laid end to end from the first, as the segments place them (`audioDecodeTimes`), every packet stays within its
-    ///   own duration of its time: jitter is absorbed, and a gap or an overlap longer than that is not contiguous;
-    /// - every segment from `segmentStarts` holds at least one packet.
+    /// - every packet is emitted within its own duration of its own time: jitter is absorbed, and a gap or an overlap
+    ///   longer than that is not contiguous;
+    /// - every segment from `segmentStarts` emits at least one packet.
     static func covers(_ packets: [(sample: FMP4Writer.Sample, time: Double)], sampleRate: UInt32,
                        segmentStarts: [Double], start: Double, end: Double) -> Bool {
         guard let first = packets.first, let last = packets.last, sampleRate > 0 else { return false }
         let rate = Double(sampleRate)
-        let firstLength = Double(first.sample.duration) / rate
-        let lastLength = Double(last.sample.duration) / rate
-        guard first.time <= max(start, 0) + firstLength, last.time + 2 * lastLength >= end else { return false }
-        var laid: UInt64 = 0  // the frames of the packets before this one
-        for packet in packets {
-            guard abs(packet.time - (first.time + Double(laid) / rate)) <= Double(packet.sample.duration) / rate else {
-                return false
-            }
-            laid += UInt64(packet.sample.duration)
+        let laid = laidTimes(packets, sampleRate: sampleRate)
+        guard let firstLaid = laid.first, let lastLaid = laid.last,
+              firstLaid <= max(start, 0) + Double(first.sample.duration) / rate,
+              lastLaid + 2 * Double(last.sample.duration) / rate >= end else { return false }
+        for (packet, emitted) in zip(packets, laid)
+        where abs(packet.time - emitted) > Double(packet.sample.duration) / rate {
+            return false
         }
-        return audioRanges(startTimes: packets.map(\.time), segmentStarts: segmentStarts).allSatisfy { !$0.isEmpty }
+        return audioRanges(startTimes: laid, segmentStarts: segmentStarts).allSatisfy { !$0.isEmpty }
+    }
+
+    /// Each audio segment's packets and decode time: the packets grouped by where the segments emit them
+    /// (`laidTimes`), so every packet's emitted time falls within its segment's range (ADR-0055 §4's ranges), and each
+    /// segment's `tfdt` (`audioDecodeTimes`).
+    static func audioSegments(_ packets: [(sample: FMP4Writer.Sample, time: Double)], sampleRate: UInt32,
+                              segmentStarts: [Double]) -> (ranges: [Range<Int>], decodeTimes: [UInt64]) {
+        let ranges = audioRanges(startTimes: laidTimes(packets, sampleRate: sampleRate), segmentStarts: segmentStarts)
+        return (ranges, audioDecodeTimes(packets, ranges: ranges, sampleRate: sampleRate))
     }
 
     /// Each segment's audio decode time (`tfdt`), at the sample rate, for the packets of each of `ranges`. The first
-    /// is its first packet's time, and each later one where the one before it ends: the audio's decode times are
-    /// contiguous from segment to segment (ADR-0055 §4). `covers` has checked that this keeps every packet within its
-    /// own duration of its time.
+    /// is its first packet's time (never before 0), and each later one where the one before it ends: the audio's decode
+    /// times are contiguous from segment to segment (ADR-0055 §4), the times `laidTimes` gives. `covers` has checked
+    /// that this keeps every packet within its own duration of its time.
     static func audioDecodeTimes(_ packets: [(sample: FMP4Writer.Sample, time: Double)], ranges: [Range<Int>],
                                  sampleRate: UInt32) -> [UInt64] {
-        var time = packets.first.map { UInt64(($0.time * Double(sampleRate)).rounded()) } ?? 0
+        var time = packets.first.map { UInt64((max($0.time, 0) * Double(sampleRate)).rounded()) } ?? 0
         return ranges.map { range in
             defer { time += packets[range].reduce(UInt64(0)) { $0 + UInt64($1.sample.duration) } }
             return time
