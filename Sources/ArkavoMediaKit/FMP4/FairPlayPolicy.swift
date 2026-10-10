@@ -10,8 +10,8 @@ import Foundation
 /// (OpenTDFKit 4 emitted `base64(hex(...))`, which arks refuses); the FairPlay
 /// path still computes it here, pinned to the arks fixture.
 ///
-/// The policy `uuid` is the FairPlay content-key id: the playlist key URI is
-/// `skd://<uuid>` and the SPC content identifier is the uuid.
+/// The policy `uuid` names the package's keys. In profile v2 each component's key URI is `skd://<uuid>/<id>` and its
+/// SPC content identifier `<uuid>/<id>` (ADR-0055 §6 in arkavo-ios). In profile v1 they were `skd://<uuid>` and the uuid.
 public enum FairPlayPolicy {
     public enum Error: Swift.Error, Equatable {
         case notJSONObject
