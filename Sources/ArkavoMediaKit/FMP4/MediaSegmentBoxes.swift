@@ -128,7 +128,9 @@ public struct TrackFragmentDecodeTimeBox: ISOFullBox {
 /// Track run box - sample-specific data for fragment
 public struct TrackRunBox: ISOFullBox {
     public let type = FourCC.trun
-    public let version: UInt8 = 0
+    /// 1 when a composition time offset is negative, which version 0 cannot hold (its offsets are unsigned, ISO/IEC
+    /// 14496-12); AVFoundation's H.264 encoder reorders frames with decode times after presentation times.
+    public let version: UInt8
     public var flags: UInt32
 
     public let dataOffset: Int32?
@@ -149,6 +151,7 @@ public struct TrackRunBox: ISOFullBox {
         self.samples = samples
         self.dataOffset = dataOffset
         self.firstSampleFlags = firstSampleFlags
+        self.version = samples.contains { ($0.compositionTimeOffset ?? 0) < 0 } ? 1 : 0
 
         var f: UInt32 = 0
         if dataOffset != nil { f |= Self.dataOffsetPresent }

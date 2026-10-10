@@ -592,3 +592,34 @@ struct TrafBoxTests {
         #expect(useSubsample, "use_subsample_encryption flag should be set for CBCS")
     }
 }
+
+/// ISO/IEC 14496-12: a version 0 `trun` holds unsigned composition time offsets, a version 1 one signed offsets.
+/// AVFoundation's H.264 encoder reorders frames with decode times after presentation times (negative offsets).
+@Suite("trun composition time offsets")
+struct TrackRunVersionTests {
+    private func versionAndOffsets(_ offsets: [Int32]) -> (version: UInt8, offsets: [Int32]) {
+        let trun = TrackRunBox(samples: offsets.map {
+            TrackRunSample(duration: 1_000, size: 10, flags: 0, compositionTimeOffset: $0)
+        }).serialize()
+        // size, type, version and flags, sample count, then per sample: duration, size, flags, offset.
+        let read = offsets.indices.map { index in
+            let at = 16 + index * 16 + 12
+            return Int32(bitPattern: trun[at ..< at + 4].reduce(UInt32(0)) { $0 << 8 | UInt32($1) })
+        }
+        return (trun[8], read)
+    }
+
+    @Test("Non-negative offsets keep version 0")
+    func nonNegative() {
+        let (version, offsets) = versionAndOffsets([0, 2_000, 1_000])
+        #expect(version == 0)
+        #expect(offsets == [0, 2_000, 1_000])
+    }
+
+    @Test("A negative offset makes the trun version 1, so it reads as signed")
+    func negative() {
+        let (version, offsets) = versionAndOffsets([0, 3_000, -1_000, -2_000])
+        #expect(version == 1)
+        #expect(offsets == [0, 3_000, -1_000, -2_000])
+    }
+}
