@@ -176,69 +176,38 @@ public final class CBCSEncryptor {
         return (result, subsample)
     }
 
-    /// Apply CBCS pattern encryption (encrypt N blocks, skip M blocks)
+    /// Apply CBCS pattern encryption (encrypt N blocks, skip M blocks) to one subsample's protected bytes.
+    ///
+    /// The encrypted blocks form one CBC chain that starts from the constant IV (ISO/IEC 23001-7 `cbcs`): each takes
+    /// the previous encrypted block's ciphertext as its IV, across the skipped blocks between them. The skipped
+    /// blocks and a trailing partial block stay clear.
     private func encryptWithPattern(_ data: Data) -> Data {
-        let blockSize = 16
-        var result = Data()
-        var offset = 0
         let patternLength = cryptBlocks + skipBlocks
-
-        while offset < data.count {
-            // Determine position in pattern
-            let blockIndex = offset / blockSize
-            let patternPosition = blockIndex % patternLength
-
-            let remaining = data.count - offset
-            let chunkSize = min(blockSize, remaining)
-            let chunk = data.subdata(in: offset..<(offset + chunkSize))
-
-            if patternPosition < cryptBlocks && chunkSize == blockSize {
-                // Encrypt this block
-                let encrypted = encryptBlock(chunk)
-                result.append(encrypted)
-            } else {
-                // Keep clear (skip block or partial block)
-                result.append(chunk)
-            }
-
-            offset += chunkSize
-        }
-
-        return result
+        let blocks = (0 ..< data.count / 16).filter { $0 % patternLength < cryptBlocks }
+        return encryptChain(data, blocks: blocks)
     }
 
-    /// Encrypt a single 16-byte block with AES-128-CBC
-    private func encryptBlock(_ block: Data) -> Data {
-        precondition(block.count == 16, "Block must be 16 bytes")
-
-        var encrypted = Data(count: 16)
-        var numBytesEncrypted: size_t = 0
-
-        let status = encrypted.withUnsafeMutableBytes { encryptedPtr in
-            block.withUnsafeBytes { blockPtr in
-                key.withUnsafeBytes { keyPtr in
-                    iv.withUnsafeBytes { ivPtr in
-                        CCCrypt(
-                            CCOperation(kCCEncrypt),
-                            CCAlgorithm(kCCAlgorithmAES),
-                            CCOptions(0), // No padding for single block
-                            keyPtr.baseAddress, 16,
-                            ivPtr.baseAddress,
-                            blockPtr.baseAddress, 16,
-                            encryptedPtr.baseAddress, 16,
-                            &numBytesEncrypted
-                        )
-                    }
-                }
+    /// Encrypts the 16-byte blocks at `blocks` (indexes into `data`) as one AES-128-CBC chain from the constant IV,
+    /// leaving every other byte as it is.
+    private func encryptChain(_ data: Data, blocks: [Int]) -> Data {
+        guard !blocks.isEmpty else { return data }
+        var bytes = [UInt8](data)
+        let plain = blocks.flatMap { bytes[$0 * 16 ..< $0 * 16 + 16] }
+        var cipher = [UInt8](repeating: 0, count: plain.count)
+        var moved = 0
+        let status = key.withUnsafeBytes { keyBytes in
+            iv.withUnsafeBytes { ivBytes in
+                CCCrypt(CCOperation(kCCEncrypt), CCAlgorithm(kCCAlgorithmAES), CCOptions(0),
+                        keyBytes.baseAddress, key.count, ivBytes.baseAddress,
+                        plain, plain.count, &cipher, cipher.count, &moved)
             }
         }
-
-        guard status == kCCSuccess else {
-            // Return original block on error
-            return block
+        // Never fall back to the clear bytes: they would be written as protected.
+        precondition(status == kCCSuccess && moved == plain.count, "AES-128-CBC encryption failed: \(status)")
+        for (index, block) in blocks.enumerated() {
+            bytes.replaceSubrange(block * 16 ..< block * 16 + 16, with: cipher[index * 16 ..< index * 16 + 16])
         }
-
-        return encrypted
+        return Data(bytes)
     }
 
     // MARK: - Audio Encryption
@@ -258,28 +227,10 @@ public final class CBCSEncryptor {
         return EncryptionResult(encryptedData: encrypted, subsamples: [subsample])
     }
 
-    /// Encrypt entire sample with AES-128-CBC (for audio)
+    /// Encrypt entire sample with AES-128-CBC (for audio): every complete block, one chain from the constant IV.
+    /// A trailing partial block stays clear (CBCS doesn't pad).
     private func encryptFullSample(_ data: Data) -> Data {
-        let blockSize = 16
-        var result = Data()
-        var offset = 0
-
-        while offset < data.count {
-            let remaining = data.count - offset
-            let chunkSize = min(blockSize, remaining)
-            let chunk = data.subdata(in: offset..<(offset + chunkSize))
-
-            if chunkSize == blockSize {
-                result.append(encryptBlock(chunk))
-            } else {
-                // Partial block at end - keep clear (CBCS doesn't pad)
-                result.append(chunk)
-            }
-
-            offset += chunkSize
-        }
-
-        return result
+        encryptChain(data, blocks: Array(0 ..< data.count / 16))
     }
 
     // MARK: - NAL Parsing
