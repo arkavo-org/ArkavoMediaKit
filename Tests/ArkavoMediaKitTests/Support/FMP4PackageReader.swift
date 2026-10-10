@@ -41,6 +41,13 @@ struct FMP4PackageReader {
         let auxiliaryBoxes: [String]
         /// The `senc` flags, when there is a `senc`.
         let sencFlags: UInt32?
+        /// The `senc` version, when there is a `senc`.
+        let sencVersion: UInt8?
+        /// The `senc` sample_count, when there is a `senc`.
+        let sencSampleCount: Int?
+        /// The bytes of the `senc` per-sample entries (after sample_count), when there is a `senc`: 0 when every
+        /// entry is empty.
+        let sencEntryBytes: Int?
     }
 
     private(set) var tracks: [UInt32: Track] = [:]
@@ -148,10 +155,13 @@ struct FMP4PackageReader {
 
         // senc: subsamples when flag 2 is set; with a constant IV there are no per-sample IVs.
         var subsamples: [[SubsampleEntry]?] = Array(repeating: nil, count: count)
-        var sencFlags: UInt32?
+        var sencFlags: UInt32?, sencVersion: UInt8?, sencSampleCount: Int?, sencEntryBytes: Int?
         if let senc = children.first(where: { $0.type == "senc" }) {
             let flags = Self.be32(bytes, senc.payload.lowerBound) & 0xFF_FFFF
             sencFlags = flags
+            sencVersion = bytes[senc.payload.lowerBound]
+            sencSampleCount = Int(Self.be32(bytes, senc.payload.lowerBound + 4))
+            sencEntryBytes = senc.payload.count - 8
             guard Int(Self.be32(bytes, senc.payload.lowerBound + 4)) == count else {
                 throw Failure.malformed("senc and trun disagree on the sample count")
             }
@@ -187,7 +197,8 @@ struct FMP4PackageReader {
         }
         let auxiliary = children.map(\.type).filter { !["tfhd", "tfdt", "trun"].contains($0) }
         return Fragment(trackID: trackID, baseDecodeTime: baseDecodeTime, durations: durations,
-                        auxiliaryBoxes: auxiliary, sencFlags: sencFlags)
+                        auxiliaryBoxes: auxiliary, sencFlags: sencFlags, sencVersion: sencVersion,
+                        sencSampleCount: sencSampleCount, sencEntryBytes: sencEntryBytes)
     }
 
     // MARK: - Boxes

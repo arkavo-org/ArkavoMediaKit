@@ -38,10 +38,13 @@ enum SyntheticMovie {
     ///   - mediaTimeScale: The video track's timescale, when set.
     ///   - sound: Audio tracks as long as the video (`frames` at 30 fps), when set.
     ///   - soundExtra: How long the audio runs past the video's end, in seconds.
+    ///   - frameReordering: H.264 High with B-frames, passed through an MP4 export, which writes the reordering
+    ///     delay as the video's edit, as the device spike's source has it: the first sample decodes at 0 and is
+    ///     presented at a later media time, which the edit maps to 0. The result is an `.mp4`.
     static func make(
         in dir: URL, frames: Int = 30, frameTimes: [Double]? = nil, keyFrameInterval: Int? = nil,
         moovFirst: Bool = false, variableFrameRate: Bool = false, mediaTimeScale: CMTimeScale? = nil,
-        sound: Sound? = nil, soundExtra: Double = 0
+        sound: Sound? = nil, soundExtra: Double = 0, frameReordering: Bool = false
     ) async throws -> URL {
         let url = dir.appendingPathComponent("synthetic-\(UUID().uuidString).mov")
         let width = 320, height = 180, fps: Int32 = 30
@@ -52,9 +55,13 @@ enum SyntheticMovie {
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
         ]
-        if let keyFrameInterval {
-            settings[AVVideoCompressionPropertiesKey] = [AVVideoMaxKeyFrameIntervalKey: keyFrameInterval]
+        var compression: [String: Any] = [:]
+        if let keyFrameInterval { compression[AVVideoMaxKeyFrameIntervalKey] = keyFrameInterval }
+        if frameReordering {
+            compression[AVVideoAllowFrameReorderingKey] = true
+            compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
         }
+        if !compression.isEmpty { settings[AVVideoCompressionPropertiesKey] = compression }
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
         if let mediaTimeScale { input.mediaTimeScale = mediaTimeScale }
         input.expectsMediaDataInRealTime = false
@@ -149,7 +156,13 @@ enum SyntheticMovie {
         try await appendAudio(through: audioEnd, frames)
         await writer.finishWriting()
         guard writer.status == .completed else { throw writer.error ?? Failure.finish }
-        return url
+        guard frameReordering else { return url }
+        // AVAssetWriter writes B-frames as negative composition offsets; an MP4 export writes the delay as an edit.
+        guard let export = AVAssetExportSession(asset: AVURLAsset(url: url), presetName: AVAssetExportPresetPassthrough)
+        else { throw Failure.writerRejectedInput }
+        let mp4 = dir.appendingPathComponent("reordered-\(UUID().uuidString).mp4")
+        try await export.export(to: mp4, as: .mp4)
+        return mp4
     }
 }
 
