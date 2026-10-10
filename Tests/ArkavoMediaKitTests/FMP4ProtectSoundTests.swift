@@ -19,10 +19,11 @@ struct FMP4ProtectSoundTests {
         let movie: URL
     }
 
-    private func protect(_ sound: SyntheticMovie.Sound, frames: Int, in dir: URL,
-                         policyJSON: Data? = nil) async throws -> Protected {
+    private func protect(_ sound: SyntheticMovie.Sound, frames: Int, in dir: URL, policyJSON: Data? = nil,
+                         audioDelay: Double = 0, soundExtra: Double = 0) async throws -> Protected {
         let kas = try TestKASKeyPair()
-        let movie = try await SyntheticMovie.make(in: dir, frames: frames, sound: sound)
+        var movie = try await SyntheticMovie.make(in: dir, frames: frames, sound: sound, soundExtra: soundExtra)
+        if audioDelay > 0 { movie = try await SyntheticMovie.delayingAudio(of: movie, by: audioDelay, in: dir) }
         let service = FMP4RecordingProtectionService(kasURL: Self.kasURL, kasPublicKeyPEM: kas.spkiPublicKeyPEM)
         let (archive, _) = try await StdoutCapture.capture {
             try await service.protectVideo(videoURL: movie, assetID: "recording-with-sound", policyJSON: policyJSON)
@@ -132,9 +133,52 @@ struct FMP4ProtectSoundTests {
         #expect(abs(audioStart - videoStart) <= 1_024 / 48_000)
 
         #expect(reader.samples[1] == (try await sourceSamples(protected.movie, .video)))
+        // The audio is the source's packets, less the encoder priming that ends before the video starts.
         let sourceAudio = try await sourceSamples(protected.movie, .audio)
+        let audioSamples = try #require(reader.samples[2])
         #expect(sourceAudio.count > 300)
-        #expect(reader.samples[2] == sourceAudio)
+        let firstSample = try #require(audioSamples.first)
+        let first = try #require(sourceAudio.firstIndex(of: firstSample))
+        #expect(first <= 3)
+        #expect(Array(sourceAudio[first ..< first + audioSamples.count]) == audioSamples)
+        #expect(audioSamples.count >= sourceAudio.count - 4)
+    }
+
+    /// The audio fragments' decode times, in seconds: where the first starts, and where the last ends.
+    private func audioSpan(_ reader: FMP4PackageReader) throws -> (start: Double, end: Double) {
+        let fragments = reader.segments.compactMap { $0.first { $0.trackID == 2 } }
+        let first = try #require(fragments.first), last = try #require(fragments.last)
+        let end = last.baseDecodeTime + last.durations.reduce(0) { $0 + UInt64($1) }
+        return (Double(first.baseDecodeTime) / 48_000, Double(end) / 48_000)
+    }
+
+    @Test("Audio that starts after the video starts after it in the package")
+    func lateAudio() async throws {
+        let dir = try directory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let protected = try await protect(.aac(tracks: 1), frames: 90, in: dir, audioDelay: 1)
+
+        let reader = try FMP4PackageReader(initSegment: try #require(protected.files["init.mp4"]),
+                                           segments: try segments(protected.files), key: protected.key)
+
+        // The audio's edit places it at 1 s; its first packet starts within a packet of that.
+        let span = try audioSpan(reader)
+        #expect(span.start > 1 - 3 * 1_024 / 48_000 && span.start <= 1)
+    }
+
+    @Test("Audio that runs past the video is cut at the video's end")
+    func longAudio() async throws {
+        let dir = try directory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let protected = try await protect(.aac(tracks: 1), frames: 90, in: dir, soundExtra: 3)
+
+        let reader = try FMP4PackageReader(initSegment: try #require(protected.files["init.mp4"]),
+                                           segments: try segments(protected.files), key: protected.key)
+
+        let videoEnd = 90.0 / 30
+        let span = try audioSpan(reader)
+        #expect(span.end <= videoEnd + 1_024 / 48_000)
+        #expect(span.end >= videoEnd - 2 * 1_024 / 48_000)
     }
 
     private func videoTimescale(_ movie: URL) async throws -> CMTimeScale {

@@ -37,10 +37,11 @@ enum SyntheticMovie {
     ///     its first captured frame writes.
     ///   - mediaTimeScale: The video track's timescale, when set.
     ///   - sound: Audio tracks as long as the video (`frames` at 30 fps), when set.
+    ///   - soundExtra: How long the audio runs past the video's end, in seconds.
     static func make(
         in dir: URL, frames: Int = 30, frameTimes: [Double]? = nil, keyFrameInterval: Int? = nil,
         moovFirst: Bool = false, variableFrameRate: Bool = false, mediaTimeScale: CMTimeScale? = nil,
-        sound: Sound? = nil
+        sound: Sound? = nil, soundExtra: Double = 0
     ) async throws -> URL {
         let url = dir.appendingPathComponent("synthetic-\(UUID().uuidString).mov")
         let width = 320, height = 180, fps: Int32 = 30
@@ -81,8 +82,16 @@ enum SyntheticMovie {
         }
         // Audio is appended alongside the video, a second ahead of it, so the writer can interleave.
         var audioFrames = 0
-        let audioEnd = Int(Double(frames) / Double(fps) * Self.audioRate)
+        let audioEnd = Int((Double(frames) / Double(fps) + soundExtra) * Self.audioRate)
+        var audioFinished = audioInputs.isEmpty
         func appendAudio(through end: Int, _ frame: Int) async throws {
+            defer {
+                // Finished as soon as it is all written, so the writer does not wait on it for the video's sake.
+                if audioFrames >= audioEnd, !audioFinished {
+                    for audioInput in audioInputs { audioInput.markAsFinished() }
+                    audioFinished = true
+                }
+            }
             while audioFrames < min(end, audioEnd) {
                 let count = min(1_024, audioEnd - audioFrames)
                 for (index, audioInput) in audioInputs.enumerated() {
@@ -97,7 +106,17 @@ enum SyntheticMovie {
 
         try await appendAudio(through: Int(Self.audioRate), 0)
         for frame in 0 ..< (frameTimes?.count ?? frames) {
-            try await waitUntilReady(input, frame)
+            // While the video waits, the writer may be waiting for audio to interleave: give it the next buffer.
+            let deadline = Date().addingTimeInterval(5)
+            while !input.isReadyForMoreMediaData {
+                if writer.status == .failed { throw writer.error ?? Failure.append(frame) }
+                guard Date() < deadline else { throw Failure.readyTimeout(frame) }
+                if audioFrames < audioEnd, audioInputs.allSatisfy(\.isReadyForMoreMediaData) {
+                    try await appendAudio(through: audioFrames + 1_024, frame)
+                } else {
+                    try await Task.sleep(nanoseconds: 2_000_000)
+                }
+            }
             guard let pool = adaptor.pixelBufferPool else { throw Failure.noPixelBufferPool }
             var buffer: CVPixelBuffer?
             let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
@@ -125,10 +144,9 @@ enum SyntheticMovie {
             }
             try await appendAudio(through: Int((Double(frame + 1) / Double(fps) + 1) * Self.audioRate), frame)
         }
-        try await appendAudio(through: audioEnd, frames)
-
+        // The video ends first, so the writer takes audio past its end.
         input.markAsFinished()
-        for audioInput in audioInputs { audioInput.markAsFinished() }
+        try await appendAudio(through: audioEnd, frames)
         await writer.finishWriting()
         guard writer.status == .completed else { throw writer.error ?? Failure.finish }
         return url
@@ -137,6 +155,27 @@ enum SyntheticMovie {
 
 extension SyntheticMovie {
     static let audioRate = 48_000.0
+
+    /// A copy of `movie` whose audio starts `delay` seconds after its video (an empty edit before it), as an editor
+    /// would place it: composed, then exported without re-encoding.
+    static func delayingAudio(of movie: URL, by delay: Double, in dir: URL) async throws -> URL {
+        let asset = AVURLAsset(url: movie)
+        let duration = try await asset.load(.duration)
+        let shift = CMTime(seconds: delay, preferredTimescale: 48_000)
+        let composition = AVMutableComposition()
+        for (type, at, length) in [(AVMediaType.video, CMTime.zero, duration), (.audio, shift, duration - shift)] {
+            guard let source = try await asset.loadTracks(withMediaType: type).first,
+                  let track = composition.addMutableTrack(withMediaType: type,
+                                                          preferredTrackID: kCMPersistentTrackID_Invalid)
+            else { throw Failure.writerRejectedInput }
+            try track.insertTimeRange(CMTimeRange(start: .zero, duration: length), of: source, at: at)
+        }
+        guard let export = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetPassthrough)
+        else { throw Failure.writerRejectedInput }
+        let url = dir.appendingPathComponent("delayed-\(UUID().uuidString).mov")
+        try await export.export(to: url, as: .mov)
+        return url
+    }
 
     private static func addAudio(_ sound: Sound, to writer: AVAssetWriter) throws -> [AVAssetWriterInput] {
         let settings: [String: Any]

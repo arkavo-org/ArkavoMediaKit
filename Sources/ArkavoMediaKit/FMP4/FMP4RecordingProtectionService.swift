@@ -148,6 +148,7 @@ public actor FMP4RecordingProtectionService {
         var samples: [FMP4Writer.Sample] = []
         var bytesRead: Int64 = 0
         var readEnd = CMTime.zero  // latest presentation end among the samples read
+        var firstDecodeTime: CMTime?  // the first sample's, where the package's timeline starts
 
         while let sampleBuffer = output.copyNextSampleBuffer() {
             guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
@@ -197,6 +198,7 @@ public actor FMP4RecordingProtectionService {
                 readEnd = max(readEnd, pts + duration)
             }
             let dts = CMSampleBufferGetDecodeTimeStamp(sampleBuffer)
+            if firstDecodeTime == nil { firstDecodeTime = dts.isNumeric ? dts : pts }
             var compositionTimeOffset: Int32 = 0
 
             // Only calculate CTS if both PTS and DTS are valid
@@ -241,8 +243,15 @@ public actor FMP4RecordingProtectionService {
                 "read \(bytesRead) of \(totalSampleBytes) sample bytes, to \(readEnd.seconds) s of \(mediaEnd.seconds) s")
         }
 
-        // 6b. Read and encrypt the audio packets, whole-block full-sample
-        let audioSamples = try audioSource.map { try Self.readAudio($0, of: asset, encryptor: encryptor) } ?? []
+        // 6b. Read and encrypt the audio packets, whole-block full-sample, placed on the video's timeline: the
+        // package's time 0 is the first video sample's decode time, and both tracks' edits map media to presentation.
+        let videoEnd = Double(samples.reduce(UInt64(0)) { $0 + UInt64($1.duration) }) / Double(timescale)
+        let videoOffset = Self.presentationOffset(of: trackSegments) - (firstDecodeTime?.seconds ?? 0)
+        let audio = try audioSource.map {
+            Self.trim(try Self.readAudio($0, of: asset, encryptor: encryptor, timeOffset: -videoOffset),
+                      sampleRate: $0.sampleRate, to: videoEnd)
+        } ?? []
+        let audioSamples = audio.map(\.sample)
 
         // 7. Generate media segments (about 6 seconds each)
         print("📼 Generating media segments...")
@@ -254,23 +263,24 @@ public actor FMP4RecordingProtectionService {
         let segmentStarts = ranges.map { range in
             Double(samples[..<range.lowerBound].reduce(UInt64(0)) { $0 + UInt64($1.duration) }) / Double(timescale)
         }
-        let audioRanges = Self.audioRanges(startTimes: Self.startTimes(of: audioSamples,
-                                                                       timescale: audioSource?.sampleRate ?? 1),
-                                           segmentStarts: segmentStarts)
+        let audioRanges = Self.audioRanges(startTimes: audio.map(\.time), segmentStarts: segmentStarts)
         var segments: [FMP4HLSGenerator.Segment] = []
         var baseDecodeTime: UInt64 = 0
-        var audioDecodeTime: UInt64 = 0
+        var audioDecodeTime: UInt64 = 0  // where the previous audio fragment ended
 
         for (segmentIndex, range) in ranges.enumerated() {
             let segmentSamples = Array(samples[range])
             let segmentDuration = segmentSamples.reduce(UInt64(0)) { $0 + UInt64($1.duration) }
             var fragments = [FMP4Writer.TrackFragment(trackID: 1, samples: segmentSamples,
                                                       baseDecodeTime: baseDecodeTime)]
-            if let audioSource, !audioRanges[segmentIndex].isEmpty {
+            if let audioSource, let first = audioRanges[segmentIndex].first {
                 let segmentAudio = Array(audioSamples[audioRanges[segmentIndex]])
+                // Its first packet's time, so a gap before it is kept; never before the previous fragment's end.
+                let start = max(audioDecodeTime,
+                                UInt64((audio[first].time * Double(audioSource.sampleRate)).rounded()))
                 fragments.append(FMP4Writer.TrackFragment(trackID: audioSource.config.trackID, samples: segmentAudio,
-                                                          baseDecodeTime: audioDecodeTime))
-                audioDecodeTime += segmentAudio.reduce(UInt64(0)) { $0 + UInt64($1.duration) }
+                                                          baseDecodeTime: start))
+                audioDecodeTime = start + segmentAudio.reduce(UInt64(0)) { $0 + UInt64($1.duration) }
             }
             let segmentData = writer.generateMediaSegment(fragments: fragments)
 
@@ -336,6 +346,24 @@ public actor FMP4RecordingProtectionService {
         let track: AVAssetTrack
         let config: FMP4Writer.TrackConfig
         let sampleRate: UInt32
+        /// Seconds from a packet's media time to its presentation time: the track's first edit.
+        let presentationOffset: Double
+    }
+
+    /// Seconds from media time to presentation time in a track's first edit that shows media (an empty edit before
+    /// it delays the track; an edit that starts into the media skips priming or reordering delay), or 0 with none.
+    static func presentationOffset(of segments: [AVAssetTrackSegment]) -> Double {
+        guard let edit = segments.first(where: { !$0.isEmpty }) else { return 0 }
+        return edit.timeMapping.target.start.seconds - edit.timeMapping.source.start.seconds
+    }
+
+    /// The packets of the package's span: those that end after its start and start before `end` (the video's), the
+    /// first moved to no earlier than 0.
+    static func trim(_ packets: [(sample: FMP4Writer.Sample, time: Double)], sampleRate: UInt32,
+                     to end: Double) -> [(sample: FMP4Writer.Sample, time: Double)] {
+        packets
+            .filter { $0.time + Double($0.sample.duration) / Double(sampleRate) > 0 && $0.time < end }
+            .map { ($0.sample, max($0.time, 0)) }
     }
 
     /// The source's audio track, or nil when it has none.
@@ -361,7 +389,8 @@ public actor FMP4RecordingProtectionService {
             track: track,
             config: .aacAudio(trackID: 2, channelCount: UInt16(description.mChannelsPerFrame),
                               sampleRate: sampleRate, audioSpecificConfig: config),
-            sampleRate: sampleRate)
+            sampleRate: sampleRate,
+            presentationOffset: presentationOffset(of: try await track.load(.segments)))
     }
 
     /// The AudioSpecificConfig of an AAC format description: its magic cookie, which is an MPEG-4 ES_Descriptor (the
@@ -416,16 +445,17 @@ public actor FMP4RecordingProtectionService {
     }
 
     /// Every AAC packet of the audio track, each encrypted whole-block full-sample, with its duration at the sample
-    /// rate. A sample buffer of compressed audio holds several packets; each is its own sample.
-    static func readAudio(_ source: AudioSource, of asset: AVURLAsset,
-                          encryptor: CBCSEncryptor) throws -> [FMP4Writer.Sample] {
+    /// rate and its presentation time plus `timeOffset`, in seconds. A sample buffer of compressed audio holds several
+    /// packets; each is its own sample.
+    static func readAudio(_ source: AudioSource, of asset: AVURLAsset, encryptor: CBCSEncryptor,
+                          timeOffset: Double) throws -> [(sample: FMP4Writer.Sample, time: Double)] {
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: source.track, outputSettings: nil)
         reader.add(output)
         guard reader.startReading() else {
             throw FMP4ProtectionError.readFailed(reader.error?.localizedDescription ?? "audio reader did not start")
         }
-        var samples: [FMP4Writer.Sample] = []
+        var samples: [(sample: FMP4Writer.Sample, time: Double)] = []
         while let buffer = output.copyNextSampleBuffer() {
             let count = CMSampleBufferGetNumSamples(buffer)
             guard count > 0, let block = CMSampleBufferGetDataBuffer(buffer) else { continue }
@@ -446,7 +476,15 @@ public actor FMP4RecordingProtectionService {
                                                          entriesNeededOut: &timingEntries) == noErr else {
                 throw FMP4ProtectionError.readFailed("audio packet timing")
             }
-            if timingEntries == 1 { timings = Array(repeating: timings[0], count: count) }
+            if timingEntries == 1 {
+                // One entry: the first packet's time, and every packet's duration.
+                timings = (0 ..< count).map { index in
+                    var timing = timings[0]
+                    timing.presentationTimeStamp = timings[0].presentationTimeStamp
+                        + CMTimeMultiply(timings[0].duration, multiplier: Int32(index))
+                    return timing
+                }
+            }
             guard sizes.reduce(0, +) == bytes.count else {
                 throw FMP4ProtectionError.readFailed("audio packet sizes do not cover the buffer")
             }
@@ -454,29 +492,20 @@ public actor FMP4RecordingProtectionService {
             for index in 0 ..< count {
                 let packet = Data(bytes[offset ..< offset + sizes[index]])
                 offset += sizes[index]
-                let duration = timings[index].duration
-                guard duration.isNumeric, duration.value > 0 else {
-                    throw FMP4ProtectionError.readFailed("audio packet without a duration")
+                let duration = timings[index].duration, time = timings[index].presentationTimeStamp
+                guard duration.isNumeric, duration.value > 0, time.isNumeric else {
+                    throw FMP4ProtectionError.readFailed("audio packet without a duration or a time")
                 }
-                samples.append(FMP4Writer.Sample(
+                samples.append((FMP4Writer.Sample(
                     data: encryptor.encryptAudioSample(packet).encryptedData,
                     duration: UInt32((duration.seconds * Double(source.sampleRate)).rounded()),
-                    isSync: true))
+                    isSync: true), time.seconds + source.presentationOffset + timeOffset))
             }
         }
         guard reader.status == .completed else {
             throw FMP4ProtectionError.readFailed(reader.error?.localizedDescription ?? "audio reader did not finish")
         }
         return samples
-    }
-
-    /// Each sample's start, in seconds: the sum of the durations before it, at `timescale`.
-    static func startTimes(of samples: [FMP4Writer.Sample], timescale: UInt32) -> [Double] {
-        var elapsed: UInt64 = 0
-        return samples.map { sample in
-            defer { elapsed += UInt64(sample.duration) }
-            return Double(elapsed) / Double(timescale)
-        }
     }
 
     /// The audio packets of each segment: those that start at or after its start and before the next segment's, so
