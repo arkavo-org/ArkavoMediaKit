@@ -78,3 +78,15 @@ ARKAVO_ENVELOPE_FIXTURE_DIR=/tmp/arkavo-envelope-fixture swift test --filter Fai
 These fixtures use fresh disposable cryptographic keys. They contain no production
 credentials. Device FairPlay playback still requires an envelope-capable deployed
 KSM and signed client; unit and cross-SDK decryption do not establish that result.
+
+The pinned Go reference check is reproducible with:
+
+```sh
+ARKAVO_ENVELOPE_FIXTURE_DIR=/tmp/arkavo-envelope-fixture tools/interop/verify-opentdf-go.sh
+```
+
+It checks `IsValidTdf`, strict schema loading, key reconstruction/root integrity,
+full payload decryption and rejection after ciphertext mutation. The test injects
+the disposable unwrapped DEK at the SDK's internal seam; it does not contact a
+KAS or establish a real authorization grant. Add `/two-tracks` to the fixture
+path to test the generated AAC+video package.

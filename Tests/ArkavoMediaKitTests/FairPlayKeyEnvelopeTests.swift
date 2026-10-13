@@ -7,7 +7,7 @@ import ZIPFoundation
 
 @Suite("OpenTDF FairPlay key envelope")
 struct FairPlayKeyEnvelopeTests {
-    let policy = Data(#"{"uuid":"6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d","body":{"dataAttributes":[],"dissem":[]}}"#.utf8)
+    let policy = Data(#"{"uuid":"6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d","arkavo:classification":{"v":1,"filter":"passed","flagged":[]},"body":{"dataAttributes":[{"attribute":"https://patreon.arkavo.com/attr/campaign-tier/value/13167240_24457368"}],"dissem":[]}}"#.utf8)
     let files = ["master.m3u8": Data("master".utf8), "video.m3u8": Data("video".utf8),
                  "video-init.mp4": Data([1, 2, 3]), "video-segment0.m4s": Data([4, 5, 6])]
 
@@ -87,7 +87,7 @@ struct FairPlayKeyEnvelopeTests {
             componentKeys: [.init(component: .video, key: Data(repeating: 1, count: 16)),
                             .init(component: .audio, key: Data(repeating: 2, count: 16))],
             iv: Data(repeating: 3, count: 16), assetID: "asset", policyJSON: policy, mediaFiles: files,
-            kasURL: URL(string: "https://kas.example")!, publicKey: try TDFManifestBuilder(kasURL: URL(string: "https://kas.example")!).publicKey(fromPEM: kas.publicKeyPEM))
+            kasURL: URL(string: "https://platform.arkavo.net")!, publicKey: try TDFManifestBuilder(kasURL: URL(string: "https://platform.arkavo.net")!).publicKey(fromPEM: kas.publicKeyPEM))
         let manifest = try #require(JSONSerialization.jsonObject(with: package.manifest) as? [String: Any])
         let info = try #require(manifest["encryptionInformation"] as? [String: Any])
         let accesses = try #require(info["keyAccess"] as? [[String: Any]])
@@ -108,12 +108,12 @@ struct FairPlayKeyEnvelopeTests {
     @Test("delegate sends encrypted payload to the KSM and receives only a CKC")
     func payloadTransport() async throws {
         let package = try make(TestKASKeyPair())
-        let manifest = FairPlayManifest(assetID: "asset", kasURL: "https://kas.example", wrappedKey: "",
+        let manifest = FairPlayManifest(assetID: "asset", kasURL: "https://platform.arkavo.net", wrappedKey: "",
                                         algorithm: "AES-256-GCM", iv: "", tdfManifestJSON: package.manifest,
                                         tdfPayload: package.payload)
         let http = FakeMediaService()
         let delegate = TDFContentKeyDelegate(manifest: manifest, authToken: nil,
-                                             serverURL: URL(string: "https://kas.example")!, http: http)
+                                             serverURL: URL(string: "https://platform.arkavo.net")!, http: http)
         let request = FakeKeyRequest("skd://6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d/video")
         await delegate.handle(request)
         let calls = await http.calls
@@ -129,7 +129,7 @@ struct FairPlayKeyEnvelopeTests {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let movie = try await SyntheticMovie.make(in: directory, sound: .aac(tracks: 1))
-        let service = FMP4RecordingProtectionService(kasURL: URL(string: "https://kas.example")!,
+        let service = FMP4RecordingProtectionService(kasURL: URL(string: "https://platform.arkavo.net")!,
                                                       kasPublicKeyPEM: kas.spkiPublicKeyPEM)
         let archive = try await service.protectVideo(videoURL: movie, assetID: "test-asset", policyJSON: policy,
                                                      profile: .keyEnvelope, kasKeyID: "test-kas")
@@ -167,12 +167,12 @@ struct FairPlayKeyEnvelopeTests {
     func missingPayload() async throws {
         let package = try make(TestKASKeyPair())
         for payload in [nil, Data([1, 2, 3])] as [Data?] {
-            let manifest = FairPlayManifest(assetID: "asset", kasURL: "https://kas.example", wrappedKey: "",
+            let manifest = FairPlayManifest(assetID: "asset", kasURL: "https://platform.arkavo.net", wrappedKey: "",
                                             algorithm: "AES-256-GCM", iv: "", tdfManifestJSON: package.manifest,
                                             tdfPayload: payload)
             let http = FakeMediaService()
             let delegate = TDFContentKeyDelegate(manifest: manifest, authToken: nil,
-                                                 serverURL: URL(string: "https://kas.example")!, http: http)
+                                                 serverURL: URL(string: "https://platform.arkavo.net")!, http: http)
             await delegate.handle(FakeKeyRequest("skd://6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d/video"))
             #expect(await http.calls.isEmpty)
         }
@@ -183,6 +183,6 @@ struct FairPlayKeyEnvelopeTests {
                       policyJSON: Data? = nil) throws -> FairPlayKeyEnvelope.Package {
         try FairPlayKeyEnvelope.build(componentKeys: [.init(component: .video, key: mediaKey)], iv: iv,
                                       assetID: "asset", policyJSON: policyJSON ?? policy, mediaFiles: mediaFiles ?? files,
-                                      kasURL: URL(string: "https://kas.example")!, publicKey: try TDFManifestBuilder(kasURL: URL(string: "https://kas.example")!).publicKey(fromPEM: kas.publicKeyPEM), kasKeyID: "test-kas")
+                                      kasURL: URL(string: "https://platform.arkavo.net")!, publicKey: try TDFManifestBuilder(kasURL: URL(string: "https://platform.arkavo.net")!).publicKey(fromPEM: kas.publicKeyPEM), kasKeyID: "test-kas")
     }
 }
