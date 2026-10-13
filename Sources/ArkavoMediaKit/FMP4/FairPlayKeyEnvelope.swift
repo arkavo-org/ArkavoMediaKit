@@ -30,6 +30,13 @@ public enum FairPlayKeyEnvelope {
               let information = manifest["encryptionInformation"] as? [String: Any],
               information["type"] as? String == "split",
               let access = information["keyAccess"] as? [[String: Any]], access.count == 1,
+              access[0]["type"] as? String == "wrapped", access[0]["protocol"] as? String == "kas",
+              let wrapped = access[0]["wrappedKey"] as? String,
+              let wrappedBytes = Data(base64Encoded: wrapped), !wrappedBytes.isEmpty,
+              wrappedBytes.base64EncodedString() == wrapped,
+              let binding = access[0]["policyBinding"] as? [String: String], binding["alg"] == "HS256",
+              let hash = binding["hash"], let hashBytes = Data(base64Encoded: hash), hashBytes.count == 32,
+              hashBytes.base64EncodedString() == hash, access[0]["encryptedMetadata"] == nil,
               let method = information["method"] as? [String: Any],
               method["algorithm"] as? String == "AES-256-GCM", method["isStreamable"] as? Bool == true,
               let integrity = information["integrityInformation"] as? [String: Any],
@@ -59,6 +66,7 @@ public enum FairPlayKeyEnvelope {
 
     /// Public inventory digests are untrusted until the license service accepts the bound policy.
     /// Players must check the bytes before playback; the service authenticates the same inventory before a CKC.
+    /// The caller must reject duplicate ZIP names before constructing the dictionary; a dictionary cannot preserve them.
     public static func verifyInventory(manifestJSON: Data, files: [String: Data]) throws {
         let manifest = try object(manifestJSON)
         guard let information = manifest["encryptionInformation"] as? [String: Any],

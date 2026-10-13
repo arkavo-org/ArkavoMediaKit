@@ -178,6 +178,30 @@ struct FairPlayKeyEnvelopeTests {
         }
     }
 
+    @Test("only a wrapped KAS access with a canonical policy binding is admitted")
+    func invalidKeyAccess() throws {
+        let package = try make(TestKASKeyPair())
+        let original = try #require(JSONSerialization.jsonObject(with: package.manifest) as? [String: Any])
+        let mutations: [(String, Any)] = [
+            ("type", "remote"), ("protocol", "file"), ("wrappedKey", "invalid!"),
+            ("policyBinding", ["alg": "HS256", "hash": "AA=="]),
+            ("policyBinding", ["alg": "HS512", "hash": Data(repeating: 0, count: 32).base64EncodedString()]),
+            ("encryptedMetadata", "e30="),
+        ]
+        for (member, value) in mutations {
+            var manifest = original
+            var information = try #require(manifest["encryptionInformation"] as? [String: Any])
+            var accesses = try #require(information["keyAccess"] as? [[String: Any]])
+            accesses[0][member] = value
+            information["keyAccess"] = accesses
+            manifest["encryptionInformation"] = information
+            let bytes = try JSONSerialization.data(withJSONObject: manifest)
+            #expect(throws: FairPlayKeyEnvelope.Error.invalidProfile) {
+                try FairPlayKeyEnvelope.validateManifest(bytes, payload: package.payload)
+            }
+        }
+    }
+
     private func make(_ kas: TestKASKeyPair, mediaKey: Data = Data(repeating: 7, count: 16),
                       iv: Data = Data(repeating: 8, count: 16), mediaFiles: [String: Data]? = nil,
                       policyJSON: Data? = nil) throws -> FairPlayKeyEnvelope.Package {
