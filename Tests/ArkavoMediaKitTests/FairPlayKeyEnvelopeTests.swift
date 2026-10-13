@@ -202,6 +202,18 @@ struct FairPlayKeyEnvelopeTests {
         }
     }
 
+    @Test("classification validates complete JSON before inspecting a profile discriminator")
+    func unambiguousJSONObject() throws {
+        try FairPlayPolicy.validateJSONStructure(Data(#"{"body":{}}"#.utf8))
+        let invalid = [#"{"policy":"legacy","policy":"envelope"}"#, #"{"policy":{},}"#,
+                       #"{"unterminated":""#, #"[]"#, #"{"value":1e400}"#]
+        for json in invalid {
+            #expect(throws: (any Swift.Error).self) {
+                try FairPlayPolicy.validateJSONStructure(Data(json.utf8))
+            }
+        }
+    }
+
     private func make(_ kas: TestKASKeyPair, mediaKey: Data = Data(repeating: 7, count: 16),
                       iv: Data = Data(repeating: 8, count: 16), mediaFiles: [String: Data]? = nil,
                       policyJSON: Data? = nil) throws -> FairPlayKeyEnvelope.Package {

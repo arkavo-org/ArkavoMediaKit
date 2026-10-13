@@ -28,6 +28,19 @@ public enum FairPlayPolicy {
         Data("{\"uuid\":\"\(UUID().uuidString.lowercased())\",\"body\":{}}".utf8)
     }
 
+    /// Validates a complete, unambiguous UTF-8 JSON object before a client classifies an archive.
+    /// Unlike UUID validation this accepts a manifest or any object; it refuses malformed syntax,
+    /// duplicate members, trailing commas, non-finite numbers and nesting deeper than 64.
+    public static func validateJSONStructure(_ json: Data) throws {
+        guard isPlainUTF8Object(json),
+              let object = try? JSONSerialization.jsonObject(with: json) as? [String: Any]
+        else { throw Error.notJSONObject }
+        guard JSONSerialization.isValidJSONObject(object) else {
+            throw Error.unsupportedJSON("non-finite number")
+        }
+        try checkStructure(of: json)
+    }
+
     /// The policy's `uuid` exactly as written (arks compares the SPC asset id
     /// with it verbatim). Throws unless it is a lower-case canonical UUID, and
     /// refuses JSON that arks' serde_json would read differently from
