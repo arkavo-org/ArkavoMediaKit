@@ -11,6 +11,8 @@ import Foundation
 /// - Per-NAL-unit encryption with 1:9 pattern
 /// - HLS Version 7 compatible streaming
 public actor FMP4RecordingProtectionService {
+    public enum PackagingProfile: Sendable { case legacyV2, keyEnvelope }
+
     private let kasURL: URL
     private let kasPublicKeyPEM: String?
 
@@ -23,7 +25,8 @@ public actor FMP4RecordingProtectionService {
         self.kasPublicKeyPEM = kasPublicKeyPEM
     }
 
-    /// Protect video content with fMP4/CBCS encryption for FairPlay streaming, as FairPlay package profile v2
+    /// Protect video content with fMP4/CBCS encryption for FairPlay streaming.
+    /// `.keyEnvelope` writes the OpenTDF 4.3 key-envelope profile; the compatibility default is profile v2
     /// (ADR-0055 in arkavo-ios).
     ///
     /// The archive holds `manifest.json` and `master.m3u8`. For each component it holds the media playlist
@@ -39,6 +42,9 @@ public actor FMP4RecordingProtectionService {
     ///     - BOM-less UTF-8 without duplicate keys.
     ///     - Its `uuid` must be a lower-case UUID: each component's key URI is `skd://<uuid>/<id>`.
     ///     - Nil embeds `FairPlayPolicy.placeholderJSON()`, which the license service refuses (no data attributes).
+    ///   - profile: `.keyEnvelope` wraps one independent 32-byte DEK and encrypts media keys and inventory in
+    ///     `0.payload`. Requires an envelope-aware KSM and player. `.legacyV2` preserves deployed playback.
+    ///   - kasKeyID: The public-key identifier advertised by KAS, when known; written on the envelope KAO.
     /// - Returns: The TDF ZIP archive.
     /// - Throws: `FMP4ProtectionError.packagingFailed` for more than 4,093 segments, an archive over 4,294,967,295
     ///   bytes (a ZIP without ZIP64), a source whose NAL unit lengths are not 4 bytes, or a video sample of more than 42
@@ -47,7 +53,9 @@ public actor FMP4RecordingProtectionService {
     public func protectVideo(
         videoURL: URL,
         assetID: String,
-        policyJSON: Data? = nil
+        policyJSON: Data? = nil,
+        profile: PackagingProfile = .legacyV2,
+        kasKeyID: String? = nil
     ) async throws -> Data {
         let policy = policyJSON ?? FairPlayPolicy.placeholderJSON()
         let contentKeyID = try FairPlayPolicy.uuid(ofPolicyJSON: policy)
@@ -108,13 +116,6 @@ public actor FMP4RecordingProtectionService {
         } else {
             kasKey = try await manifestBuilder.fetchKASPublicKey()
         }
-        let manifest = try manifestBuilder.buildManifest(
-            componentKeys: componentKeys,
-            iv: constantIV,
-            policyJSON: policy,
-            publicKey: kasKey
-        )
-        let manifestData = try manifestBuilder.serializeManifest(manifest)
 
         // 4. The video component: one H.264 track, 1:9 pattern encrypted under the video key
         print("📦 Creating fMP4 writers with CBCS encryption...")
@@ -338,15 +339,27 @@ public actor FMP4RecordingProtectionService {
 
         // 9. Package into TDF archive (ZIP)
         print("📦 Packaging into TDF archive...")
-        let enhancedManifestData = try addFMP4Metadata(
-            to: manifestData,
-            assetID: assetID,
-            contentKeyID: contentKeyID,
-            playlistFilename: FairPlayPackage.masterPlaylistName
-        )
-        let entryNames = [FairPlayPackage.masterPlaylistName] + components.flatMap { component in
+        let enhancedManifestData: Data
+        var entryNames = [FairPlayPackage.masterPlaylistName] + components.flatMap { component in
             [FairPlayPackage.playlistName(component), FairPlayPackage.initName(component)]
                 + durations.indices.map { FairPlayPackage.segmentName(component, index: $0) }
+        }
+        if profile == .keyEnvelope {
+            let mediaFiles = try Dictionary(uniqueKeysWithValues: entryNames.map {
+                ($0, try Data(contentsOf: tempDir.appendingPathComponent($0)))
+            })
+            let envelope = try FairPlayKeyEnvelope.build(
+                componentKeys: componentKeys, iv: constantIV, assetID: assetID, policyJSON: policy,
+                mediaFiles: mediaFiles, kasURL: kasURL, publicKey: kasKey, kasKeyID: kasKeyID)
+            enhancedManifestData = envelope.manifest
+            try envelope.payload.write(to: tempDir.appendingPathComponent(FairPlayKeyEnvelope.payloadName))
+            entryNames.append(FairPlayKeyEnvelope.payloadName)
+        } else {
+            let manifest = try manifestBuilder.buildManifest(
+                componentKeys: componentKeys, iv: constantIV, policyJSON: policy, publicKey: kasKey)
+            enhancedManifestData = try addFMP4Metadata(
+                to: manifestBuilder.serializeManifest(manifest), assetID: assetID,
+                contentKeyID: contentKeyID, playlistFilename: FairPlayPackage.masterPlaylistName)
         }
         let archive = try Self.createTDFArchive(tempDir: tempDir, manifestData: enhancedManifestData,
                                                 entryNames: entryNames)
@@ -984,8 +997,8 @@ public actor FMP4RecordingProtectionService {
         return sps.isEmpty ? nil : H264Parameters(sps: sps, pps: pps, nalLengthSize: nalLengthSize)
     }
 
-    /// Add fMP4-specific metadata to manifest using TDF spec's encryptedMetadata field.
-    /// The metadata is base64-encoded JSON (unencrypted) per TDF spec allowance. No reader decides anything from it
+    /// Legacy profile v2 metadata. This historical plaintext base64 in encryptedMetadata is NOT standard OpenTDF.
+    /// The key-envelope profile never calls this helper. No legacy reader decides anything from it
     /// (ADR-0047 §2 in arkavo-ios). It names the master playlist for players that look the playlist up.
     private func addFMP4Metadata(
         to manifestData: Data,

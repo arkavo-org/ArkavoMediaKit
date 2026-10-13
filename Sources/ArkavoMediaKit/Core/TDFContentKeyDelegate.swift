@@ -96,10 +96,13 @@ public protocol FairPlayManifestProtocol: Sendable {
     /// the policy and its binding reach the license service (required by arks
     /// after PR #75), and its policy uuid is the SPC content id.
     var tdfManifestJSON: Data? { get }
+    /// Encrypted 0.payload; only the KSM decrypts this to media keys.
+    var tdfPayload: Data? { get }
 }
 
 public extension FairPlayManifestProtocol {
     var tdfManifestJSON: Data? { nil }
+    var tdfPayload: Data? { nil }
 }
 
 // MARK: - Default FairPlay Manifest Implementation
@@ -112,6 +115,7 @@ public struct FairPlayManifest: FairPlayManifestProtocol, Sendable {
     public let algorithm: String
     public let iv: String
     public let tdfManifestJSON: Data?
+    public let tdfPayload: Data?
 
     public init(
         assetID: String,
@@ -119,7 +123,8 @@ public struct FairPlayManifest: FairPlayManifestProtocol, Sendable {
         wrappedKey: String,
         algorithm: String,
         iv: String,
-        tdfManifestJSON: Data? = nil
+        tdfManifestJSON: Data? = nil,
+        tdfPayload: Data? = nil
     ) {
         self.assetID = assetID
         self.kasURL = kasURL
@@ -127,6 +132,7 @@ public struct FairPlayManifest: FairPlayManifestProtocol, Sendable {
         self.algorithm = algorithm
         self.iv = iv
         self.tdfManifestJSON = tdfManifestJSON
+        self.tdfPayload = tdfPayload
     }
 }
 
@@ -263,7 +269,22 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
 
     init(manifest: Manifest, authToken: String?, serverURL: URL, http: any FairPlayHTTP) {
         self.manifest = manifest
-        self.targets = Result { try FairPlayKeyTarget.targets(for: manifest) }
+        self.targets = Result {
+            if let payload = manifest.tdfPayload {
+                guard let json = manifest.tdfManifestJSON else {
+                    throw FairPlayKeyEnvelope.Error.invalidProfile
+                }
+                try FairPlayKeyEnvelope.validateManifest(json, payload: payload)
+            } else if let json = manifest.tdfManifestJSON,
+                      let object = try? JSONSerialization.jsonObject(with: json) as? [String: Any],
+                      let info = object["encryptionInformation"] as? [String: Any],
+                      let encoded = info["policy"] as? String, let policy = Data(base64Encoded: encoded),
+                      let policyObject = try? JSONSerialization.jsonObject(with: policy) as? [String: Any],
+                      policyObject["arkavo:fpsProfile"] != nil {
+                throw FairPlayKeyEnvelope.Error.invalidProfile
+            }
+            return try FairPlayKeyTarget.targets(for: manifest)
+        }
         self.authToken = authToken
         self.serverURL = serverURL
         self.http = http
@@ -503,6 +524,12 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
             "spcData": spcData.base64EncodedString(),
             "tdfManifest": try Self.keyRequestManifestData(for: manifest).base64EncodedString(),
         ]
+        if let payload = manifest.tdfPayload {
+            guard payload.count <= FairPlayKeyEnvelope.maximumPayloadSize else {
+                throw FairPlayError.manifestEncodingFailed("Key envelope exceeds the profile limit")
+            }
+            body["tdfPayload"] = payload.base64EncodedString()
+        }
         if let component = target.component { body["component"] = component }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
