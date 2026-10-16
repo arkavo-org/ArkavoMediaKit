@@ -15,14 +15,25 @@ public actor FMP4RecordingProtectionService {
 
     private let kasURL: URL
     private let kasPublicKeyPEM: String?
+    /// Fetches the license service's envelope key for `.keyEnvelope` when no PEM was given.
+    private let envelopeKeyHTTP: any FairPlayHTTP
 
     /// - Parameters:
-    ///   - kasURL: KAS server URL; the key access object names it and, when
-    ///     `kasPublicKeyPEM` is nil, its RSA public key is fetched from it.
-    ///   - kasPublicKeyPEM: The KAS RSA public key, when the caller already has it.
+    ///   - kasURL: KAS server root, e.g. `https://platform.arkavo.net`; the key access object names it. When
+    ///     `kasPublicKeyPEM` is nil, the wrapping key is fetched from it: for `.legacyV2` the platform KAS key
+    ///     (`kas/v2/kas_public_key`), for `.keyEnvelope` the license service's envelope key (`media/v1/envelope-key`).
+    ///   - kasPublicKeyPEM: The RSA public key to wrap to, when the caller already has it. Nothing is fetched. For
+    ///     `.keyEnvelope` it must be the license service's envelope key: an envelope wrapped to the platform KAS key
+    ///     is refused.
     public init(kasURL: URL, kasPublicKeyPEM: String? = nil) {
+        self.init(kasURL: kasURL, kasPublicKeyPEM: kasPublicKeyPEM, envelopeKeyHTTP: URLSessionFairPlayHTTP())
+    }
+
+    /// `init(kasURL:kasPublicKeyPEM:)`, fetching the envelope key through `envelopeKeyHTTP`.
+    init(kasURL: URL, kasPublicKeyPEM: String?, envelopeKeyHTTP: any FairPlayHTTP) {
         self.kasURL = kasURL
         self.kasPublicKeyPEM = kasPublicKeyPEM
+        self.envelopeKeyHTTP = envelopeKeyHTTP
     }
 
     /// Protect video content with fMP4/CBCS encryption for FairPlay streaming.
@@ -44,13 +55,18 @@ public actor FMP4RecordingProtectionService {
     ///     - Nil embeds `FairPlayPolicy.placeholderJSON()`, which the license service refuses (no data attributes).
     ///   - profile: `.keyEnvelope` wraps one independent 32-byte DEK and encrypts media keys and inventory in
     ///     the payload entry `0.payload`, which the manifest's `payload.url` names. Requires an envelope-aware KSM
-    ///     and player. `.legacyV2` preserves deployed playback.
-    ///   - kasKeyID: The public-key identifier advertised by KAS, when known; written on the envelope KAO.
+    ///     and player. Without `kasPublicKeyPEM`, it wraps the DEK to the license service's envelope key from
+    ///     `<kasURL>/media/v1/envelope-key`, never to the platform KAS key, which the license service refuses for an
+    ///     envelope. `.legacyV2` preserves deployed playback.
+    ///   - kasKeyID: The `kid` written on the envelope KAO, by which the license service picks the unwrapping key.
+    ///     It overrides the fetched envelope key's `kid`. With `kasPublicKeyPEM` it is the only `kid`: nil writes
+    ///     none. `.legacyV2` ignores it.
     /// - Returns: The TDF ZIP archive.
     /// - Throws: `FMP4ProtectionError.packagingFailed` for more than 4,093 segments, an archive over 4,294,967,295
     ///   bytes (a ZIP without ZIP64), a source whose NAL unit lengths are not 4 bytes, or a video sample of more than 42
     ///   subsamples; `unsupportedAudio` for sound that cannot be made into an audio component covering the video,
-    ///   rather than drop it.
+    ///   rather than drop it. `FairPlayEnvelopeKeyError` when `.keyEnvelope` without `kasPublicKeyPEM` gets no usable
+    ///   envelope key.
     public func protectVideo(
         videoURL: URL,
         assetID: String,
@@ -112,8 +128,14 @@ public actor FMP4RecordingProtectionService {
         print("🔐 Wrapping content keys with KAS public key...")
         let manifestBuilder = TDFManifestBuilder(kasURL: kasURL)
         let kasKey: SecKey
+        var envelopeKeyID = kasKeyID
         if let pem = kasPublicKeyPEM {
             kasKey = try manifestBuilder.publicKey(fromPEM: pem)
+        } else if profile == .keyEnvelope {
+            // The license service's KSM-only key, never the platform KAS key. The caller's kid wins over its own.
+            let envelopeKey = try await FairPlayEnvelopeKey.fetch(kasURL: kasURL, http: envelopeKeyHTTP)
+            kasKey = envelopeKey.publicKey
+            envelopeKeyID = kasKeyID ?? envelopeKey.kid
         } else {
             kasKey = try await manifestBuilder.fetchKASPublicKey()
         }
@@ -351,7 +373,7 @@ public actor FMP4RecordingProtectionService {
             })
             let envelope = try FairPlayKeyEnvelope.build(
                 componentKeys: componentKeys, iv: constantIV, assetID: assetID, policyJSON: policy,
-                mediaFiles: mediaFiles, kasURL: kasURL, publicKey: kasKey, kasKeyID: kasKeyID)
+                mediaFiles: mediaFiles, kasURL: kasURL, publicKey: kasKey, kasKeyID: envelopeKeyID)
             enhancedManifestData = envelope.manifest
             try envelope.payload.write(to: tempDir.appendingPathComponent(FairPlayKeyEnvelope.payloadName))
             entryNames.append(FairPlayKeyEnvelope.payloadName)
