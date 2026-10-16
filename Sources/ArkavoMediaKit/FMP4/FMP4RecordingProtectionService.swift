@@ -43,7 +43,8 @@ public actor FMP4RecordingProtectionService {
     ///     - Its `uuid` must be a lower-case UUID: each component's key URI is `skd://<uuid>/<id>`.
     ///     - Nil embeds `FairPlayPolicy.placeholderJSON()`, which the license service refuses (no data attributes).
     ///   - profile: `.keyEnvelope` wraps one independent 32-byte DEK and encrypts media keys and inventory in
-    ///     `0.payload`. Requires an envelope-aware KSM and player. `.legacyV2` preserves deployed playback.
+    ///     the payload entry `0.payload`, which the manifest's `payload.url` names. Requires an envelope-aware KSM
+    ///     and player. `.legacyV2` preserves deployed playback.
     ///   - kasKeyID: The public-key identifier advertised by KAS, when known; written on the envelope KAO.
     /// - Returns: The TDF ZIP archive.
     /// - Throws: `FMP4ProtectionError.packagingFailed` for more than 4,093 segments, an archive over 4,294,967,295

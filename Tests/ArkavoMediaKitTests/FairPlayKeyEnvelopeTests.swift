@@ -142,7 +142,9 @@ struct FairPlayKeyEnvelopeTests {
         }
         let manifestEntry = entries.removeValue(forKey: "manifest.json")
         let manifest = try #require(manifestEntry)
-        let payloadEntry = entries.removeValue(forKey: "0.payload")
+        let payloadName = try FairPlayKeyEnvelope.payloadEntryName(ofManifestJSON: manifest)
+        #expect(payloadName == FairPlayKeyEnvelope.payloadName)
+        let payloadEntry = entries.removeValue(forKey: payloadName)
         let payload = try #require(payloadEntry)
         try FairPlayKeyEnvelope.validateManifest(manifest, payload: payload)
         try FairPlayKeyEnvelope.verifyInventory(manifestJSON: manifest, files: entries)
@@ -175,6 +177,97 @@ struct FairPlayKeyEnvelopeTests {
                                                  serverURL: URL(string: "https://platform.arkavo.net")!, http: http)
             await delegate.handle(FakeKeyRequest("skd://6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d/video"))
             #expect(await http.calls.isEmpty)
+        }
+    }
+
+    @Test("the payload is the entry payload.url names, whatever its name; nothing binds the name")
+    func renamedPayloadReference() async throws {
+        let kas = try TestKASKeyPair()
+        let package = try make(kas)
+        let renamed = try manifest(package.manifest, settingPayload: "url", to: "payload.bin")
+        #expect(try FairPlayKeyEnvelope.payloadEntryName(ofManifestJSON: package.manifest) == "0.payload")
+        #expect(try FairPlayKeyEnvelope.payloadEntryName(ofManifestJSON: renamed) == "payload.bin")
+        try FairPlayKeyEnvelope.validateManifest(renamed, payload: package.payload)
+        // The policy binding, root signature and segment hash cover the policy and the ciphertext, not the descriptor.
+        let original = try #require(JSONSerialization.jsonObject(with: package.manifest) as? [String: Any])
+        let changed = try #require(JSONSerialization.jsonObject(with: renamed) as? [String: Any])
+        let originalInfo = try #require(original["encryptionInformation"] as? [String: Any])
+        let changedInfo = try #require(changed["encryptionInformation"] as? [String: Any])
+        #expect(NSDictionary(dictionary: originalInfo).isEqual(to: changedInfo))
+        let wrapped = try #require((originalInfo["keyAccess"] as? [[String: Any]])?.first?["wrappedKey"] as? String)
+        let dek = try TDFCrypto.data(from: TDFCrypto.unwrapSymmetricKeyWithRSA(privateKeyPEM: kas.privateKeyPEM,
+                                                                              wrappedKey: wrapped))
+
+        // An archive whose payload entry is payload.bin: the reader takes that entry and leaves the media.
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for (name, bytes) in files { try bytes.write(to: directory.appendingPathComponent(name)) }
+        try package.payload.write(to: directory.appendingPathComponent("payload.bin"))
+        let archive = try FMP4RecordingProtectionService.createTDFArchive(
+            tempDir: directory, manifestData: renamed, entryNames: files.keys.sorted() + ["payload.bin"])
+        let zip = try Archive(data: archive, accessMode: .read)
+        var entries: [String: Data] = [:]
+        for entry in zip {
+            var bytes = Data()
+            _ = try zip.extract(entry) { bytes.append($0) }
+            entries[entry.path] = bytes
+        }
+        let manifestEntry = entries.removeValue(forKey: FairPlayPackage.manifestName)
+        let archived = try #require(manifestEntry)
+        #expect(entries[FairPlayKeyEnvelope.payloadName] == nil)
+        // Leaving the named entry among the media fails: it is neither served nor in the inventory.
+        #expect(throws: FairPlayKeyEnvelope.Error.invalidInventory) {
+            try FairPlayKeyEnvelope.verifyInventory(manifestJSON: archived, files: entries)
+        }
+        let payloadName = try FairPlayKeyEnvelope.payloadEntryName(ofManifestJSON: archived)
+        let payloadEntry = entries.removeValue(forKey: payloadName)
+        let payload = try #require(payloadEntry)
+        try FairPlayKeyEnvelope.validateManifest(archived, payload: payload)
+        try FairPlayKeyEnvelope.verifyInventory(manifestJSON: archived, files: entries)
+        let plaintext = try AES.GCM.open(AES.GCM.SealedBox(combined: payload), using: SymmetricKey(data: dek))
+        let envelope = try #require(JSONSerialization.jsonObject(with: plaintext) as? [String: Any])
+        #expect(envelope["profile"] as? String == FairPlayKeyEnvelope.profile)
+
+        // The delegate admits it and sends the payload bytes, not a name.
+        let http = FakeMediaService()
+        let delegate = TDFContentKeyDelegate(
+            manifest: FairPlayManifest(assetID: "asset", kasURL: "https://platform.arkavo.net", wrappedKey: "",
+                                       algorithm: "AES-256-GCM", iv: "", tdfManifestJSON: archived, tdfPayload: payload),
+            authToken: nil, serverURL: URL(string: "https://platform.arkavo.net")!, http: http)
+        await delegate.handle(FakeKeyRequest("skd://6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d/video"))
+        let calls = await http.calls
+        let keyRequest = try #require(calls.first { $0.route == "POST key-request" })
+        #expect(keyRequest.body["tdfPayload"] == payload.base64EncodedString())
+    }
+
+    @Test("a payload reference to no usable root-level entry is refused")
+    func unusablePayloadReference() throws {
+        #expect(FairPlayKeyEnvelope.isPayloadEntryName("0.payload"))
+        #expect(FairPlayKeyEnvelope.isPayloadEntryName("payload.bin"))
+        let unusable = ["", ".", "..", "dir/x", "../x", "/0.payload", #"dir\x"#, "manifest.json", "master.m3u8",
+                        "video.m3u8", "audio.m3u8", "video-init.mp4", "audio-init.mp4", "video-segment0.m4s"]
+        for name in unusable {
+            #expect(!FairPlayKeyEnvelope.isPayloadEntryName(name), "\(name)")
+        }
+        let package = try make(TestKASKeyPair())
+        var mutations: [(String, Any?)] = unusable.map { ("url", $0) }
+        mutations += [("url", 7), ("url", ["0.payload"]), ("url", nil), ("type", "remote"), ("protocol", "https"),
+                      ("isEncrypted", false), ("isEncrypted", nil)]
+        for (member, value) in mutations {
+            let bytes = try manifest(package.manifest, settingPayload: member, to: value)
+            #expect(throws: FairPlayKeyEnvelope.Error.invalidPayloadReference, "\(member): \(String(describing: value))") {
+                try FairPlayKeyEnvelope.payloadEntryName(ofManifestJSON: bytes)
+            }
+            #expect(throws: FairPlayKeyEnvelope.Error.invalidPayloadReference, "\(member): \(String(describing: value))") {
+                try FairPlayKeyEnvelope.validateManifest(bytes, payload: package.payload)
+            }
+        }
+        var root = try #require(JSONSerialization.jsonObject(with: package.manifest) as? [String: Any])
+        root["payload"] = "0.payload"
+        let flattened = try JSONSerialization.data(withJSONObject: root)
+        #expect(throws: FairPlayKeyEnvelope.Error.invalidPayloadReference) {
+            try FairPlayKeyEnvelope.payloadEntryName(ofManifestJSON: flattened)
         }
     }
 
@@ -212,6 +305,15 @@ struct FairPlayKeyEnvelopeTests {
                 try FairPlayPolicy.validateJSONStructure(Data(json.utf8))
             }
         }
+    }
+
+    /// The manifest with `payload.<member>` set to `value`, or removed for nil.
+    private func manifest(_ manifest: Data, settingPayload member: String, to value: Any?) throws -> Data {
+        var root = try #require(JSONSerialization.jsonObject(with: manifest) as? [String: Any])
+        var descriptor = try #require(root["payload"] as? [String: Any])
+        descriptor[member] = value
+        root["payload"] = descriptor
+        return try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys, .withoutEscapingSlashes])
     }
 
     private func make(_ kas: TestKASKeyPair, mediaKey: Data = Data(repeating: 7, count: 16),

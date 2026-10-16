@@ -6,12 +6,17 @@ import Security
 /// Media remains CBCS encrypted; the payload uses an independent 256-bit AES-GCM key.
 public enum FairPlayKeyEnvelope {
     public static let profile = "urn:arkavo:fairplay:key-envelope:1"
+    /// The payload entry `build` names in `payload.url`. Readers locate the payload by the manifest's
+    /// `payload.url` (`payloadEntryName(ofManifestJSON:)`): OpenTDF gives `0.payload` only as an example.
     public static let payloadName = "0.payload"
     public static let maximumPayloadSize = 2_097_180
     public static let maximumFiles = 8_191
 
     public enum Error: Swift.Error, Equatable {
         case invalidInventory, reservedPolicyMember, oversizedPayload, invalidIV, invalidProfile, invalidAssetID
+        /// The manifest's `payload` is not a zip `reference` to an encrypted, usable payload entry
+        /// (`isPayloadEntryName(_:)`).
+        case invalidPayloadReference
     }
 
     public struct Package: Sendable {
@@ -19,14 +24,28 @@ public enum FairPlayKeyEnvelope {
         public let payload: Data
     }
 
+    /// Whether `name` can be the payload entry: one root-level archive entry, distinct from the manifest and
+    /// the served media. Non-empty, not `.` or `..`, without `/` or `\`, not `FairPlayPackage.manifestName`,
+    /// and not a name `FairPlayPackage.isServed(_:)` accepts.
+    public static func isPayloadEntryName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." && !name.contains("/") && !name.contains("\\")
+            && name != FairPlayPackage.manifestName && !FairPlayPackage.isServed(name)
+    }
+
+    /// The archive entry holding the payload: the manifest's `payload.url` (OpenTDF payload reference). Requires
+    /// `type: reference`, `protocol: zip`, `isEncrypted: true` and a url `isPayloadEntryName(_:)` accepts.
+    /// `validateManifest(_:payload:)` remains the envelope check.
+    public static func payloadEntryName(ofManifestJSON manifestJSON: Data) throws -> String {
+        try payloadEntryName(in: object(manifestJSON))
+    }
+
     /// Validate the public envelope shape before contacting a license service. This does not
     /// authenticate policy/root bindings: only the KSM can do that with the unwrapped DEK.
+    /// `payload` is the bytes of the entry `payloadEntryName(ofManifestJSON:)` names.
     public static func validateManifest(_ manifestJSON: Data, payload: Data) throws {
         let manifest = try object(manifestJSON)
+        _ = try payloadEntryName(in: manifest)
         guard manifest["schemaVersion"] as? String == "4.3.0",
-              let descriptor = manifest["payload"] as? [String: Any],
-              descriptor["type"] as? String == "reference", descriptor["url"] as? String == payloadName,
-              descriptor["protocol"] as? String == "zip", descriptor["isEncrypted"] as? Bool == true,
               let information = manifest["encryptionInformation"] as? [String: Any],
               information["type"] as? String == "split",
               let access = information["keyAccess"] as? [[String: Any]], access.count == 1,
@@ -66,7 +85,9 @@ public enum FairPlayKeyEnvelope {
 
     /// Public inventory digests are untrusted until the license service accepts the bound policy.
     /// Players must check the bytes before playback; the service authenticates the same inventory before a CKC.
-    /// The caller must reject duplicate ZIP names before constructing the dictionary; a dictionary cannot preserve them.
+    /// `files` is every archive entry but `manifest.json` and the payload entry `payloadEntryName(ofManifestJSON:)`
+    /// names. The caller must reject duplicate ZIP names before constructing the dictionary; a dictionary cannot
+    /// preserve them.
     public static func verifyInventory(manifestJSON: Data, files: [String: Data]) throws {
         let manifest = try object(manifestJSON)
         guard let information = manifest["encryptionInformation"] as? [String: Any],
@@ -152,6 +173,15 @@ public enum FairPlayKeyEnvelope {
             ],
         ]
         return Package(manifest: try json(manifest), payload: payload)
+    }
+
+    private static func payloadEntryName(in manifest: [String: Any]) throws -> String {
+        guard let descriptor = manifest["payload"] as? [String: Any],
+              descriptor["type"] as? String == "reference", descriptor["protocol"] as? String == "zip",
+              descriptor["isEncrypted"] as? Bool == true,
+              let name = descriptor["url"] as? String, isPayloadEntryName(name)
+        else { throw Error.invalidPayloadReference }
+        return name
     }
 
     private static func object(_ data: Data) throws -> [String: Any] {

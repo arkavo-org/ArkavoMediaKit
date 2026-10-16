@@ -96,7 +96,8 @@ public protocol FairPlayManifestProtocol: Sendable {
     /// the policy and its binding reach the license service (required by arks
     /// after PR #75), and its policy uuid is the SPC content id.
     var tdfManifestJSON: Data? { get }
-    /// Encrypted 0.payload; only the KSM decrypts this to media keys.
+    /// The encrypted payload entry the manifest's `payload.url` names (`FairPlayKeyEnvelope.payloadEntryName`;
+    /// the writer uses `0.payload`). Only the KSM decrypts this to media keys.
     var tdfPayload: Data? { get }
 }
 
