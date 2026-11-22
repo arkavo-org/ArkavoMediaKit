@@ -1,14 +1,18 @@
 import Foundation
 import Security
+import Synchronization
 
 // MARK: - TDF Manifest Builder
 
 /// Builds OpenTDF Standard TDF manifests for FairPlay key delivery
-public final class TDFManifestBuilder {
+public final class TDFManifestBuilder: Sendable {
+    /// Maximum allowed response size for KAS public key fetch (64 KiB)
+    private static let maxPublicKeyResponseBytes = 64 * 1024
+
     // MARK: - Types
 
     /// TDF Manifest structure matching OpenTDF Standard TDF specification
-    public struct Manifest: Codable {
+    public struct Manifest: Codable, Sendable {
         public let encryptionInformation: EncryptionInformation
         public let payload: Payload?
 
@@ -18,7 +22,7 @@ public final class TDFManifestBuilder {
         }
     }
 
-    public struct EncryptionInformation: Codable {
+    public struct EncryptionInformation: Codable, Sendable {
         public let type: String
         public let keyAccess: [KeyAccess]
         public let method: EncryptionMethod
@@ -37,7 +41,7 @@ public final class TDFManifestBuilder {
         }
     }
 
-    public struct KeyAccess: Codable {
+    public struct KeyAccess: Codable, Sendable {
         public let type: String
         public let url: String
         public let `protocol`: String
@@ -58,7 +62,7 @@ public final class TDFManifestBuilder {
         }
     }
 
-    public struct PolicyBinding: Codable {
+    public struct PolicyBinding: Codable, Sendable {
         public let alg: String
         public let hash: String
 
@@ -68,7 +72,7 @@ public final class TDFManifestBuilder {
         }
     }
 
-    public struct EncryptionMethod: Codable {
+    public struct EncryptionMethod: Codable, Sendable {
         public let algorithm: String
         public let iv: String
         public let isStreamable: Bool?
@@ -98,7 +102,7 @@ public final class TDFManifestBuilder {
         }
     }
 
-    public struct IntegrityInformation: Codable {
+    public struct IntegrityInformation: Codable, Sendable {
         public let rootSignature: RootSignature
         public let segmentHashAlg: String
         public let segments: [Segment]?
@@ -114,7 +118,7 @@ public final class TDFManifestBuilder {
         }
     }
 
-    public struct RootSignature: Codable {
+    public struct RootSignature: Codable, Sendable {
         public let alg: String
         public let sig: String
 
@@ -124,13 +128,13 @@ public final class TDFManifestBuilder {
         }
     }
 
-    public struct Segment: Codable {
+    public struct Segment: Codable, Sendable {
         public let hash: String
         public let segmentSize: Int?
         public let encryptedSegmentSize: Int?
     }
 
-    public struct Payload: Codable {
+    public struct Payload: Codable, Sendable {
         public let type: String
         public let url: String?
         public let `protocol`: String
@@ -151,42 +155,71 @@ public final class TDFManifestBuilder {
 
     // MARK: - Properties
 
+    private struct KeyCacheBox: @unchecked Sendable {
+        var key: SecKey?
+    }
+
     private let kasURL: URL
-    private var kasPublicKey: SecKey?
+    private let urlSession: URLSession?
+    private let keyCache = Mutex(KeyCacheBox())
 
     // MARK: - Initialization
 
     /// Initialize with KAS URL
     public init(kasURL: URL) {
         self.kasURL = kasURL
+        self.urlSession = nil
+    }
+
+    /// Internal initializer allowing custom URLSession injection in tests
+    init(kasURL: URL, urlSession: URLSession) {
+        self.kasURL = kasURL
+        self.urlSession = urlSession
     }
 
     // MARK: - Public Key Fetching
 
-    /// Fetch KAS RSA public key from server
+    /// Fetch KAS RSA public key from server (requires HTTPS, refuses redirects)
     public func fetchKASPublicKey() async throws -> SecKey {
-        if let existing = kasPublicKey {
+        if let existing = keyCache.withLock({ $0.key }) {
             return existing
         }
 
-        let url = kasURL.appendingPathComponent("kas/v2/kas_public_key")
-        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
-        components.queryItems = [URLQueryItem(name: "algorithm", value: "rsa:2048")]
+        guard kasURL.scheme?.lowercased() == "https",
+              let host = kasURL.host, !host.isEmpty
+        else {
+            throw TDFError.publicKeyFetchFailed
+        }
 
-        var request = URLRequest(url: components.url!)
+        let url = kasURL.appendingPathComponent("kas/v2/kas_public_key")
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            throw TDFError.publicKeyFetchFailed
+        }
+        components.queryItems = [URLQueryItem(name: "algorithm", value: "rsa:2048")]
+        guard let requestURL = components.url else {
+            throw TDFError.publicKeyFetchFailed
+        }
+
+        var request = URLRequest(url: requestURL)
         // KAS advertises `alt-svc: h3`; opt the first hop into HTTP/3 (falls back to HTTP/2).
         request.assumesHTTP3Capable = true
         request.httpMethod = "GET"
+        request.timeoutInterval = 30
+        request.cachePolicy = .reloadIgnoringLocalCacheData
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let session = urlSession ?? URLSession.shared
+        let (data, response) = try await session.data(for: request, delegate: RedirectRefusal())
 
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw TDFError.publicKeyFetchFailed
         }
+        guard data.count <= Self.maxPublicKeyResponseBytes else {
+            throw TDFError.invalidPublicKeyFormat
+        }
 
         // Parse response - expects PEM or JSON with public key
         let key = try parsePublicKeyResponse(data)
-        kasPublicKey = key
+        keyCache.withLock { $0.key = key }
         return key
     }
 
@@ -218,6 +251,7 @@ public final class TDFManifestBuilder {
 
         var error: Unmanaged<CFError>?
         guard let secKey = SecKeyCreateWithData(keyData as CFData, attributes as CFDictionary, &error) else {
+            _ = error?.takeRetainedValue()
             throw TDFError.invalidPublicKeyFormat
         }
 
@@ -235,7 +269,7 @@ public final class TDFManifestBuilder {
     /// END line (or the end of the text, when the END line is missing). RFC 7468
     /// lets text surround the block and whitespace sit in the body. Text with
     /// no BEGIN line is taken as bare base64.
-    private static func pemBody(_ pem: String) -> String {
+    static func pemBody(_ pem: String) -> String {
         guard let begin = pem.range(of: "-----BEGIN ") else { return pem }
         guard let labelEnd = pem.range(of: "-----", range: begin.upperBound ..< pem.endIndex),
               ["PUBLIC KEY", "RSA PUBLIC KEY"].contains(pem[begin.upperBound ..< labelEnd.lowerBound])
@@ -266,6 +300,7 @@ public final class TDFManifestBuilder {
 
         var error: Unmanaged<CFError>?
         guard let wrappedData = SecKeyCreateEncryptedData(publicKey, algorithm, contentKey as CFData, &error) else {
+            _ = error?.takeRetainedValue()
             throw TDFError.keyWrappingFailed
         }
 
@@ -327,6 +362,10 @@ public final class TDFManifestBuilder {
         policyJSON: Data,
         publicKey: SecKey
     ) throws -> Manifest {
+        guard iv.count == 16 else {
+            throw TDFError.invalidIVSize
+        }
+        try FairPlayPolicy.validateJSONStructure(policyJSON)
         let wrappedKey = try wrapKey(contentKey, with: publicKey)
         let policyBase64 = policyJSON.base64EncodedString()
         let keyAccess = KeyAccess(
@@ -352,6 +391,9 @@ public final class TDFManifestBuilder {
         policyJSON: Data,
         publicKey: SecKey
     ) throws -> Manifest {
+        guard iv.count == 16 else {
+            throw TDFError.invalidIVSize
+        }
         let policyBase64 = try FairPlayComponents.insert(componentKeys, intoPolicyJSON: policyJSON).base64EncodedString()
         let keyAccess = try componentKeys.map { componentKey in
             KeyAccess(
@@ -378,10 +420,11 @@ public final class TDFManifestBuilder {
 
     // MARK: - Errors
 
-    public enum TDFError: Error, LocalizedError {
+    public enum TDFError: Error, LocalizedError, Equatable, Sendable {
         case publicKeyFetchFailed
         case invalidPublicKeyFormat
         case invalidKeySize
+        case invalidIVSize
         case unsupportedAlgorithm
         case keyWrappingFailed
         case manifestSerializationFailed
@@ -395,6 +438,8 @@ public final class TDFManifestBuilder {
                 return "Invalid public key format"
             case .invalidKeySize:
                 return "Content key must be 16 or 32 bytes"
+            case .invalidIVSize:
+                return "Initialization vector must be 16 bytes"
             case .unsupportedAlgorithm:
                 return "RSA-OAEP algorithm not supported"
             case .keyWrappingFailed:

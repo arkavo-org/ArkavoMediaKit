@@ -132,14 +132,18 @@ public actor HLSTDFPackager {
         originalDurations: [Double],
         segmentCount: Int
     ) -> String {
+        let maxDuration = originalDurations.filter { $0.isFinite && $0 > 0 }.max() ?? 6.0
         var playlist = "#EXTM3U\n"
         playlist += "#EXT-X-VERSION:3\n"
-        playlist += "#EXT-X-TARGETDURATION:\(Int(ceil(originalDurations.max() ?? 6.0)))\n"
+        playlist += "#EXT-X-TARGETDURATION:\(max(1, Int(ceil(maxDuration))))\n"
         playlist += "#EXT-X-MEDIA-SEQUENCE:0\n"
-        playlist += "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n"
+        // Segments in an HLS TDF archive are encrypted at the archive layer and decrypted by
+        // HLSResourceLoaderDelegate / HLSTDFExtractor; do not emit an unauthenticated #EXT-X-KEY
+        // without IV that would trigger double-decryption in AVPlayer.
 
         for i in 0..<segmentCount {
-            let duration = i < originalDurations.count ? originalDurations[i] : 6.0
+            let rawDuration = i < originalDurations.count ? originalDurations[i] : 6.0
+            let duration = (rawDuration.isFinite && rawDuration > 0) ? rawDuration : 6.0
             playlist += "#EXTINF:\(String(format: "%.3f", duration)),\n"
             playlist += "segments/\(i).enc\n"
         }

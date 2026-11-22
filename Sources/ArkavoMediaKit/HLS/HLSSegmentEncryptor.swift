@@ -49,6 +49,10 @@ public actor HLSSegmentEncryptor {
         segmentIndex: Int,
         duration: Double
     ) async throws -> (tdfData: Data, metadata: SegmentMetadata) {
+        guard segmentIndex >= 0, duration.isFinite, duration >= 0 else {
+            throw EncryptorError.invalidData
+        }
+
         // Create crypto instance
         let crypto = try StandardTDFSegmentCrypto(
             kasURL: kasURL,
@@ -68,15 +72,21 @@ public actor HLSSegmentEncryptor {
         let reader = try TDFArchiveReader(data: tdfData)
         let manifest = try reader.manifest()
 
-        // Create segment URL pointing to .tdf file
-        let segmentURL = URL(string: "https://cdn.arkavo.net/\(assetID)/segment_\(segmentIndex).tdf")!
+        // Create segment URL pointing to .tdf file without force-unwrapping
+        var urlComponents = URLComponents()
+        urlComponents.scheme = "https"
+        urlComponents.host = "cdn.arkavo.net"
+        urlComponents.path = "/\(assetID)/segment_\(segmentIndex).tdf"
+        guard let segmentURL = urlComponents.url else {
+            throw EncryptorError.invalidData
+        }
 
         // Encode manifest as base64 for embedding in HLS playlist
         let manifestData = try JSONEncoder().encode(manifest)
         let manifestBase64 = manifestData.base64EncodedString()
 
-        // Extract IV from manifest for HLS compatibility
-        let iv = extractIV(from: manifest)
+        // Extract IV from manifest for HLS compatibility (fail closed if missing/invalid)
+        let iv = try extractIV(from: manifest)
 
         // Create metadata
         let metadata = SegmentMetadata(
@@ -159,18 +169,17 @@ public actor HLSSegmentEncryptor {
 
     // MARK: - Private Helpers
 
-    private func extractIV(from manifest: TDFManifest) -> Data {
-        // Extract IV from manifest for HLS #EXT-X-KEY directive
-        // In OpenTDFKit, encryptionInformation and method are non-optional
+    private func extractIV(from manifest: TDFManifest) throws -> Data {
+        // Extract IV from manifest for HLS #EXT-X-KEY directive; never fabricate a random IV on decode failure
         let encInfo = manifest.encryptionInformation
         let method = encInfo.method
         let ivString = method.iv
 
-        guard let iv = Data(base64Encoded: ivString) else {
-            // Generate random IV if base64 decode fails (fallback)
-            var ivData = Data(count: 12)
-            _ = ivData.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 12, $0.baseAddress!) }
-            return ivData
+        guard !ivString.isEmpty,
+              let iv = Data(base64Encoded: ivString),
+              !iv.isEmpty
+        else {
+            throw EncryptorError.invalidHeader
         }
         return iv
     }

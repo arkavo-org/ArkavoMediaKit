@@ -60,11 +60,14 @@ public actor StandardTDFKeyProvider {
     ) async throws -> KeyAccessResponse {
         let startTime = Date()
 
-        // Validate session exists and is active
+        // Validate session exists, is active, and belongs to this user and asset
         let session = try await sessionManager.getSession(sessionID: request.sessionID)
+        guard session.userID == request.userID, session.assetID == request.assetID else {
+            throw KeyProviderError.sessionInvalid
+        }
 
         // Get current active stream count for concurrency check
-        let activeStreams = await sessionManager.getActiveStreamCount(userID: request.userID)
+        let activeStreams = await sessionManager.getActiveStreamCount(userID: session.userID)
 
         // Validate policy
         try policy.validate(
@@ -87,11 +90,9 @@ public actor StandardTDFKeyProvider {
             throw KeyProviderError.missingWrappedKey
         }
         let wrappedKey = keyAccess.wrappedKey
-
-        // For now, return the wrapped key as-is
-        // In production, would send to KAS for rewrap with user's ephemeral public key
-        // KAS flow: manifest + ephemeral_pubkey → KAS validates policy → rewraps DEK → returns
-        let wrappedKeyData = Data(wrappedKey.utf8).base64EncodedString()
+        guard let decodedWrappedKey = Data(base64Encoded: wrappedKey), !decodedWrappedKey.isEmpty else {
+            throw KeyProviderError.invalidTDFManifest
+        }
 
         // Calculate latency
         let latencyMS = Int(Date().timeIntervalSince(startTime) * 1000)
@@ -103,7 +104,7 @@ public actor StandardTDFKeyProvider {
         )
 
         return KeyAccessResponse(
-            wrappedKey: wrappedKeyData,
+            wrappedKey: wrappedKey,
             metadata: .init(
                 segmentIndex: request.segmentIndex,
                 expiresAt: nil,
@@ -170,9 +171,10 @@ public actor StandardTDFKeyProvider {
             segments: []
         )
 
+        let randomIV = try TDFCrypto.randomBytes(count: 12)
         let method = TDFMethodDescriptor(
             algorithm: "AES-256-GCM",
-            iv: Data(count: 12).base64EncodedString(), // Placeholder IV
+            iv: randomIV.base64EncodedString(),
             isStreamable: true
         )
 
@@ -231,6 +233,15 @@ public actor StandardTDFKeyProvider {
         let wrappedKey = keyAccess.wrappedKey
 
         if useKASRewrap {
+            // Prevent SSRF and OAuth token exfiltration via an untrusted manifest keyAccess.url
+            try validateKasURL(keyAccess.url)
+            guard let manifestKASURL = URL(string: keyAccess.url),
+                  let manifestOrigin = StandardTDFKASKeyClient.origin(of: manifestKASURL),
+                  let configuredOrigin = StandardTDFKASKeyClient.origin(of: kasURL),
+                  manifestOrigin == configuredOrigin
+            else {
+                throw StandardTDFKASKeyClientError.untrustedKASOrigin(keyAccess.url)
+            }
             guard let authToken = await authTokenProvider?(), !authToken.isEmpty else {
                 throw KeyProviderError.notAuthenticated
             }
@@ -241,10 +252,32 @@ public actor StandardTDFKeyProvider {
                 throw KeyProviderError.noPrivateKey
             }
 
-            return try TDFCrypto.unwrapSymmetricKeyWithRSA(
+            let dek = try TDFCrypto.unwrapSymmetricKeyWithRSA(
                 privateKeyPEM: privateKeyPEM,
                 wrappedKey: wrappedKey
             )
+
+            // Verify policyBinding against the unwrapped DEK to prevent policy substitution
+            if !encInfo.policy.isEmpty {
+                guard keyAccess.policyBinding.alg == "HS256" else {
+                    throw KeyProviderError.policyValidationFailed("Unsupported policyBinding algorithm")
+                }
+                let expected = Data(HMAC<SHA256>.authenticationCode(
+                    for: Data(encInfo.policy.utf8),
+                    using: dek
+                ))
+                guard let actual = Data(base64Encoded: keyAccess.policyBinding.hash),
+                      actual.count == expected.count
+                else {
+                    throw KeyProviderError.policyValidationFailed("Policy binding verification failed")
+                }
+                let diff = zip(actual, expected).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) }
+                guard diff == 0 else {
+                    throw KeyProviderError.policyValidationFailed("Policy binding verification failed")
+                }
+            }
+
+            return dek
         }
     }
 

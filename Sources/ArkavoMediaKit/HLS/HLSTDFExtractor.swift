@@ -10,20 +10,55 @@ import ZIPFoundation
 /// - m3u8 playlist
 /// - Encrypted video segments
 public actor HLSTDFExtractor {
+    /// Default ZIP extraction limits to prevent ZIP bomb OOM DoS attacks
+    public struct ExtractionLimits: Sendable {
+        public let maxManifestBytes: Int
+        public let maxPlaylistBytes: Int
+        public let maxSegmentBytes: Int
+        public let maxTotalBytes: Int
+        public let maxSegmentCount: Int
+
+        public static let `default` = ExtractionLimits(
+            maxManifestBytes: 1 * 1024 * 1024,
+            maxPlaylistBytes: 1 * 1024 * 1024,
+            maxSegmentBytes: 64 * 1024 * 1024,
+            maxTotalBytes: 512 * 1024 * 1024,
+            maxSegmentCount: 4_096
+        )
+
+        public init(
+            maxManifestBytes: Int = 1 * 1024 * 1024,
+            maxPlaylistBytes: Int = 1 * 1024 * 1024,
+            maxSegmentBytes: Int = 64 * 1024 * 1024,
+            maxTotalBytes: Int = 512 * 1024 * 1024,
+            maxSegmentCount: Int = 4_096
+        ) {
+            self.maxManifestBytes = max(1, maxManifestBytes)
+            self.maxPlaylistBytes = max(1, maxPlaylistBytes)
+            self.maxSegmentBytes = max(1, maxSegmentBytes)
+            self.maxTotalBytes = max(1, maxTotalBytes)
+            self.maxSegmentCount = max(1, maxSegmentCount)
+        }
+    }
+
     private let kasURL: URL
     private let kasPublicKeyPEM: String?
+    private let limits: ExtractionLimits
 
     /// Initialize with optional KAS configuration for key unwrapping
     ///
     /// - Parameters:
-    ///   - kasURL: KAS server URL for key unwrapping
+    ///   - kasURL: Trusted KAS server URL for key unwrapping
     ///   - kasPublicKeyPEM: KAS RSA public key (optional, for offline decryption)
+    ///   - limits: Size and count caps applied during ZIP extraction
     public init(
         kasURL: URL,
-        kasPublicKeyPEM: String? = nil
+        kasPublicKeyPEM: String? = nil,
+        limits: ExtractionLimits = .default
     ) {
         self.kasURL = kasURL
         self.kasPublicKeyPEM = kasPublicKeyPEM
+        self.limits = limits
     }
 
     /// Extract HLS content from TDF archive to local directory
@@ -32,54 +67,67 @@ public actor HLSTDFExtractor {
     ///   - tdfData: TDF archive data
     ///   - outputDirectory: Directory to extract HLS content
     /// - Returns: LocalHLSAsset with extracted content locations
-    /// - Throws: HLSTDFExtractorError if extraction fails
+    /// - Throws: HLSTDFExtractorError if extraction fails or archive violates security limits
     public func extract(
         tdfData: Data,
         outputDirectory: URL
     ) async throws -> LocalHLSAsset {
-        // Create output directory
+        // Open TDF archive
+        let archive = try Archive(data: tdfData, accessMode: .read)
+
+        // Reject any archive containing symlinks or path-traversal entries up front
+        for entry in archive {
+            if entry.type == .symlink {
+                throw HLSTDFExtractorError.unsupportedEntryType(entry.path)
+            }
+            if entry.path.contains("..") || entry.path.hasPrefix("/") || entry.path.contains("\\") {
+                throw HLSTDFExtractorError.invalidArchive
+            }
+        }
+
+        var remainingTotal = limits.maxTotalBytes
+
+        // Extract manifest.json with size cap and file-type verification
+        guard let manifestEntry = archive["manifest.json"] else {
+            throw HLSTDFExtractorError.missingManifest
+        }
+        let manifestData = try extractBoundedFile(
+            from: archive,
+            entry: manifestEntry,
+            maxBytes: limits.maxManifestBytes,
+            remainingTotal: &remainingTotal
+        )
+
+        // Parse and validate manifest before creating files on disk
+        let manifest = try parseManifest(manifestData)
+
+        // Extract playlist.m3u8 with size cap and file-type verification
+        guard let playlistEntry = archive["playlist.m3u8"] else {
+            throw HLSTDFExtractorError.missingPlaylist
+        }
+        let playlistData = try extractBoundedFile(
+            from: archive,
+            entry: playlistEntry,
+            maxBytes: limits.maxPlaylistBytes,
+            remainingTotal: &remainingTotal
+        )
+
+        // Create output directories
         try FileManager.default.createDirectory(
             at: outputDirectory,
             withIntermediateDirectories: true
         )
 
-        // Open TDF archive
-        let archive = try Archive(data: tdfData, accessMode: .read)
-
-        // Extract manifest.json
-        guard let manifestEntry = archive["manifest.json"] else {
-            throw HLSTDFExtractorError.missingManifest
-        }
-
-        var manifestData = Data()
-        _ = try archive.extract(manifestEntry) { data in
-            manifestData.append(data)
-        }
-
-        // Parse manifest
-        let manifest = try parseManifest(manifestData)
-
-        // Extract playlist.m3u8
-        guard let playlistEntry = archive["playlist.m3u8"] else {
-            throw HLSTDFExtractorError.missingPlaylist
-        }
-
-        var playlistData = Data()
-        _ = try archive.extract(playlistEntry) { data in
-            playlistData.append(data)
-        }
-
         let playlistURL = outputDirectory.appendingPathComponent("playlist.m3u8")
         try playlistData.write(to: playlistURL)
 
-        // Create segments directory
         let segmentsDir = outputDirectory.appendingPathComponent("segments")
         try FileManager.default.createDirectory(
             at: segmentsDir,
             withIntermediateDirectories: true
         )
 
-        // Extract encrypted segments
+        // Extract encrypted segments with bounded sizes and segment count cap
         var segmentURLs: [URL] = []
         var index = 0
 
@@ -88,11 +136,16 @@ public actor HLSTDFExtractor {
             guard let segmentEntry = archive[segmentPath] else {
                 break
             }
-
-            var segmentData = Data()
-            _ = try archive.extract(segmentEntry) { data in
-                segmentData.append(data)
+            guard index < limits.maxSegmentCount else {
+                throw HLSTDFExtractorError.entryTooLarge(segmentPath)
             }
+
+            let segmentData = try extractBoundedFile(
+                from: archive,
+                entry: segmentEntry,
+                maxBytes: limits.maxSegmentBytes,
+                remainingTotal: &remainingTotal
+            )
 
             let segmentURL = segmentsDir.appendingPathComponent("\(index).enc")
             try segmentData.write(to: segmentURL)
@@ -117,6 +170,43 @@ public actor HLSTDFExtractor {
         )
     }
 
+    private func extractBoundedFile(
+        from archive: Archive,
+        entry: Entry,
+        maxBytes: Int,
+        remainingTotal: inout Int
+    ) throws -> Data {
+        guard entry.type == .file else {
+            throw HLSTDFExtractorError.unsupportedEntryType(entry.path)
+        }
+        let allowedBytes = min(maxBytes, remainingTotal)
+        guard allowedBytes >= 0, entry.uncompressedSize <= UInt64(allowedBytes) else {
+            throw HLSTDFExtractorError.entryTooLarge(entry.path)
+        }
+
+        var output = Data()
+        output.reserveCapacity(min(Int(entry.uncompressedSize), allowedBytes))
+        var exceeded = false
+        do {
+            _ = try archive.extract(entry) { chunk in
+                if output.count + chunk.count > allowedBytes {
+                    exceeded = true
+                    throw HLSTDFExtractorError.entryTooLarge(entry.path)
+                }
+                output.append(chunk)
+            }
+        } catch let error as HLSTDFExtractorError {
+            throw error
+        } catch {
+            if exceeded {
+                throw HLSTDFExtractorError.entryTooLarge(entry.path)
+            }
+            throw error
+        }
+        remainingTotal -= output.count
+        return output
+    }
+
     /// Decrypt a segment using the wrapped key from manifest
     ///
     /// - Parameters:
@@ -125,16 +215,35 @@ public actor HLSTDFExtractor {
     ///   - symmetricKey: Decryption key (from KAS unwrap or cache)
     ///   - manifest: TDF manifest with encryption info
     /// - Returns: Decrypted segment data
-    /// - Throws: HLSTDFExtractorError if decryption fails
+    /// - Throws: HLSTDFExtractorError if decryption or integrity validation fails
     public func decryptSegment(
         segmentData: Data,
         segmentIndex: Int,
         symmetricKey: SymmetricKey,
         manifest: HLSManifest
     ) throws -> Data {
-        // Get IV for this segment
-        guard segmentIndex < manifest.segmentIVs.count else {
+        // Bounds-check segmentIndex against negative and out-of-range indices
+        guard segmentIndex >= 0, segmentIndex < manifest.segmentIVs.count else {
             throw HLSTDFExtractorError.segmentIVNotFound(index: segmentIndex)
+        }
+
+        // Verify policyBinding against DEK whenever policy or binding metadata is present
+        if manifest.policy != nil || manifest.policyBindingHash != nil || manifest.policyBindingAlg != nil {
+            guard let policyBase64 = manifest.policy,
+                  manifest.policyBindingAlg == "HS256",
+                  let bindingHash = manifest.policyBindingHash,
+                  let actual = Data(base64Encoded: bindingHash)
+            else {
+                throw HLSTDFExtractorError.integrityCheckFailed
+            }
+            let expected = Data(HMAC<SHA256>.authenticationCode(
+                for: Data(policyBase64.utf8),
+                using: symmetricKey
+            ))
+            let diff = zip(actual, expected).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) }
+            guard actual.count == expected.count, diff == 0 else {
+                throw HLSTDFExtractorError.integrityCheckFailed
+            }
         }
 
         let ivBase64 = manifest.segmentIVs[segmentIndex]
@@ -142,9 +251,28 @@ public actor HLSTDFExtractor {
             throw HLSTDFExtractorError.invalidIV
         }
 
-        // Decrypt based on mode
-        let mode = manifest.encryptionMode ?? "CBC"
-        if mode == "GCM" {
+        // Determine mode authoritatively from encryptionInformation.method.algorithm (never downgrade via unsigned meta.hls.encryptionMode)
+        let isGCM: Bool
+        switch manifest.algorithm {
+        case "AES-128-GCM", "AES-256-GCM":
+            isGCM = true
+        case "AES-128-CBC", "AES-256-CBC":
+            isGCM = false
+        default:
+            throw HLSTDFExtractorError.unsupportedAlgorithm(manifest.algorithm)
+        }
+
+        if let declaredMode = manifest.encryptionMode {
+            let expectedMode = isGCM ? "GCM" : "CBC"
+            guard declaredMode == expectedMode else {
+                throw HLSTDFExtractorError.algorithmMismatch
+            }
+        }
+
+        if isGCM {
+            guard iv.count == 12 else {
+                throw HLSTDFExtractorError.invalidIV
+            }
             // GCM: last 16 bytes are the tag
             let tagSize = 16
             guard segmentData.count >= tagSize else {
@@ -160,6 +288,9 @@ public actor HLSTDFExtractor {
                 symmetricKey: symmetricKey
             )
         } else {
+            guard iv.count == 16 else {
+                throw HLSTDFExtractorError.invalidIV
+            }
             // CBC mode (FairPlay compatible)
             return try TDFCrypto.decryptPayloadCBC(
                 ciphertext: segmentData,
@@ -184,6 +315,26 @@ public actor HLSTDFExtractor {
               let algorithm = method["algorithm"] as? String
         else {
             throw HLSTDFExtractorError.invalidManifestFormat
+        }
+
+        // Reject untrusted manifest keyAccess.url that attempts to redirect KAS requests off-origin
+        let resolvedKASURL: URL
+        if let rawKASURL = keyAccess["url"] as? String, !rawKASURL.isEmpty {
+            do {
+                try validateKasURL(rawKASURL)
+            } catch {
+                throw HLSTDFExtractorError.untrustedKASURL(rawKASURL)
+            }
+            guard let manifestKASURL = URL(string: rawKASURL),
+                  let manifestOrigin = StandardTDFKASKeyClient.origin(of: manifestKASURL),
+                  let trustedOrigin = StandardTDFKASKeyClient.origin(of: kasURL),
+                  manifestOrigin == trustedOrigin
+            else {
+                throw HLSTDFExtractorError.untrustedKASURL(rawKASURL)
+            }
+            resolvedKASURL = manifestKASURL
+        } else {
+            resolvedKASURL = kasURL
         }
 
         // Extract policy and policyBinding for KAS rewrap
@@ -213,7 +364,7 @@ public actor HLSTDFExtractor {
             segmentCount: segmentCount,
             totalDuration: totalDuration,
             encryptionMode: encryptionMode,
-            kasURL: (keyAccess["url"] as? String).flatMap { URL(string: $0) } ?? kasURL,
+            kasURL: resolvedKASURL,
             policy: policy,
             policyBindingAlg: policyBindingAlg,
             policyBindingHash: policyBindingHash
@@ -316,7 +467,7 @@ public struct HLSManifest: Sendable {
 }
 
 /// Errors that can occur during HLS TDF extraction
-public enum HLSTDFExtractorError: Error, LocalizedError {
+public enum HLSTDFExtractorError: Error, LocalizedError, Equatable, Sendable {
     case invalidArchive
     case missingManifest
     case missingPlaylist
@@ -327,6 +478,12 @@ public enum HLSTDFExtractorError: Error, LocalizedError {
     case invalidIV
     case segmentTooSmall
     case decryptionFailed(String)
+    case entryTooLarge(String)
+    case unsupportedEntryType(String)
+    case untrustedKASURL(String)
+    case unsupportedAlgorithm(String)
+    case algorithmMismatch
+    case integrityCheckFailed
 
     public var errorDescription: String? {
         switch self {
@@ -350,6 +507,18 @@ public enum HLSTDFExtractorError: Error, LocalizedError {
             "Segment data too small for authentication tag"
         case let .decryptionFailed(reason):
             "Decryption failed: \(reason)"
+        case let .entryTooLarge(path):
+            "Archive entry exceeds maximum allowed size: \(path)"
+        case let .unsupportedEntryType(path):
+            "Unsupported non-file archive entry (e.g. symlink): \(path)"
+        case let .untrustedKASURL(url):
+            "Manifest KAS URL is untrusted or invalid: \(url)"
+        case let .unsupportedAlgorithm(algorithm):
+            "Unsupported encryption algorithm: \(algorithm)"
+        case .algorithmMismatch:
+            "Manifest encryptionMode does not match encryptionInformation.method.algorithm"
+        case .integrityCheckFailed:
+            "Manifest policy binding or integrity verification failed"
         }
     }
 }

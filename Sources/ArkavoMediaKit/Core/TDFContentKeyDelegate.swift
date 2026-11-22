@@ -7,12 +7,17 @@ import Synchronization
 
 /// Global configuration for FairPlay debugging
 public enum FairPlayDebugConfig {
-    /// Enable verbose debug logging (set to false for production)
     #if DEBUG
-        public nonisolated(unsafe) static var isVerboseLoggingEnabled = true
+        private static let verboseLoggingStorage = Mutex(true)
     #else
-        public nonisolated(unsafe) static var isVerboseLoggingEnabled = false
+        private static let verboseLoggingStorage = Mutex(false)
     #endif
+
+    /// Enable verbose debug logging (set to false for production)
+    public static var isVerboseLoggingEnabled: Bool {
+        get { verboseLoggingStorage.withLock { $0 } }
+        set { verboseLoggingStorage.withLock { $0 = newValue } }
+    }
 }
 
 // MARK: - FairPlay Debug Logger
@@ -271,6 +276,11 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
     init(manifest: Manifest, authToken: String?, serverURL: URL, http: any FairPlayHTTP) {
         self.manifest = manifest
         self.targets = Result {
+            guard serverURL.scheme?.lowercased() == "https",
+                  let host = serverURL.host, !host.isEmpty
+            else {
+                throw FairPlayError.sessionStartFailed("FairPlay server URL must use HTTPS")
+            }
             if let payload = manifest.tdfPayload {
                 guard let json = manifest.tdfManifestJSON else {
                     throw FairPlayKeyEnvelope.Error.invalidProfile
@@ -470,7 +480,8 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
             throw FairPlayError.sessionStartFailed("HTTP \(statusCode)")
         }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let sessionId = json["sessionId"] as? String, !sessionId.isEmpty
+              let sessionId = json["sessionId"] as? String,
+              (try? InputValidator.validateSessionID(sessionId)) != nil
         else {
             throw FairPlayError.sessionStartFailed("Invalid session response")
         }
@@ -479,6 +490,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
 
     /// End a session, best effort: a failure is logged and never fails the key.
     private func endSession(_ sessionId: String) async {
+        guard (try? InputValidator.validateSessionID(sessionId)) != nil else { return }
         let url = serverURL.appendingPathComponent("media/v1/session").appendingPathComponent(sessionId)
         var request = URLRequest(url: url)
         request.httpMethod = "DELETE"
@@ -547,7 +559,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw FairPlayError.invalidCKCResponse("Response is not valid JSON")
         }
-        if json["error"] != nil {
+        if let errorValue = json["error"], !(errorValue is NSNull) {
             throw FairPlayError.ckcRequestFailed("HTTP \(statusCode): the key service refused the key")
         }
         guard let ckcBase64 = json["wrappedKey"] as? String else {

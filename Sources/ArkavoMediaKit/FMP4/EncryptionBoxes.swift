@@ -156,8 +156,8 @@ public struct TrackEncryptionBox: ISOFullBox {
         // default_KID (16 bytes)
         data.append(defaultKID)
 
-        // default_constant_IV_size and default_constant_IV (if IV size is 0)
-        if defaultPerSampleIVSize == 0, let constantIV = defaultConstantIV {
+        // default_constant_IV_size and default_constant_IV (ISO/IEC 23001-7 §8.2: only when default_isProtected == 1 and IV size == 0)
+        if defaultIsProtected == 1, defaultPerSampleIVSize == 0, let constantIV = defaultConstantIV {
             data.append(UInt8(constantIV.count))
             data.append(constantIV)
         }
@@ -277,7 +277,7 @@ public struct SampleEncryptionEntry {
 }
 
 /// Subsample encryption entry (clear + protected regions)
-public struct SubsampleEntry {
+public struct SubsampleEntry: Equatable, Sendable {
     public let bytesOfClearData: UInt16
     public let bytesOfProtectedData: UInt32
 
@@ -368,7 +368,8 @@ public struct SampleAuxiliaryInfoOffsetsBox: ISOFullBox {
                 use64BitOffsets: Bool = false,
                 auxInfoType: FourCC? = nil,
                 auxInfoTypeParameter: UInt32? = nil) {
-        self.version = use64BitOffsets ? 1 : 0
+        let needs64Bit = use64BitOffsets || offsets.contains { $0 > UInt64(UInt32.max) }
+        self.version = needs64Bit ? 1 : 0
         self.offsets = offsets
         self.auxInfoType = auxInfoType
         self.auxInfoTypeParameter = auxInfoTypeParameter

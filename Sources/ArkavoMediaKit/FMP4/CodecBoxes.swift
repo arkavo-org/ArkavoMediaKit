@@ -91,14 +91,20 @@ public struct AVCDecoderConfigurationRecord: ISOBox {
     public let pictureParameterSets: [Data]
 
     public init(sps: [Data], pps: [Data]) {
+        precondition(sps.count <= 31, "AVCDecoderConfigurationRecord supports at most 31 SPS entries")
+        precondition(pps.count <= 255, "AVCDecoderConfigurationRecord supports at most 255 PPS entries")
+        precondition(sps.allSatisfy { $0.count <= Int(UInt16.max) }, "SPS entry exceeds 65535 bytes")
+        precondition(pps.allSatisfy { $0.count <= Int(UInt16.max) }, "PPS entry exceeds 65535 bytes")
+
         self.sequenceParameterSets = sps
         self.pictureParameterSets = pps
 
-        // Extract profile/level from first SPS
+        // Extract profile/level from first SPS safely regardless of Data.startIndex
         if let firstSPS = sps.first, firstSPS.count >= 4 {
-            self.profileIndication = firstSPS[1]
-            self.profileCompatibility = firstSPS[2]
-            self.levelIndication = firstSPS[3]
+            let bytes = [UInt8](firstSPS)
+            self.profileIndication = bytes[1]
+            self.profileCompatibility = bytes[2]
+            self.levelIndication = bytes[3]
         } else {
             self.profileIndication = 100 // High profile
             self.profileCompatibility = 0
@@ -406,8 +412,10 @@ public struct AACSampleEntry: ISOBox {
         // Pre-defined + reserved
         data.append(Data(count: 4))
 
-        // Sample rate (16.16 fixed point)
-        data.append((sampleRate << 16).bigEndianData)
+        // Sample rate (16.16 fixed point; clamp high rates like 88.2/96 kHz rather than wrapping UInt32 << 16,
+        // as ISO/IEC 14496-12 AudioSpecificConfig inside esds carries the exact sampling frequency)
+        let clampedRate = min(sampleRate, UInt32(UInt16.max))
+        data.append((clampedRate << 16).bigEndianData)
 
         // esds box
         data.append(esds.serialize())

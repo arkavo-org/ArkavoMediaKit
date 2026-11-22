@@ -24,16 +24,40 @@ public struct MediaDRMPolicy: Sendable {
     /// Subscription tier requirement
     public let requiredSubscriptionTier: String?
 
-    public enum HDCPLevel: String, Sendable, Codable {
+    public enum HDCPLevel: String, Sendable, Codable, Comparable {
         case none = "none"
         case type0 = "type0" // HDCP 1.x
         case type1 = "type1" // HDCP 2.2+
+
+        public var rank: Int {
+            switch self {
+            case .none: 0
+            case .type0: 1
+            case .type1: 2
+            }
+        }
+
+        public static func < (lhs: HDCPLevel, rhs: HDCPLevel) -> Bool {
+            lhs.rank < rhs.rank
+        }
     }
 
-    public enum DeviceSecurityLevel: String, Sendable, Codable {
+    public enum DeviceSecurityLevel: String, Sendable, Codable, Comparable {
         case low = "low"
         case medium = "medium"
         case high = "high"
+
+        public var rank: Int {
+            switch self {
+            case .low: 0
+            case .medium: 1
+            case .high: 2
+            }
+        }
+
+        public static func < (lhs: DeviceSecurityLevel, rhs: DeviceSecurityLevel) -> Bool {
+            lhs.rank < rhs.rank
+        }
     }
 
     public struct RentalWindow: Sendable, Codable {
@@ -76,37 +100,79 @@ public struct MediaDRMPolicy: Sendable {
         currentActiveStreams: Int,
         deviceInfo: DeviceInfo
     ) throws {
-        // Check rental window
-        if let rentalWindow, let firstPlay = firstPlayTimestamp {
-            let elapsed = Date().timeIntervalSince(firstPlay)
-            if elapsed > rentalWindow.playbackWindow {
-                throw PolicyViolation.rentalWindowExpired
+        let now = Date()
+
+        // Check rental window (both purchase window and playback window)
+        if let rentalWindow {
+            let purchaseDate: Date
+            if let purchasedAtString = session.metadata["purchasedAt"],
+               let parsed = ISO8601DateFormatter().date(from: purchasedAtString)
+            {
+                purchaseDate = parsed
+            } else {
+                purchaseDate = session.createdAt
+            }
+
+            if let firstPlay = firstPlayTimestamp {
+                if firstPlay.timeIntervalSince(purchaseDate) > rentalWindow.purchaseWindow {
+                    throw PolicyViolation.rentalWindowExpired
+                }
+                let elapsed = now.timeIntervalSince(firstPlay)
+                if elapsed > rentalWindow.playbackWindow {
+                    throw PolicyViolation.rentalWindowExpired
+                }
+            } else {
+                let elapsedSincePurchase = now.timeIntervalSince(purchaseDate)
+                if elapsedSincePurchase > rentalWindow.purchaseWindow {
+                    throw PolicyViolation.rentalWindowExpired
+                }
             }
         }
 
-        // Check concurrency
-        if let maxStreams = maxConcurrentStreams, currentActiveStreams >= maxStreams {
+        // Check concurrency (currentActiveStreams includes the current active session, so allow up to maxStreams inclusive)
+        if let maxStreams = maxConcurrentStreams, maxStreams <= 0 || currentActiveStreams > maxStreams {
             throw PolicyViolation.concurrencyLimitExceeded
         }
 
-        // Check geo-restrictions
-        if let region = session.geoRegion {
-            if let allowed = allowedRegions, !allowed.contains(region) {
+        // Check geo-restrictions (fail closed when allowedRegions or non-empty blockedRegions is set and geoRegion is nil)
+        if let allowed = allowedRegions {
+            guard let region = session.geoRegion else {
+                throw PolicyViolation.geoRestricted(region: "unknown")
+            }
+            if !allowed.contains(region) {
                 throw PolicyViolation.geoRestricted(region: region)
             }
-            if let blocked = blockedRegions, blocked.contains(region) {
+        }
+        if let blocked = blockedRegions, !blocked.isEmpty {
+            guard let region = session.geoRegion else {
+                throw PolicyViolation.geoRestricted(region: "unknown")
+            }
+            if blocked.contains(region) {
                 throw PolicyViolation.geoRestricted(region: region)
             }
         }
 
-        // Check device security
-        if let minLevel = minSecurityLevel, deviceInfo.securityLevel.rawValue < minLevel.rawValue {
+        // Check HDCP requirement using numeric rank
+        if let requiredHDCP = hdcpLevel, deviceInfo.hdcpCapability < requiredHDCP {
+            throw PolicyViolation.insufficientHDCP(required: requiredHDCP)
+        }
+
+        // Check device security using numeric rank (never lexicographic string comparison)
+        if let minLevel = minSecurityLevel, deviceInfo.securityLevel < minLevel {
             throw PolicyViolation.insufficientDeviceSecurity
         }
 
         // Check virtual machine
         if !allowVirtualMachines && deviceInfo.isVirtualMachine {
             throw PolicyViolation.virtualMachineDetected
+        }
+
+        // Check subscription tier requirement
+        if let requiredTier = requiredSubscriptionTier {
+            let actualTier = session.metadata["subscriptionTier"]
+            guard actualTier == requiredTier else {
+                throw PolicyViolation.subscriptionRequired(tier: requiredTier)
+            }
         }
     }
 }
@@ -129,11 +195,12 @@ public struct DeviceInfo: Sendable {
 }
 
 /// Policy violation errors
-public enum PolicyViolation: Error, LocalizedError, Sendable {
+public enum PolicyViolation: Error, LocalizedError, Sendable, Equatable {
     case rentalWindowExpired
     case concurrencyLimitExceeded
     case geoRestricted(region: String)
     case insufficientDeviceSecurity
+    case insufficientHDCP(required: MediaDRMPolicy.HDCPLevel)
     case virtualMachineDetected
     case subscriptionRequired(tier: String)
 
@@ -147,6 +214,8 @@ public enum PolicyViolation: Error, LocalizedError, Sendable {
             "Content not available in region: \(region)"
         case .insufficientDeviceSecurity:
             "Device security level insufficient"
+        case let .insufficientHDCP(required):
+            "HDCP level insufficient (required: \(required.rawValue))"
         case .virtualMachineDetected:
             "Playback not allowed on virtual machines"
         case let .subscriptionRequired(tier):

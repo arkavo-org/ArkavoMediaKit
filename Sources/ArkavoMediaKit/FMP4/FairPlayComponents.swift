@@ -114,6 +114,7 @@ public enum FairPlayComponents {
         // Parsed before checkStructure, which assumes JSON that has already parsed.
         guard FairPlayPolicy.isPlainUTF8Object(json),
               let object = try? JSONSerialization.jsonObject(with: json) as? [String: Any],
+              JSONSerialization.isValidJSONObject(object),
               (try? FairPlayPolicy.checkStructure(of: json)) != nil
         else { return nil }
         return object

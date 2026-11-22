@@ -42,6 +42,12 @@ public actor MediaSessionManager {
         self.client = MediaServerClient(configuration: configuration)
     }
 
+    /// Internal initializer allowing custom MediaServerClient injection in tests
+    init(configuration: DRMConfiguration, client: MediaServerClient) {
+        self.configuration = configuration
+        self.client = client
+    }
+
     /// Start a new playback session
     /// - Parameters:
     ///   - userID: User identifier
@@ -111,20 +117,21 @@ public actor MediaSessionManager {
     /// End a session
     /// - Parameter sessionId: Session identifier
     public func endSession(sessionId: String) async throws {
-        guard activeSessions[sessionId] != nil else {
-            throw SessionError.sessionNotFound(sessionID: UUID())
+        guard activeSessions.removeValue(forKey: sessionId) != nil else {
+            if let uuid = UUID(uuidString: sessionId) {
+                throw SessionError.sessionNotFound(sessionID: uuid)
+            }
+            throw SessionError.sessionNotFoundWithID(sessionId)
         }
 
-        // Notify server
-        try await client.endSession(sessionId: sessionId)
-
-        // Remove from active sessions
-        activeSessions.removeValue(forKey: sessionId)
-
-        // Stop heartbeat if no more sessions
+        // Stop heartbeat immediately if no active sessions remain so a failed server
+        // notification cannot leak the local session or let heartbeats resurrect it.
         if activeSessions.isEmpty {
             stopHeartbeat()
         }
+
+        // Notify server (best-effort cleanup already completed locally)
+        try await client.endSession(sessionId: sessionId)
     }
 
     /// End all active sessions
@@ -143,6 +150,11 @@ public actor MediaSessionManager {
         activeSessions.count
     }
 
+    /// Read current session snapshot (internal for testing)
+    func session(for sessionId: String) -> ActiveSession? {
+        activeSessions[sessionId]
+    }
+
     // MARK: - Heartbeat Management
 
     private func startHeartbeatIfNeeded() {
@@ -154,9 +166,14 @@ public actor MediaSessionManager {
             while !Task.isCancelled {
                 guard let self else { return }
 
-                // Wait for heartbeat interval
+                // Wait for heartbeat interval; stop immediately on cancellation without firing an extra heartbeat
                 let interval = configuration.heartbeatInterval
-                try? await Task.sleep(for: .seconds(interval))
+                do {
+                    try await Task.sleep(for: .seconds(interval))
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled else { return }
 
                 // Send heartbeats for all active sessions
                 await self.sendHeartbeats()
@@ -169,51 +186,53 @@ public actor MediaSessionManager {
         heartbeatTask = nil
     }
 
-    private func sendHeartbeats() async {
-        let now = Date()
+    func sendHeartbeats() async {
         let maxRetries = 3
+        // Snapshot keys/state before suspension points
+        let snapshots = Array(activeSessions.values)
 
-        for (sessionId, session) in activeSessions {
+        for snapshot in snapshots {
+            let sessionId = snapshot.sessionId
+            // Re-check before sending in case a previous iteration's await allowed endSession
+            guard let currentBeforeSend = activeSessions[sessionId] else { continue }
             do {
                 try await client.sendHeartbeat(
                     sessionId: sessionId,
-                    state: session.state.rawValue,
-                    position: session.position
+                    state: currentBeforeSend.state.rawValue,
+                    position: currentBeforeSend.position
                 )
 
-                // Success - reset failure count and update last heartbeat time
-                var updatedSession = session
-                updatedSession.lastHeartbeat = now
-                updatedSession.failedHeartbeatCount = 0
-                updatedSession.lastHeartbeatError = nil
-                activeSessions[sessionId] = updatedSession
+                // Re-fetch after suspension: never resurrect ended sessions or clobber concurrent state updates
+                guard var current = activeSessions[sessionId] else { continue }
+                current.lastHeartbeat = Date()
+                current.failedHeartbeatCount = 0
+                current.lastHeartbeatError = nil
+                activeSessions[sessionId] = current
 
             } catch {
                 // Log error but continue with other sessions
                 logger.error("Failed to send heartbeat for session \(sessionId): \(error.localizedDescription)")
 
-                // Increment failure count
-                var updatedSession = session
-                updatedSession.failedHeartbeatCount += 1
-                updatedSession.lastHeartbeatError = error
-                activeSessions[sessionId] = updatedSession
+                // Re-fetch after suspension: if the session was ended while in flight, do not resurrect it
+                guard var current = activeSessions[sessionId] else { continue }
+                current.failedHeartbeatCount += 1
+                current.lastHeartbeatError = error
+                activeSessions[sessionId] = current
 
                 // Notify callback
                 onHeartbeatFailure?(sessionId, error)
 
                 // Only remove session after max retries or timeout
-                // This allows for transient network failures
-                if updatedSession.failedHeartbeatCount >= maxRetries {
+                if current.failedHeartbeatCount >= maxRetries {
                     logger.warning("Session \(sessionId) exceeded max heartbeat failures (\(maxRetries)), removing session")
                     activeSessions.removeValue(forKey: sessionId)
                 } else {
-                    // Check if session expired (no successful heartbeat for timeout period)
-                    let elapsed = now.timeIntervalSince(session.lastHeartbeat)
+                    let elapsed = Date().timeIntervalSince(current.lastHeartbeat)
                     if elapsed > configuration.sessionTimeout {
                         logger.warning("Session \(sessionId) timed out after \(elapsed)s, removing session")
                         activeSessions.removeValue(forKey: sessionId)
                     } else {
-                        logger.info("Session \(sessionId) heartbeat failed (\(updatedSession.failedHeartbeatCount)/\(maxRetries)), will retry")
+                        logger.info("Session \(sessionId) heartbeat failed (\(current.failedHeartbeatCount)/\(maxRetries)), will retry")
                     }
                 }
             }

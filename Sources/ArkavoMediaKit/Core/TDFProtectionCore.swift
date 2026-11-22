@@ -1,16 +1,37 @@
 import CommonCrypto
 import Foundation
+import OpenTDFKit
 
 // MARK: - TDF Protection Core
 
 /// Shared cryptographic operations for TDF content protection
 /// Used by TDFProtectionService, RecordingProtectionService, and VideoProtectionService
 public enum TDFProtectionCore {
+    /// Maximum allowed response size for KAS public key fetch (64 KiB)
+    private static let maxKASPublicKeyResponseBytes = 64 * 1024
+
+    /// Dedicated ephemeral, redirect-refusing session for KAS public key fetches
+    private static let kasSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 60
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.urlCache = nil
+        return URLSession(configuration: config, delegate: RedirectRefusal(), delegateQueue: nil)
+    }()
+
     // MARK: - Key Generation
 
     /// Generate 16-byte DEK for AES-128 encryption
     public static func generateDEK() throws -> Data {
         var bytes = [UInt8](repeating: 0, count: 16)
+        defer {
+            bytes.withUnsafeMutableBytes { buffer in
+                if let baseAddress = buffer.baseAddress {
+                    memset_s(baseAddress, buffer.count, 0, buffer.count)
+                }
+            }
+        }
         let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
         guard status == errSecSuccess else {
             throw TDFProtectionCoreError.keyGenerationFailed
@@ -87,6 +108,8 @@ public enum TDFProtectionCore {
         let stripped = pem
             .replacingOccurrences(of: "-----BEGIN PUBLIC KEY-----", with: "")
             .replacingOccurrences(of: "-----END PUBLIC KEY-----", with: "")
+            .replacingOccurrences(of: "-----BEGIN RSA PUBLIC KEY-----", with: "")
+            .replacingOccurrences(of: "-----END RSA PUBLIC KEY-----", with: "")
             .replacingOccurrences(of: "\n", with: "")
             .replacingOccurrences(of: "\r", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -116,7 +139,7 @@ public enum TDFProtectionCore {
         return key
     }
 
-    /// Wrap DEK with RSA-2048 OAEP using SHA-1 (per OpenTDF spec)
+    /// Wrap DEK with RSA OAEP using SHA-1 (per OpenTDF spec; supports RSA-2048/3072/4096)
     /// - Parameters:
     ///   - dek: 16-byte data encryption key
     ///   - publicKeyPEM: PEM-encoded RSA public key
@@ -134,8 +157,9 @@ public enum TDFProtectionCore {
             throw TDFProtectionCoreError.keyWrapFailed(error?.takeRetainedValue())
         }
 
-        // Verify wrapped key size (256 bytes for RSA-2048)
-        guard encrypted.count == 256 else {
+        // Verify wrapped key matches the RSA key's modulus byte length (256 for RSA-2048, 384 for 3072, 512 for 4096)
+        let expectedSize = SecKeyGetBlockSize(publicKey)
+        guard expectedSize >= 256, encrypted.count == expectedSize else {
             throw TDFProtectionCoreError.invalidWrappedKeySize
         }
 
@@ -144,13 +168,31 @@ public enum TDFProtectionCore {
 
     // MARK: - KAS Integration
 
-    /// Fetch RSA public key from KAS server
+    /// Fetch RSA public key from KAS server (requires HTTPS, refuses redirects)
     /// - Parameters:
-    ///   - kasURL: Base KAS server URL
+    ///   - kasURL: Base KAS server URL (must use HTTPS)
     ///   - algorithm: Algorithm query parameter (default: "rsa")
     /// - Returns: PEM-encoded RSA public key
     public static func fetchKASRSAPublicKey(kasURL: URL, algorithm: String = "rsa") async throws -> String {
-        var components = URLComponents(url: kasURL, resolvingAgainstBaseURL: true)!
+        try await fetchKASRSAPublicKey(kasURL: kasURL, algorithm: algorithm, session: kasSession)
+    }
+
+    /// Internal overload supporting injected URLSession in tests
+    static func fetchKASRSAPublicKey(kasURL: URL, algorithm: String = "rsa", session: URLSession) async throws -> String {
+        guard kasURL.scheme?.lowercased() == "https",
+              let host = kasURL.host, !host.isEmpty
+        else {
+            throw TDFProtectionCoreError.invalidKASURL
+        }
+        do {
+            try validateKasURL(kasURL.absoluteString)
+        } catch {
+            throw TDFProtectionCoreError.invalidKASURL
+        }
+
+        guard var components = URLComponents(url: kasURL, resolvingAgainstBaseURL: true) else {
+            throw TDFProtectionCoreError.invalidKASURL
+        }
         components.path = "/kas/v2/kas_public_key"
         components.queryItems = [URLQueryItem(name: "algorithm", value: algorithm)]
 
@@ -161,12 +203,18 @@ public enum TDFProtectionCore {
         // KAS advertises `alt-svc: h3`; opt the first hop into HTTP/3 (falls back to HTTP/2).
         var request = URLRequest(url: url)
         request.assumesHTTP3Capable = true
-        let (data, response) = try await URLSession.shared.data(for: request)
+        request.timeoutInterval = 30
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await session.data(for: request, delegate: RedirectRefusal())
 
         guard let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode == 200
         else {
             throw TDFProtectionCoreError.kasKeyFetchFailed
+        }
+
+        guard data.count <= maxKASPublicKeyResponseBytes else {
+            throw TDFProtectionCoreError.invalidKASResponse
         }
 
         // Try both common key names in response

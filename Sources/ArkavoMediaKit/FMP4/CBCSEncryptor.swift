@@ -1,26 +1,33 @@
 import CommonCrypto
+import CryptoKit
 import Foundation
+import Synchronization
 
 // MARK: - CBCS Debug Configuration
 
 /// Global configuration for CBCS encryption debugging
 public enum CBCSDebugConfig {
-    /// Enable verbose debug logging (set to false for production)
     #if DEBUG
-    public nonisolated(unsafe) static var isVerboseLoggingEnabled = true
+    private static let verboseLoggingStorage = Mutex(true)
     #else
-    public nonisolated(unsafe) static var isVerboseLoggingEnabled = false
+    private static let verboseLoggingStorage = Mutex(false)
     #endif
+
+    /// Enable verbose debug logging (set to false for production)
+    public static var isVerboseLoggingEnabled: Bool {
+        get { verboseLoggingStorage.withLock { $0 } }
+        set { verboseLoggingStorage.withLock { $0 = newValue } }
+    }
 }
 
 // MARK: - CBCS Encryptor
 
 /// CBCS (Common Encryption Scheme - CBC mode with Subsample encryption) encryptor
 /// Implements pattern-based encryption for FairPlay Streaming
-public final class CBCSEncryptor {
+public final class CBCSEncryptor: Sendable {
     // MARK: - Types
 
-    public enum Failure: Error, Equatable {
+    public enum Failure: Error, Equatable, Sendable {
         /// The sample's NAL unit lengths do not cover it exactly.
         case malformedSample
         /// The system's random source failed, with this status: there is no key.
@@ -28,13 +35,13 @@ public final class CBCSEncryptor {
     }
 
     /// Encryption result with subsample map
-    public struct EncryptionResult {
+    public struct EncryptionResult: Sendable {
         public let encryptedData: Data
         public let subsamples: [SubsampleEntry]
     }
 
     /// NAL unit information for subsample mapping
-    public struct NALUnit {
+    public struct NALUnit: Sendable {
         public let type: UInt8
         public let offset: Int
         public let length: Int
@@ -54,14 +61,18 @@ public final class CBCSEncryptor {
     /// - Parameters:
     ///   - key: 16-byte AES-128 encryption key
     ///   - iv: 16-byte initialization vector (constant for CBCS)
-    ///   - cryptBlocks: Number of blocks to encrypt in pattern (default 1)
+    ///   - cryptBlocks: Number of blocks to encrypt in pattern (default 1; 0:0 means full-sample whole-block encryption)
     ///   - skipBlocks: Number of blocks to skip in pattern (default 9)
     public init(key: Data, iv: Data, cryptBlocks: Int = 1, skipBlocks: Int = 9) {
         precondition(key.count == 16, "Key must be 16 bytes for AES-128")
         precondition(iv.count == 16, "IV must be 16 bytes")
+        precondition(cryptBlocks >= 0 && skipBlocks >= 0, "Pattern block counts must be non-negative")
+        precondition(cryptBlocks <= 15 && skipBlocks <= 15, "Pattern block counts must fit in 4-bit tenc fields (0...15)")
+        precondition(cryptBlocks > 0 || skipBlocks == 0, "Invalid CBCS pattern 0:\(skipBlocks): cryptBlocks=0 is only valid with skipBlocks=0")
 
-        self.key = key
-        self.iv = iv
+        // Normalize into fresh contiguous zero-based Data so slices with non-zero startIndex are safe
+        self.key = Data(key)
+        self.iv = Data(iv)
         self.cryptBlocks = cryptBlocks
         self.skipBlocks = skipBlocks
     }
@@ -72,42 +83,41 @@ public final class CBCSEncryptor {
     ///
     /// Each slice NAL unit is one subsample whose clear bytes are its length prefix, NAL header and slice header,
     /// so protection starts on the first byte after the slice header (ISO/IEC 23001-7 `cbcs`, as CMAF requires).
-    /// Every other NAL unit is clear.
+    /// Every other NAL unit is clear (split into <= 65,535-byte subsample entries if larger than `UInt16.max`).
     /// - Parameters:
     ///   - sample: Raw video sample data (with length-prefixed NAL units)
-    ///   - nalLengthSize: Size of NAL unit length field (typically 4)
+    ///   - nalLengthSize: Size of NAL unit length field (must be 1, 2, or 4; typically 4)
     ///   - sliceHeaders: Measures slice headers, from the stream's parameter sets
     /// - Returns: Encrypted data and subsample map
-    /// - Throws: `H264SliceHeaderParser.Failure` for a slice it cannot measure, rather than protect from a guess
+    /// - Throws: `Failure.malformedSample` or `H264SliceHeaderParser.Failure`
     public func encryptVideoSample(_ sample: Data, nalLengthSize: Int = 4,
                                    sliceHeaders: H264SliceHeaderParser) throws -> EncryptionResult {
-        let nalUnits = try parseNALUnits(sample, lengthSize: nalLengthSize)
+        let bytes = [UInt8](sample)
+        let nalUnits = try parseNALUnits(bytes, lengthSize: nalLengthSize)
 
         var encryptedData = Data()
+        encryptedData.reserveCapacity(bytes.count)
         var subsamples: [SubsampleEntry] = []
 
         // Debug: Log NAL structure for first few samples
         if CBCSDebugConfig.isVerboseLoggingEnabled && nalUnits.count > 1 {
             let nalTypes = nalUnits.map { "NAL\($0.type)(\($0.isSlice ? "slice" : "non-slice"):\($0.length)B)" }
-            print("🔍 [CBCS] Sample \(sample.count)B has \(nalUnits.count) NALs: \(nalTypes.joined(separator: ", "))")
+            print("🔍 [CBCS] Sample \(bytes.count)B has \(nalUnits.count) NALs: \(nalTypes.joined(separator: ", "))")
         }
 
         for nal in nalUnits {
-            let nalData = sample.subdata(in: nal.offset..<(nal.offset + nal.length))
+            let nalData = Data(bytes[nal.offset ..< (nal.offset + nal.length)])
 
             if nal.isSlice {
                 // Encrypt slice NAL units
-                let (encrypted, subsample) = try encryptNALUnit(nalData, lengthSize: nalLengthSize,
-                                                                sliceHeaders: sliceHeaders)
+                let (encrypted, nalSubsamples) = try encryptNALUnit(nalData, lengthSize: nalLengthSize,
+                                                                    sliceHeaders: sliceHeaders)
                 encryptedData.append(encrypted)
-                subsamples.append(subsample)
+                subsamples.append(contentsOf: nalSubsamples)
             } else {
-                // Non-slice NAL units (SPS, PPS, SEI, etc.) are kept clear
+                // Non-slice NAL units (SPS, PPS, SEI, etc.) are kept clear; split if > UInt16.max
                 encryptedData.append(nalData)
-                subsamples.append(SubsampleEntry(
-                    bytesOfClearData: UInt16(nal.length),
-                    bytesOfProtectedData: 0
-                ))
+                Self.appendClearSubsamples(byteCount: nal.length, into: &subsamples)
             }
         }
 
@@ -119,14 +129,6 @@ public final class CBCSEncryptor {
             print("⚠️ [CBCS] Subsample mismatch: clear=\(totalClear) + protected=\(totalProtected) = \(totalSubsampleBytes), but data=\(encryptedData.count)")
         }
 
-        // NOTE: Do NOT merge subsamples for FairPlay CBCS!
-        // FairPlay/CBCS requires each NAL unit to have its own subsample entry.
-        // The decoder uses these entries to know exactly which bytes are clear vs encrypted.
-        // Reference content (Apple FairPlay SDK) uses 8 subsamples per sample (50 bytes = 2 + 8*6).
-        //
-        // Merging would create: [164 clear, 99836 protected] - WRONG for FairPlay!
-        // Correct is: [28c,0p] [8c,0p] [128c,99836p] etc. - separate entry per NAL
-
         // Debug: Log subsample structure
         if CBCSDebugConfig.isVerboseLoggingEnabled {
             let subsampleDesc = subsamples.map { "[\($0.bytesOfClearData)c/\($0.bytesOfProtectedData)p]" }.joined(separator: " ")
@@ -136,11 +138,25 @@ public final class CBCSEncryptor {
         return EncryptionResult(encryptedData: encryptedData, subsamples: subsamples)
     }
 
+    /// Splits a clear-only byte run into one or more `SubsampleEntry` items so `bytesOfClearData` never overflows `UInt16`.
+    private static func appendClearSubsamples(byteCount: Int, into subsamples: inout [SubsampleEntry]) {
+        var remaining = byteCount
+        let maxClear = Int(UInt16.max)
+        while remaining > maxClear {
+            subsamples.append(SubsampleEntry(bytesOfClearData: UInt16.max, bytesOfProtectedData: 0))
+            remaining -= maxClear
+        }
+        subsamples.append(SubsampleEntry(bytesOfClearData: UInt16(remaining), bytesOfProtectedData: 0))
+    }
+
     /// Encrypt a single slice NAL unit using CBCS pattern, from the first byte after its slice header
     private func encryptNALUnit(_ nalData: Data, lengthSize: Int,
-                                sliceHeaders: H264SliceHeaderParser) throws -> (Data, SubsampleEntry) {
+                                sliceHeaders: H264SliceHeaderParser) throws -> (Data, [SubsampleEntry]) {
         // Length prefix, NAL header and slice header stay clear.
         let clearBytes = lengthSize + (try sliceHeaders.headerSize(ofSlice: nalData.dropFirst(lengthSize)))
+        guard clearBytes <= nalData.count else {
+            throw Failure.malformedSample
+        }
 
         // Keep NAL header + slice header clear
         let clearPart = nalData.prefix(clearBytes)
@@ -149,11 +165,16 @@ public final class CBCSEncryptor {
         let payload = nalData.dropFirst(clearBytes)
 
         if payload.isEmpty {
-            return (nalData, SubsampleEntry(bytesOfClearData: UInt16(nalData.count), bytesOfProtectedData: 0))
+            var entries: [SubsampleEntry] = []
+            Self.appendClearSubsamples(byteCount: nalData.count, into: &entries)
+            return (nalData, entries)
         }
 
         // Apply pattern encryption to payload
         let encryptedPayload = encryptWithPattern(Data(payload))
+        guard let protectedCount = UInt32(exactly: encryptedPayload.count) else {
+            throw Failure.malformedSample
+        }
 
         // Debug: Verify encryption actually modified data
         if CBCSDebugConfig.isVerboseLoggingEnabled && payload.count >= 16 {
@@ -166,25 +187,37 @@ public final class CBCSEncryptor {
         }
 
         var result = Data()
+        result.reserveCapacity(nalData.count)
         result.append(clearPart)
         result.append(encryptedPayload)
 
-        let subsample = SubsampleEntry(
-            bytesOfClearData: UInt16(clearBytes),
-            bytesOfProtectedData: UInt32(encryptedPayload.count)
-        )
+        var entries: [SubsampleEntry] = []
+        var remainingClear = clearBytes
+        let maxClear = Int(UInt16.max)
+        while remainingClear > maxClear {
+            entries.append(SubsampleEntry(bytesOfClearData: UInt16.max, bytesOfProtectedData: 0))
+            remainingClear -= maxClear
+        }
+        entries.append(SubsampleEntry(
+            bytesOfClearData: UInt16(remainingClear),
+            bytesOfProtectedData: protectedCount
+        ))
 
-        return (result, subsample)
+        return (result, entries)
     }
 
     /// Apply CBCS pattern encryption (encrypt N blocks, skip M blocks) to one subsample's protected bytes.
     ///
-    /// The encrypted blocks form one CBC chain that starts from the constant IV (ISO/IEC 23001-7 `cbcs`): each takes
-    /// the previous encrypted block's ciphertext as its IV, across the skipped blocks between them. The skipped
-    /// blocks and a trailing partial block stay clear.
+    /// Per ISO/IEC 23001-7 `cbcs`, pattern `0:0` encrypts every complete 16-byte block (full-sample whole-block).
+    /// Otherwise encrypted blocks form one CBC chain starting from the constant IV across skipped blocks.
     private func encryptWithPattern(_ data: Data) -> Data {
+        let blockCount = data.count / 16
+        guard blockCount > 0 else { return data }
+        if cryptBlocks == 0 && skipBlocks == 0 {
+            return encryptChain(data, blocks: Array(0 ..< blockCount))
+        }
         let patternLength = cryptBlocks + skipBlocks
-        let blocks = (0 ..< data.count / 16).filter { $0 % patternLength < cryptBlocks }
+        let blocks = (0 ..< blockCount).filter { $0 % patternLength < cryptBlocks }
         return encryptChain(data, blocks: blocks)
     }
 
@@ -231,29 +264,48 @@ public final class CBCSEncryptor {
 
     // MARK: - NAL Parsing
 
-    /// Parse NAL units from length-prefixed sample
-    /// - Throws: `Failure.malformedSample` unless the NAL units cover the sample exactly, so no byte is dropped.
-    private func parseNALUnits(_ data: Data, lengthSize: Int) throws -> [NALUnit] {
+    /// Parse NAL units from length-prefixed sample (ISO/IEC 14496-15 supports 1, 2, or 4 byte lengths).
+    /// - Throws: `Failure.malformedSample` for invalid `lengthSize`, 0-length NALs, or truncated/trailing bytes.
+    private func parseNALUnits(_ bytes: [UInt8], lengthSize: Int) throws -> [NALUnit] {
+        guard lengthSize == 1 || lengthSize == 2 || lengthSize == 4 else {
+            throw Failure.malformedSample
+        }
+
         var nalUnits: [NALUnit] = []
         var offset = 0
 
-        while offset + lengthSize < data.count {
-            // Read NAL unit length
-            let lengthData = data.subdata(in: offset..<(offset + lengthSize))
+        while offset < bytes.count {
+            guard offset + lengthSize <= bytes.count else {
+                throw Failure.malformedSample
+            }
+
             let length: Int
             switch lengthSize {
-            case 1: length = Int(lengthData[0])
-            case 2: length = Int(UInt16(bigEndianData: lengthData))
-            case 4: length = Int(UInt32(bigEndianData: lengthData))
-            default: length = Int(UInt32(bigEndianData: lengthData))
+            case 1:
+                length = Int(bytes[offset])
+            case 2:
+                length = (Int(bytes[offset]) << 8) | Int(bytes[offset + 1])
+            case 4:
+                let raw = (UInt32(bytes[offset]) << 24)
+                    | (UInt32(bytes[offset + 1]) << 16)
+                    | (UInt32(bytes[offset + 2]) << 8)
+                    | UInt32(bytes[offset + 3])
+                guard let exact = Int(exactly: raw) else {
+                    throw Failure.malformedSample
+                }
+                length = exact
+            default:
+                throw Failure.malformedSample
+            }
+
+            // A valid NAL unit must contain at least its 1-byte NAL header
+            guard length > 0, length <= bytes.count - (offset + lengthSize) else {
+                throw Failure.malformedSample
             }
 
             let totalLength = lengthSize + length
-            guard offset + totalLength <= data.count else { break }
-
-            // Determine NAL type
             let nalHeaderOffset = offset + lengthSize
-            let nalType = parseNALType(data[nalHeaderOffset])
+            let nalType = parseNALType(bytes[nalHeaderOffset])
 
             nalUnits.append(NALUnit(
                 type: nalType,
@@ -265,7 +317,7 @@ public final class CBCSEncryptor {
             offset += totalLength
         }
 
-        guard offset == data.count else { throw Failure.malformedSample }
+        guard offset == bytes.count else { throw Failure.malformedSample }
         return nalUnits
     }
 
@@ -277,7 +329,6 @@ public final class CBCSEncryptor {
     /// Check if NAL unit is a slice (VCL NAL)
     private func isSliceNAL(_ type: UInt8) -> Bool {
         // H.264 slice NAL types: 1-5
-        // H.265 slice NAL types: 0-31 (simplified)
         switch type {
         case 1...5: return true  // H.264 coded slice
         case 19: return true     // H.264 coded slice of IDR
@@ -285,61 +336,20 @@ public final class CBCSEncryptor {
         default: return false
         }
     }
-
-    /// Merge consecutive subsamples
-    private func mergeSubsamples(_ subsamples: [SubsampleEntry]) -> [SubsampleEntry] {
-        guard !subsamples.isEmpty else { return [] }
-
-        var merged: [SubsampleEntry] = []
-        var currentClear: UInt16 = 0
-        var currentProtected: UInt32 = 0
-
-        for subsample in subsamples {
-            if subsample.bytesOfProtectedData == 0 {
-                // All clear - accumulate
-                currentClear += subsample.bytesOfClearData
-            } else if currentProtected == 0 {
-                // Starting new protected region
-                currentClear += subsample.bytesOfClearData
-                currentProtected = subsample.bytesOfProtectedData
-            } else {
-                // Already have protected - emit current and start new
-                merged.append(SubsampleEntry(
-                    bytesOfClearData: currentClear,
-                    bytesOfProtectedData: currentProtected
-                ))
-                currentClear = subsample.bytesOfClearData
-                currentProtected = subsample.bytesOfProtectedData
-            }
-        }
-
-        // Emit final subsample
-        if currentClear > 0 || currentProtected > 0 {
-            merged.append(SubsampleEntry(
-                bytesOfClearData: currentClear,
-                bytesOfProtectedData: currentProtected
-            ))
-        }
-
-        return merged
-    }
 }
 
 // MARK: - Key Derivation
 
 extension CBCSEncryptor {
-    /// Derive content key from key ID using HKDF (for testing)
+    /// Derive a 16-byte AES-128 content key from `keyID` and `masterKey` using HKDF-SHA256.
     public static func deriveKey(from keyID: Data, using masterKey: Data) -> Data {
-        // Simplified key derivation - in production use proper HKDF
-        var derived = Data(count: 16)
-
-        for i in 0..<16 {
-            let masterByte: UInt8 = i < masterKey.count ? masterKey[i] : 0
-            let keyIDByte: UInt8 = i < keyID.count ? keyID[i] : 0
-            derived[i] = masterByte ^ keyIDByte
-        }
-
-        return derived
+        let derived = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: SymmetricKey(data: Data(masterKey)),
+            salt: Data(keyID),
+            info: Data("arkavo-cbcs-key-v1".utf8),
+            outputByteCount: 16
+        )
+        return derived.withUnsafeBytes { Data($0) }
     }
 
     /// A 16-byte AES-128 content key from the system's cryptographically secure random source.
@@ -373,24 +383,24 @@ extension CBCSEncryptor {
         return bytes
     }
 
-    /// Generate random key ID
+    /// Generate random key ID (fails closed via precondition if the CSPRNG fails).
     public static func generateKeyID() -> Data {
         var keyID = Data(count: 16)
-        _ = keyID.withUnsafeMutableBytes { ptr in
+        let status = keyID.withUnsafeMutableBytes { ptr in
             SecRandomCopyBytes(kSecRandomDefault, 16, ptr.baseAddress!)
         }
+        precondition(status == errSecSuccess, "SecRandomCopyBytes failed while generating key ID: \(status)")
         return keyID
     }
 
-    /// Generate random IV.
-    ///
-    /// Kept for source compatibility: it ignores the random source's status, so on a failure the IV may be left unfilled
-    /// (zero). `FMP4RecordingProtectionService` uses the status-checked `generateConstantIV()`.
+    /// Generate random IV (fails closed via precondition if the CSPRNG fails).
+    /// `FMP4RecordingProtectionService` uses the throwing `generateConstantIV()`.
     public static func generateIV() -> Data {
         var iv = Data(count: 16)
-        _ = iv.withUnsafeMutableBytes { ptr in
+        let status = iv.withUnsafeMutableBytes { ptr in
             SecRandomCopyBytes(kSecRandomDefault, 16, ptr.baseAddress!)
         }
+        precondition(status == errSecSuccess, "SecRandomCopyBytes failed while generating IV: \(status)")
         return iv
     }
 }

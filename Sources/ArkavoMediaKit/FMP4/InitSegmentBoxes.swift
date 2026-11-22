@@ -266,7 +266,12 @@ public struct MediaHeaderBox: ISOFullBox {
 
     private static func packLanguage(_ lang: String) -> UInt16 {
         let chars = Array(lang.prefix(3).lowercased().utf8)
-        guard chars.count == 3 else { return 0x55C4 } // "und"
+        // ISO-639-2/T packs three ASCII lowercase letters ('a'...'z' = 0x61...0x7A) as 5-bit values
+        guard chars.count == 3,
+              chars.allSatisfy({ $0 >= 0x61 && $0 <= 0x7A })
+        else {
+            return 0x55C4 // "und"
+        }
         let c1 = UInt16(chars[0] - 0x60)
         let c2 = UInt16(chars[1] - 0x60)
         let c3 = UInt16(chars[2] - 0x60)
