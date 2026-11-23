@@ -87,13 +87,13 @@ public actor HLSTDFPackager {
             segmentCount: encryptedSegments.count
         )
 
-        // Build master manifest
+        // Build master manifest (including per-segment and root integrity metadata)
         let manifest = try buildMasterManifest(
             wrappedKey: wrappedKey,
             symmetricKey: symmetricKey,
             assetID: assetID,
             policyJSON: policyJSON,
-            segmentIVs: encryptedSegments.map { $0.iv },
+            encryptedSegments: encryptedSegments,
             totalDuration: hlsResult.totalDuration
         )
 
@@ -123,8 +123,11 @@ public actor HLSTDFPackager {
                 plaintext: data,
                 symmetricKey: symmetricKey
             )
-            // For GCM, append tag to ciphertext
-            return (result.iv, result.cipherText + result.authenticationTag)
+            // For GCM, append tag to ciphertext in a fresh 0-indexed Data buffer
+            var combined = Data(capacity: result.cipherText.count + result.authenticationTag.count)
+            combined.append(result.cipherText)
+            combined.append(result.authenticationTag)
+            return (result.iv, combined)
         }
     }
 
@@ -132,14 +135,19 @@ public actor HLSTDFPackager {
         originalDurations: [Double],
         segmentCount: Int
     ) -> String {
+        let maxDuration = originalDurations.filter { $0.isFinite && $0 > 0 }.max() ?? 6.0
+        let safeTarget = max(1, Int(min(ceil(maxDuration), Double(Int.max / 2))))
         var playlist = "#EXTM3U\n"
         playlist += "#EXT-X-VERSION:3\n"
-        playlist += "#EXT-X-TARGETDURATION:\(Int(ceil(originalDurations.max() ?? 6.0)))\n"
+        playlist += "#EXT-X-TARGETDURATION:\(safeTarget)\n"
         playlist += "#EXT-X-MEDIA-SEQUENCE:0\n"
-        playlist += "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n"
+        // Segments in an HLS TDF archive are encrypted at the archive layer and decrypted by
+        // HLSResourceLoaderDelegate / HLSTDFExtractor; do not emit an unauthenticated #EXT-X-KEY
+        // without IV that would trigger double-decryption in AVPlayer.
 
         for i in 0..<segmentCount {
-            let duration = i < originalDurations.count ? originalDurations[i] : 6.0
+            let rawDuration = i < originalDurations.count ? originalDurations[i] : 6.0
+            let duration = (rawDuration.isFinite && rawDuration > 0) ? rawDuration : 6.0
             playlist += "#EXTINF:\(String(format: "%.3f", duration)),\n"
             playlist += "segments/\(i).enc\n"
         }
@@ -153,9 +161,41 @@ public actor HLSTDFPackager {
         symmetricKey: SymmetricKey,
         assetID: String,
         policyJSON: Data?,
-        segmentIVs: [Data],
+        encryptedSegments: [(filename: String, data: Data, iv: Data)],
         totalDuration: Double
     ) throws -> Data {
+        let segmentIVs = encryptedSegments.map(\.iv)
+        // Compute authentic per-segment signatures and rootSignature (HS256 for CBC, GMAC tag for GCM)
+        let segmentHashAlg = mode == .gcm ? "GMAC" : "HS256"
+        var rawSegmentSignatures: [Data] = []
+        var segmentIntegrityEntries: [[String: Any]] = []
+        rawSegmentSignatures.reserveCapacity(encryptedSegments.count)
+        segmentIntegrityEntries.reserveCapacity(encryptedSegments.count)
+        for seg in encryptedSegments {
+            let sig: Data
+            if mode == .gcm {
+                sig = Data(seg.data.suffix(16))
+            } else {
+                sig = TDFCrypto.segmentSignature(segmentCiphertext: seg.data, symmetricKey: symmetricKey)
+            }
+            rawSegmentSignatures.append(sig)
+            segmentIntegrityEntries.append([
+                "hash": sig.base64EncodedString(),
+                "encryptedSegmentSize": seg.data.count,
+            ])
+        }
+        let rootSigBase64 = TDFCrypto.rootSignatureBase64(
+            rawSegmentSignatures: rawSegmentSignatures,
+            symmetricKey: symmetricKey
+        )
+        let integrityInformation: [String: Any] = [
+            "rootSignature": [
+                "alg": "HS256",
+                "sig": rootSigBase64,
+            ],
+            "segmentHashAlg": segmentHashAlg,
+            "segments": segmentIntegrityEntries,
+        ]
         // Resolve the policy: caller-supplied (data attributes) or a minimal
         // placeholder when nil. `policyData` is the RAW policy JSON; it is passed
         // as-is to `TDFCrypto.policyBinding`, which (OpenTDFKit >= 5.0)
@@ -230,7 +270,8 @@ public actor HLSTDFPackager {
                     "algorithm": keySize.algorithm(mode: mode),
                     "iv": manifestIV,
                     "isStreamable": true
-                ]
+                ],
+                "integrityInformation": integrityInformation
             ],
             "payload": [
                 "type": "reference",

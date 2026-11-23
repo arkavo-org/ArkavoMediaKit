@@ -157,13 +157,11 @@ public struct TrackRunBox: ISOFullBox {
         if dataOffset != nil { f |= Self.dataOffsetPresent }
         if firstSampleFlags != nil { f |= Self.firstSampleFlagsPresent }
 
-        // Check first sample for optional fields
-        if let first = samples.first {
-            if first.duration != nil { f |= Self.sampleDurationPresent }
-            if first.size != nil { f |= Self.sampleSizePresent }
-            if first.flags != nil { f |= Self.sampleFlagsPresent }
-            if first.compositionTimeOffset != nil { f |= Self.sampleCompositionTimeOffsetsPresent }
-        }
+        // Check all samples for optional per-sample fields so later samples' values are never dropped
+        if samples.contains(where: { $0.duration != nil }) { f |= Self.sampleDurationPresent }
+        if samples.contains(where: { $0.size != nil }) { f |= Self.sampleSizePresent }
+        if samples.contains(where: { $0.flags != nil }) { f |= Self.sampleFlagsPresent }
+        if samples.contains(where: { $0.compositionTimeOffset != nil }) { f |= Self.sampleCompositionTimeOffsetsPresent }
 
         self.flags = f
     }

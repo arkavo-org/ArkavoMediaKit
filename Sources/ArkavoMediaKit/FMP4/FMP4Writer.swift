@@ -396,7 +396,10 @@ public final class FMP4Writer {
             generateTraf(fragment: fragment, dataOffsetBase: 0, trafOffset: 0).serialize().count
         }
         let moofSize = 8 + mfhdSize + trafSizes.reduce(0, +)
-        let mdatHeaderSize = 8 // mdat box header
+        let mdatPayloadSize = fragments.reduce(UInt64(0)) { total, fragment in
+            total + fragment.samples.reduce(UInt64(0)) { $0 + UInt64($1.data.count) }
+        }
+        let mdatHeaderSize = ContainerBox.headerSize(forPayloadSize: mdatPayloadSize)
 
         var moof = ContainerBox(type: .moof)
         moof.append(mfhd)
@@ -442,7 +445,8 @@ public final class FMP4Writer {
 
         // trun
         let trunSamples = samples.map { sample in
-            TrackRunSample(
+            precondition(sample.data.count <= Int(UInt32.max), "Sample size \(sample.data.count) exceeds UInt32.max")
+            return TrackRunSample(
                 duration: sample.duration,
                 size: UInt32(sample.data.count),
                 flags: sample.isSync ? TrackRunSample.syncFlags() : TrackRunSample.nonSyncFlags(),
@@ -451,7 +455,8 @@ public final class FMP4Writer {
         }
 
         // Data offset from fragment start to mdat payload
-        // AVPlayer uses fragment start as base (not moof start) despite default-base-is-moof
+        precondition(dataOffsetBase >= Int(Int32.min) && dataOffsetBase <= Int(Int32.max),
+                     "Fragment data offset \(dataOffsetBase) overflows Int32")
         let dataOffset = Int32(dataOffsetBase)
 
         if dataOffsetBase > 0 {
@@ -512,6 +517,7 @@ public final class FMP4Writer {
                 subsamples = actualSubsamples
             } else {
                 // Fallback: treat entire sample as protected (for unencrypted or unknown)
+                precondition(sample.data.count <= Int(UInt32.max), "Sample size \(sample.data.count) exceeds UInt32.max")
                 subsamples = [SubsampleEntry(
                     bytesOfClearData: 0,
                     bytesOfProtectedData: UInt32(sample.data.count)
@@ -566,14 +572,12 @@ public final class FMP4Writer {
             )
             print("🔐 FMP4Writer: Using uniform saiz defaultSampleInfoSize=\(uniformSize) for \(samples.count) samples")
         } else {
-            // Variable sizes - use per-sample array (with truncation warning)
-            let truncatedSizes = sampleInfoSizes.map { size -> UInt8 in
-                if size > 255 {
-                    print("⚠️ FMP4Writer: Sample auxiliary info size \(size) exceeds 255, truncating")
-                }
-                return UInt8(min(size, 255))
+            // Variable sizes - never silently clamp > 255 (would make saiz disagree with senc)
+            let exactSizes = sampleInfoSizes.map { size -> UInt8 in
+                precondition(size <= 255, "Sample auxiliary info size \(size) exceeds saiz 1-byte limit (max 42 subsamples per sample)")
+                return UInt8(size)
             }
-            saiz = SampleAuxiliaryInfoSizesBox(sampleInfoSizes: truncatedSizes)
+            saiz = SampleAuxiliaryInfoSizesBox(sampleInfoSizes: exactSizes)
             // Debug: Show unique sizes
             let sizeCounts = Dictionary(grouping: sampleInfoSizes) { $0 }.mapValues { $0.count }
             print("🔐 FMP4Writer: Variable saiz sizes for \(samples.count) samples: \(sizeCounts)")
@@ -639,36 +643,37 @@ extension FMP4Writer {
     }
 
     private static func parseAVCC(_ data: Data) -> (sps: [Data], pps: [Data]) {
-        guard data.count > 6 else { return ([], []) }
+        let bytes = [UInt8](data)
+        guard bytes.count > 6 else { return ([], []) }
 
         var sps: [Data] = []
         var pps: [Data] = []
         var offset = 5 // Skip config version, profile, compatibility, level, length size
 
         // Number of SPS
-        let numSPS = Int(data[offset] & 0x1F)
+        let numSPS = Int(bytes[offset] & 0x1F)
         offset += 1
 
         for _ in 0..<numSPS {
-            guard offset + 2 <= data.count else { break }
-            let length = Int(UInt16(bigEndianData: data.subdata(in: offset..<offset+2)))
+            guard offset + 2 <= bytes.count else { break }
+            let length = (Int(bytes[offset]) << 8) | Int(bytes[offset + 1])
             offset += 2
-            guard offset + length <= data.count else { break }
-            sps.append(data.subdata(in: offset..<offset+length))
+            guard offset + length <= bytes.count else { break }
+            sps.append(Data(bytes[offset..<(offset + length)]))
             offset += length
         }
 
         // Number of PPS
-        guard offset < data.count else { return (sps, pps) }
-        let numPPS = Int(data[offset])
+        guard offset < bytes.count else { return (sps, pps) }
+        let numPPS = Int(bytes[offset])
         offset += 1
 
         for _ in 0..<numPPS {
-            guard offset + 2 <= data.count else { break }
-            let length = Int(UInt16(bigEndianData: data.subdata(in: offset..<offset+2)))
+            guard offset + 2 <= bytes.count else { break }
+            let length = (Int(bytes[offset]) << 8) | Int(bytes[offset + 1])
             offset += 2
-            guard offset + length <= data.count else { break }
-            pps.append(data.subdata(in: offset..<offset+length))
+            guard offset + length <= bytes.count else { break }
+            pps.append(Data(bytes[offset..<(offset + length)]))
             offset += length
         }
 
@@ -676,30 +681,31 @@ extension FMP4Writer {
     }
 
     private static func parseHVCC(_ data: Data) -> (vps: [Data], sps: [Data], pps: [Data]) {
-        // Simplified HEVC config parsing
-        guard data.count > 23 else { return ([], [], []) }
+        // Simplified HEVC config parsing (safe for non-zero startIndex slices)
+        let bytes = [UInt8](data)
+        guard bytes.count > 23 else { return ([], [], []) }
 
         var vps: [Data] = []
         var sps: [Data] = []
         var pps: [Data] = []
 
         var offset = 22 // Skip to numOfArrays
-        let numArrays = Int(data[offset])
+        let numArrays = Int(bytes[offset])
         offset += 1
 
         for _ in 0..<numArrays {
-            guard offset + 3 <= data.count else { break }
-            let nalUnitType = data[offset] & 0x3F
+            guard offset + 3 <= bytes.count else { break }
+            let nalUnitType = bytes[offset] & 0x3F
             offset += 1
-            let numNalus = Int(UInt16(bigEndianData: data.subdata(in: offset..<offset+2)))
+            let numNalus = (Int(bytes[offset]) << 8) | Int(bytes[offset + 1])
             offset += 2
 
             for _ in 0..<numNalus {
-                guard offset + 2 <= data.count else { break }
-                let length = Int(UInt16(bigEndianData: data.subdata(in: offset..<offset+2)))
+                guard offset + 2 <= bytes.count else { break }
+                let length = (Int(bytes[offset]) << 8) | Int(bytes[offset + 1])
                 offset += 2
-                guard offset + length <= data.count else { break }
-                let nalData = data.subdata(in: offset..<offset+length)
+                guard offset + length <= bytes.count else { break }
+                let nalData = Data(bytes[offset..<(offset + length)])
                 offset += length
 
                 switch nalUnitType {

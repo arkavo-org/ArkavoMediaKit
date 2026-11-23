@@ -55,6 +55,9 @@ struct TestVideoGenerator: AsyncParsableCommand {
 
         // Serve mode - start HTTP server
         if let servePath = serve {
+            guard port > 0 else {
+                throw ValidationError("Invalid '--port 0': port must be between 1 and 65535")
+            }
             let serverDir = URL(fileURLWithPath: servePath)
             let server = SimpleHTTPServer(directory: serverDir, port: port)
             try await server.start()
@@ -136,15 +139,17 @@ struct VideoTestGenerator {
     ])
     let testKeyID = Data(repeating: 0x12, count: 16)
 
-    // Realistic H.264 720p parameters
-    // SPS: High profile, level 3.1, 1280x720
+    // Real H.264 High profile SPS, PPS, and slice headers so H264SliceHeaderParser and CBCSEncryptor
+    // produce genuine CBCS-encrypted samples with accurate subsamples for B2/M1/P2 fixtures.
     let sampleSPS = Data([
-        0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9, 0x40, 0x50,
-        0x05, 0xBB, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00,
-        0x10, 0x00, 0x00, 0x03, 0x03, 0xC0, 0xF1, 0x83,
-        0x19, 0x60,
+        0x67, 0x64, 0x00, 0x0D, 0xAC, 0xD9, 0x41, 0x41,
+        0x9F, 0x9F, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00,
+        0x10, 0x00, 0x00, 0x03, 0x03, 0xC0, 0xF1, 0x42,
+        0x99, 0x60,
     ])
-    let samplePPS = Data([0x68, 0xEE, 0x3C, 0x80])
+    let samplePPS = Data([0x68, 0xE9, 0x38, 0xF2, 0xC8, 0xB0])
+    let idrSliceHeader = Data([0x65, 0x88, 0x84, 0x00, 0x27, 0xFF])
+    let pSliceHeader = Data([0x41, 0x88, 0x88, 0x40, 0xBF])
 
     func generateAll() throws {
         print("Generating all test scenarios to: \(outputDir.path)")
@@ -248,10 +253,17 @@ struct VideoTestGenerator {
         let initData = writer.generateInitSegment()
         try initData.write(to: dir.appendingPathComponent("init.mp4"))
 
-        // Generate encrypted media segments
+        // Generate CBCS-encrypted media segments
+        let encryptor = CBCSEncryptor(key: testKey, iv: testIV)
+        let sliceHeaders = try H264SliceHeaderParser(sps: [sampleSPS], pps: [samplePPS])
         var hlsSegments: [FMP4HLSGenerator.Segment] = []
         for i in 0..<segmentCount {
-            let samples = createSamples(duration: segmentDuration, startWithIDR: true)
+            let samples = try createEncryptedSamples(
+                duration: segmentDuration,
+                startWithIDR: true,
+                encryptor: encryptor,
+                sliceHeaders: sliceHeaders
+            )
             let baseTime = UInt64(i * segmentDuration * 90000)
             let segmentData = writer.generateMediaSegment(
                 trackID: 1, samples: samples, baseDecodeTime: baseTime
@@ -297,9 +309,16 @@ struct VideoTestGenerator {
         let initData = writer.generateInitSegment()
         try initData.write(to: dir.appendingPathComponent("init.mp4"))
 
+        let encryptor = CBCSEncryptor(key: testKey, iv: testIV)
+        let sliceHeaders = try H264SliceHeaderParser(sps: [sampleSPS], pps: [samplePPS])
         var hlsSegments: [FMP4HLSGenerator.Segment] = []
         for i in 0..<segmentCount {
-            let samples = createSamples(duration: segmentDuration, startWithIDR: true)
+            let samples = try createEncryptedSamples(
+                duration: segmentDuration,
+                startWithIDR: true,
+                encryptor: encryptor,
+                sliceHeaders: sliceHeaders
+            )
             let baseTime = UInt64(i * segmentDuration * 90000)
             let segmentData = writer.generateMediaSegment(
                 trackID: 1, samples: samples, baseDecodeTime: baseTime
@@ -556,9 +575,16 @@ struct VideoTestGenerator {
         let initData = writer.generateInitSegment()
         try initData.write(to: dir.appendingPathComponent("init.mp4"))
 
+        let encryptor = CBCSEncryptor(key: testKey, iv: testIV)
+        let sliceHeaders = try H264SliceHeaderParser(sps: [sampleSPS], pps: [samplePPS])
         var hlsSegments: [FMP4HLSGenerator.Segment] = []
         for i in 0..<segmentCount {
-            let samples = createSamples(duration: segmentDuration, startWithIDR: true)
+            let samples = try createEncryptedSamples(
+                duration: segmentDuration,
+                startWithIDR: true,
+                encryptor: encryptor,
+                sliceHeaders: sliceHeaders
+            )
             let baseTime = UInt64(i * segmentDuration * 90000)
             let segmentData = writer.generateMediaSegment(
                 trackID: 1, samples: samples, baseDecodeTime: baseTime
@@ -614,17 +640,36 @@ struct VideoTestGenerator {
         return samples
     }
 
+    func createEncryptedSamples(
+        duration: Int,
+        startWithIDR: Bool,
+        encryptor: CBCSEncryptor,
+        sliceHeaders: H264SliceHeaderParser
+    ) throws -> [FMP4Writer.Sample] {
+        let clearSamples = createSamples(duration: duration, startWithIDR: startWithIDR)
+        return try clearSamples.map { sample in
+            let encrypted = try encryptor.encryptVideoSample(
+                sample.data,
+                nalLengthSize: 4,
+                sliceHeaders: sliceHeaders
+            )
+            return FMP4Writer.Sample(
+                data: encrypted.encryptedData,
+                duration: sample.duration,
+                isSync: sample.isSync,
+                compositionTimeOffset: sample.compositionTimeOffset,
+                subsamples: encrypted.subsamples
+            )
+        }
+    }
+
     func createVideoSample(isIDR: Bool) -> Data {
         var data = Data()
 
-        // NAL unit with 4-byte length prefix (Annex B to AVCC format)
-        let nalType: UInt8 = isIDR ? 0x65 : 0x41  // IDR slice (5) vs non-IDR P-slice (1)
-
-        // Create slice header + fake slice data
-        // For IDR: larger to simulate keyframe (~8KB)
-        // For P-frame: smaller (~2KB)
+        // Valid H.264 slice header matching sampleSPS/samplePPS followed by slice payload
+        let header = isIDR ? idrSliceHeader : pSliceHeader
         let payloadSize = isIDR ? 8000 : 2000
-        var nalData = Data([nalType])
+        var nalData = header
         nalData.append(Data(repeating: 0xAB, count: payloadSize))
 
         // Write NAL length (big-endian 4 bytes)
@@ -663,22 +708,39 @@ struct VideoRepackager {
             throw RepackagerError.noFormatDescription
         }
 
+        guard segmentDuration > 0 else {
+            throw RepackagerError.invalidParameters("Segment duration must be positive")
+        }
+
         let dimensions = try await videoTrack.load(.naturalSize)
         let timescale = try await videoTrack.load(.naturalTimeScale)
+
+        guard dimensions.width.isFinite, dimensions.height.isFinite,
+              dimensions.width >= 1, dimensions.height >= 1,
+              dimensions.width <= Double(UInt16.max), dimensions.height <= Double(UInt16.max),
+              let width = UInt16(exactly: dimensions.width.rounded()),
+              let height = UInt16(exactly: dimensions.height.rounded())
+        else {
+            throw RepackagerError.invalidParameters("Invalid track dimensions: \(dimensions.width)x\(dimensions.height)")
+        }
+
+        guard timescale > 0, let validatedTimescale = UInt32(exactly: timescale) else {
+            throw RepackagerError.invalidParameters("Invalid track timescale: \(timescale)")
+        }
 
         // Extract SPS/PPS from format description
         guard let h264Params = extractParameterSets(from: formatDesc) else {
             throw RepackagerError.noParameterSets
         }
 
-        print("  Video: \(Int(dimensions.width))x\(Int(dimensions.height)), timescale: \(timescale)")
+        print("  Video: \(width)x\(height), timescale: \(validatedTimescale)")
         print("  NAL length size: \(h264Params.nalLengthSize) bytes")
 
         // Create FMP4 writer (clear, no encryption)
         let trackConfig = FMP4Writer.TrackConfig.h264Video(
-            width: UInt16(dimensions.width),
-            height: UInt16(dimensions.height),
-            timescale: UInt32(timescale),
+            width: width,
+            height: height,
+            timescale: validatedTimescale,
             sps: h264Params.sps,
             pps: h264Params.pps
         )
@@ -695,33 +757,55 @@ struct VideoRepackager {
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
         reader.add(output)
-        reader.startReading()
+        guard reader.startReading() else {
+            throw RepackagerError.readFailed(reader.error?.localizedDescription ?? "AVAssetReader failed to start")
+        }
 
         var allSamples: [FMP4Writer.Sample] = []
 
         while let sampleBuffer = output.copyNextSampleBuffer() {
             guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
 
-            var length: Int = 0
-            var dataPointer: UnsafeMutablePointer<Int8>?
-            CMBlockBufferGetDataPointer(dataBuffer, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &dataPointer)
+            // Copy safely via CMBlockBufferCopyDataBytes (handles non-contiguous CMBlockBuffers)
+            let totalLength = CMBlockBufferGetDataLength(dataBuffer)
+            var sampleData = Data(count: totalLength)
+            if totalLength > 0 {
+                let status = sampleData.withUnsafeMutableBytes { buf -> OSStatus in
+                    guard let base = buf.baseAddress else { return kCMBlockBufferBadPointerParameterErr }
+                    return CMBlockBufferCopyDataBytes(dataBuffer, atOffset: 0, dataLength: totalLength, destination: base)
+                }
+                guard status == kCMBlockBufferNoErr else {
+                    throw RepackagerError.readFailed("CMBlockBufferCopyDataBytes failed (\(status))")
+                }
+            }
 
-            guard let pointer = dataPointer else { continue }
-            let sampleData = Data(bytes: pointer, count: length)
-
-            // Get timing info
+            // Get timing info safely (guard against invalid/indefinite CMTime and overflow)
             let duration = CMSampleBufferGetDuration(sampleBuffer)
-            let durationValue = UInt32(duration.value * Int64(timescale) / Int64(duration.timescale))
+            guard duration.isNumeric, duration.timescale > 0, duration.value >= 0 else {
+                throw RepackagerError.readFailed("Invalid video sample duration")
+            }
+            let convertedDuration = CMTimeConvertScale(duration, timescale: timescale, method: .default)
+            guard convertedDuration.isNumeric,
+                  convertedDuration.value >= 0,
+                  let durationValue = UInt32(exactly: convertedDuration.value)
+            else {
+                throw RepackagerError.readFailed("Video sample duration out of range")
+            }
 
             // Calculate Composition Time Offset for B-frames
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
             let dts = CMSampleBufferGetDecodeTimeStamp(sampleBuffer)
             var compositionTimeOffset: Int32 = 0
 
-            if pts.isValid && dts.isValid && pts != dts {
-                let ptsInTimescale = Int64(pts.value) * Int64(timescale) / Int64(pts.timescale)
-                let dtsInTimescale = Int64(dts.value) * Int64(timescale) / Int64(dts.timescale)
-                compositionTimeOffset = Int32(ptsInTimescale - dtsInTimescale)
+            if pts.isNumeric && dts.isNumeric && pts.timescale > 0 && dts.timescale > 0 && pts != dts {
+                let delta = CMTimeSubtract(pts, dts)
+                if delta.isNumeric {
+                    let converted = CMTimeConvertScale(delta, timescale: timescale, method: .default)
+                    guard converted.isNumeric, let exactCTS = Int32(exactly: converted.value) else {
+                        throw RepackagerError.readFailed("Composition time offset out of range")
+                    }
+                    compositionTimeOffset = exactCTS
+                }
             }
 
             // Check if sync sample
@@ -741,53 +825,62 @@ struct VideoRepackager {
             ))
         }
 
+        guard reader.status == .completed else {
+            throw RepackagerError.readFailed(reader.error?.localizedDescription ?? "AVAssetReader status \(reader.status.rawValue)")
+        }
+        guard !allSamples.isEmpty else {
+            throw RepackagerError.readFailed("No video samples found")
+        }
+
         print("  Read \(allSamples.count) samples")
 
-        // Generate media segments
+        // Generate GOP-aligned media segments (each new segment starts on a sync sample)
         print("  Generating media segments...")
-        let segmentDurationTicks = UInt64(segmentDuration * Int(timescale))
+        let segmentDurationTicks = UInt64(segmentDuration) * UInt64(validatedTimescale)
         var hlsSegments: [FMP4HLSGenerator.Segment] = []
         var segmentIndex = 0
-        var sampleIndex = 0
         var currentSegmentSamples: [FMP4Writer.Sample] = []
         var currentSegmentDuration: UInt64 = 0
         var baseDecodeTime: UInt64 = 0
 
-        while sampleIndex < allSamples.count {
-            let sample = allSamples[sampleIndex]
-            currentSegmentSamples.append(sample)
-            currentSegmentDuration += UInt64(sample.duration)
-            sampleIndex += 1
+        func flushSegment() throws {
+            guard !currentSegmentSamples.isEmpty else { return }
+            let segmentData = writer.generateMediaSegment(
+                trackID: 1,
+                samples: currentSegmentSamples,
+                baseDecodeTime: baseDecodeTime
+            )
+            let segmentFilename = "segment\(segmentIndex).m4s"
+            try segmentData.write(to: outputDir.appendingPathComponent(segmentFilename))
 
-            // End segment when duration reached or last sample
-            let shouldEndSegment = currentSegmentDuration >= segmentDurationTicks || sampleIndex == allSamples.count
+            let duration = Double(currentSegmentDuration) / Double(validatedTimescale)
+            hlsSegments.append(FMP4HLSGenerator.Segment(uri: segmentFilename, duration: duration))
 
-            if shouldEndSegment && !currentSegmentSamples.isEmpty {
-                let segmentData = writer.generateMediaSegment(
-                    trackID: 1,
-                    samples: currentSegmentSamples,
-                    baseDecodeTime: baseDecodeTime
-                )
-
-                let segmentFilename = "segment\(segmentIndex).m4s"
-                try segmentData.write(to: outputDir.appendingPathComponent(segmentFilename))
-
-                let duration = Double(currentSegmentDuration) / Double(timescale)
-                hlsSegments.append(FMP4HLSGenerator.Segment(uri: segmentFilename, duration: duration))
-
-                baseDecodeTime += currentSegmentDuration
-                currentSegmentSamples = []
-                currentSegmentDuration = 0
-                segmentIndex += 1
-            }
+            baseDecodeTime += currentSegmentDuration
+            currentSegmentSamples = []
+            currentSegmentDuration = 0
+            segmentIndex += 1
         }
 
+        for sample in allSamples {
+            if !currentSegmentSamples.isEmpty && sample.isSync && currentSegmentDuration >= segmentDurationTicks {
+                try flushSegment()
+            }
+            currentSegmentSamples.append(sample)
+            currentSegmentDuration += UInt64(sample.duration)
+        }
+        try flushSegment()
+
         print("  Created \(segmentIndex) segments")
+
+        // RFC 8216 §4.3.3.1: EXT-X-TARGETDURATION must be >= every rounded EXTINF duration
+        let maxActualDuration = hlsSegments.map(\.duration).max() ?? Double(segmentDuration)
+        let targetDuration = max(1, Int(maxActualDuration.rounded()))
 
         // Generate HLS playlist
         print("  Generating playlist...")
         let playlistConfig = FMP4HLSGenerator.PlaylistConfig(
-            targetDuration: segmentDuration,
+            targetDuration: targetDuration,
             playlistType: .vod,
             initSegmentURI: "init.mp4"
         )
@@ -816,10 +909,11 @@ struct VideoRepackager {
             return nil
         }
 
-        guard avcCData.count >= 8 else { return nil }
+        let bytes = [UInt8](avcCData)
+        guard bytes.count >= 8 else { return nil }
 
         // Extract NAL length size from byte 4 (lower 2 bits + 1)
-        let lengthSizeMinusOne = Int(avcCData[4] & 0x03)
+        let lengthSizeMinusOne = Int(bytes[4] & 0x03)
         let nalLengthSize = lengthSizeMinusOne + 1
 
         var sps: [Data] = []
@@ -827,31 +921,31 @@ struct VideoRepackager {
         var offset = 5
 
         // Number of SPS (lower 5 bits)
-        let numSPS = Int(avcCData[offset] & 0x1F)
+        let numSPS = Int(bytes[offset] & 0x1F)
         offset += 1
 
         for _ in 0..<numSPS {
-            guard offset + 2 <= avcCData.count else { break }
-            let spsLen = Int(avcCData[offset]) << 8 | Int(avcCData[offset + 1])
+            guard offset + 2 <= bytes.count else { break }
+            let spsLen = Int(bytes[offset]) << 8 | Int(bytes[offset + 1])
             offset += 2
-            guard offset + spsLen <= avcCData.count else { break }
-            sps.append(avcCData.subdata(in: offset..<(offset + spsLen)))
+            guard offset + spsLen <= bytes.count else { break }
+            sps.append(Data(bytes[offset..<(offset + spsLen)]))
             offset += spsLen
         }
 
-        guard offset < avcCData.count else {
+        guard offset < bytes.count else {
             return sps.isEmpty ? nil : H264Parameters(sps: sps, pps: pps, nalLengthSize: nalLengthSize)
         }
 
-        let numPPS = Int(avcCData[offset])
+        let numPPS = Int(bytes[offset])
         offset += 1
 
         for _ in 0..<numPPS {
-            guard offset + 2 <= avcCData.count else { break }
-            let ppsLen = Int(avcCData[offset]) << 8 | Int(avcCData[offset + 1])
+            guard offset + 2 <= bytes.count else { break }
+            let ppsLen = Int(bytes[offset]) << 8 | Int(bytes[offset + 1])
             offset += 2
-            guard offset + ppsLen <= avcCData.count else { break }
-            pps.append(avcCData.subdata(in: offset..<(offset + ppsLen)))
+            guard offset + ppsLen <= bytes.count else { break }
+            pps.append(Data(bytes[offset..<(offset + ppsLen)]))
             offset += ppsLen
         }
 
@@ -865,35 +959,47 @@ enum RepackagerError: Error, LocalizedError {
     case noVideoTrack
     case noFormatDescription
     case noParameterSets
+    case invalidParameters(String)
+    case readFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .noVideoTrack: "No video track found in source file"
         case .noFormatDescription: "No format description in video track"
         case .noParameterSets: "Could not extract SPS/PPS from video"
+        case let .invalidParameters(reason): "Invalid video parameters: \(reason)"
+        case let .readFailed(reason): "Failed to read video samples: \(reason)"
         }
     }
 }
 
 // MARK: - Simple HTTP Server
 
-/// Simple HTTP server for serving fMP4/HLS content to AVPlayer
+/// Simple HTTP server for serving fMP4/HLS content to AVPlayer on loopback only
 final class SimpleHTTPServer: @unchecked Sendable {
     private let directory: URL
+    private let canonicalRoot: URL
     private let port: UInt16
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "SimpleHTTPServer")
 
     init(directory: URL, port: UInt16) {
         self.directory = directory
+        self.canonicalRoot = directory.standardizedFileURL.resolvingSymlinksInPath()
         self.port = port
     }
 
     func start() async throws {
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            throw ValidationError("Invalid port \(port): must be between 1 and 65535")
+        }
+
+        // Bind strictly to IPv4 loopback (127.0.0.1) so local files are never exposed on the LAN
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
+        parameters.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: nwPort)
 
-        listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
+        listener = try NWListener(using: parameters)
 
         listener?.newConnectionHandler = { [weak self] connection in
             self?.handleConnection(connection)
@@ -918,6 +1024,56 @@ final class SimpleHTTPServer: @unchecked Sendable {
         await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in
             // Never resumes - runs until process killed
         }
+    }
+
+    /// Resolves a request path safely inside `canonicalRoot`, rejecting traversal (`..`, `%2e%2e`, backslashes, NUL),
+    /// directories, and symlinks pointing outside the served directory.
+    static func resolveContainedFile(requestTarget: String, in root: URL) -> URL? {
+        let canonicalRoot = root.standardizedFileURL.resolvingSymlinksInPath()
+        let rootPrefix = canonicalRoot.path.hasSuffix("/") ? canonicalRoot.path : canonicalRoot.path + "/"
+
+        // Strip query string and fragment
+        let rawPath = requestTarget.split(separator: "?", maxSplits: 1).first
+            .flatMap { $0.split(separator: "#", maxSplits: 1).first }
+            .map(String.init) ?? ""
+
+        guard rawPath.hasPrefix("/") else { return nil }
+        let normalizedTarget = rawPath == "/" ? "/playlist.m3u8" : rawPath
+
+        // Decode percent-encoding strictly (reject malformed sequences, NUL bytes, backslashes)
+        guard let decoded = normalizedTarget.removingPercentEncoding,
+              !decoded.contains("\0"),
+              !decoded.contains("\\")
+        else {
+            return nil
+        }
+
+        // Reject any explicit `..` path component before and after canonicalization
+        let relative = String(decoded.dropFirst())
+        let segments = relative.split(separator: "/", omittingEmptySubsequences: false)
+        guard !segments.isEmpty,
+              !segments.contains(".."),
+              !segments.contains(".")
+        else {
+            return nil
+        }
+
+        let candidate = canonicalRoot.appendingPathComponent(relative)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+
+        guard candidate.path.hasPrefix(rootPrefix) else {
+            return nil
+        }
+
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue
+        else {
+            return nil
+        }
+
+        return candidate
     }
 
     private func handleConnection(_ connection: NWConnection) {
@@ -958,31 +1114,44 @@ final class SimpleHTTPServer: @unchecked Sendable {
             return
         }
 
-        var path = String(parts[1])
-        if path == "/" {
-            path = "/playlist.m3u8"
+        let requestTarget = String(parts[1])
+
+        // Reject traversal/escape attempts with 403 before touching the filesystem
+        if requestTarget.contains("..") || requestTarget.lowercased().contains("%2e") || requestTarget.contains("\\") {
+            print("  403: \(requestTarget)")
+            sendError(connection, status: 403, message: "Forbidden")
+            return
         }
 
-        // Remove leading slash and decode URL
-        let filename = String(path.dropFirst()).removingPercentEncoding ?? String(path.dropFirst())
-        let fileURL = directory.appendingPathComponent(filename)
-
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            print("  404: \(filename)")
+        guard let fileURL = Self.resolveContainedFile(requestTarget: requestTarget, in: canonicalRoot) else {
+            // Distinguish symlink escapes outside root vs missing files
+            let rawPath = requestTarget.split(separator: "?", maxSplits: 1).first.map(String.init) ?? ""
+            if let decoded = rawPath.removingPercentEncoding {
+                let candidate = canonicalRoot.appendingPathComponent(String(decoded.dropFirst()))
+                    .standardizedFileURL
+                    .resolvingSymlinksInPath()
+                let rootPrefix = canonicalRoot.path.hasSuffix("/") ? canonicalRoot.path : canonicalRoot.path + "/"
+                if !candidate.path.hasPrefix(rootPrefix) {
+                    print("  403: \(requestTarget)")
+                    sendError(connection, status: 403, message: "Forbidden")
+                    return
+                }
+            }
+            print("  404: \(requestTarget)")
             sendError(connection, status: 404, message: "Not Found")
             return
         }
 
         do {
             let fileData = try Data(contentsOf: fileURL)
-            let mimeType = mimeTypeFor(filename)
-            print("  200: \(filename) (\(fileData.count) bytes)")
+            let mimeType = mimeTypeFor(fileURL.lastPathComponent)
+            print("  200: \(fileURL.lastPathComponent) (\(fileData.count) bytes)")
 
+            // Loopback-only server; never emit wildcard Access-Control-Allow-Origin: *
             let response = """
             HTTP/1.1 200 OK\r
             Content-Type: \(mimeType)\r
             Content-Length: \(fileData.count)\r
-            Access-Control-Allow-Origin: *\r
             Connection: close\r
             \r
 

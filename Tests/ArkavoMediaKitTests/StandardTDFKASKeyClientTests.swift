@@ -347,7 +347,7 @@ struct RewrapTests {
     @Test("HLS manifest unwraps to the DEK when the KAS wraps with the standard salt")
     func hlsManifestUnwrapsWithStandardSalt() async throws {
         let kas = FakeKAS(salt: FakeKAS.standardTDFSalt)
-        let client = StandardTDFKASKeyClient(urlSession: kas.install())
+        let client = StandardTDFKASKeyClient(urlSession: kas.install(), allowedKASOrigins: [kas.platformBase])
 
         let key = try await client.unwrapKey(manifest: Fixture.hlsManifest(), authToken: kas.expectedBearer)
 
@@ -359,7 +359,7 @@ struct RewrapTests {
     @Test("rewrap request carries the manifest policy and key access object the KAS verifies")
     func rewrapRequestCarriesPolicyAndKeyAccess() async throws {
         let kas = FakeKAS()
-        let client = StandardTDFKASKeyClient(urlSession: kas.install())
+        let client = StandardTDFKASKeyClient(urlSession: kas.install(), allowedKASOrigins: [kas.platformBase])
 
         _ = try await client.unwrapKey(manifest: Fixture.hlsManifest(), authToken: kas.expectedBearer)
 
@@ -385,7 +385,7 @@ struct RewrapTests {
     @Test("unwrap fails when the KAS wraps with the NanoTDF salt")
     func unwrapFailsWithNanoTDFSalt() async throws {
         let kas = FakeKAS(salt: FakeKAS.nanoTDFSalt)
-        let client = StandardTDFKASKeyClient(urlSession: kas.install())
+        let client = StandardTDFKASKeyClient(urlSession: kas.install(), allowedKASOrigins: [kas.platformBase])
 
         await #expect(throws: (any Error).self, "a DEK wrapped with the NanoTDF salt must not unwrap on the standard-TDF path") {
             _ = try await client.unwrapKey(manifest: Fixture.hlsManifest(), authToken: kas.expectedBearer)
@@ -395,7 +395,7 @@ struct RewrapTests {
     @Test("REST-only well-known still rewraps on the Connect route")
     func restOnlyWellKnownRewrapsOnConnect() async throws {
         let kas = FakeKAS(wellKnown: .restOnly)
-        let client = StandardTDFKASKeyClient(urlSession: kas.install())
+        let client = StandardTDFKASKeyClient(urlSession: kas.install(), allowedKASOrigins: [kas.platformBase])
 
         let key = try await client.unwrapKey(manifest: Fixture.hlsManifest(), authToken: kas.expectedBearer)
 
@@ -408,7 +408,7 @@ struct RewrapTests {
     @Test("unreachable well-known falls back to the Connect route under the platform base")
     func unreachableWellKnownRewrapsOnConnect() async throws {
         let kas = FakeKAS(wellKnown: .unreachable)
-        let client = StandardTDFKASKeyClient(urlSession: kas.install())
+        let client = StandardTDFKASKeyClient(urlSession: kas.install(), allowedKASOrigins: [kas.platformBase])
 
         let key = try await client.unwrapKey(manifest: Fixture.hlsManifest(), authToken: kas.expectedBearer)
 
@@ -420,7 +420,7 @@ struct RewrapTests {
     @Test("KAS errors propagate unchanged")
     func kasErrorsPropagate() async throws {
         let kas = FakeKAS(expectedBearer: "someone-else")
-        let client = StandardTDFKASKeyClient(urlSession: kas.install())
+        let client = StandardTDFKASKeyClient(urlSession: kas.install(), allowedKASOrigins: [kas.platformBase])
 
         await #expect(throws: KASRewrapError.self) {
             _ = try await client.unwrapKey(manifest: Fixture.hlsManifest(), authToken: "stale-token")
@@ -430,7 +430,7 @@ struct RewrapTests {
     @Test("HLS manifest without policy data throws missingPolicyData before any request")
     func missingPolicyDataThrows() async throws {
         let kas = FakeKAS()
-        let client = StandardTDFKASKeyClient(urlSession: kas.install())
+        let client = StandardTDFKASKeyClient(urlSession: kas.install(), allowedKASOrigins: [kas.platformBase])
 
         for manifest in [
             Fixture.hlsManifest(policy: nil),
@@ -456,7 +456,7 @@ struct KeyProviderTests {
             kasURL: Fixture.kasURL,
             kasPublicKeyPEM: "",
             sessionManager: TDF3MediaSession(),
-            kasKeyClient: StandardTDFKASKeyClient(urlSession: kas.install())
+            kasKeyClient: StandardTDFKASKeyClient(urlSession: kas.install(), allowedKASOrigins: [kas.platformBase])
         )
 
         await #expect(throws: KeyProviderError.notAuthenticated) {
@@ -473,7 +473,7 @@ struct KeyProviderTests {
             kasPublicKeyPEM: "",
             sessionManager: TDF3MediaSession(),
             authTokenProvider: { nil },
-            kasKeyClient: StandardTDFKASKeyClient(urlSession: kas.install())
+            kasKeyClient: StandardTDFKASKeyClient(urlSession: kas.install(), allowedKASOrigins: [kas.platformBase])
         )
 
         await #expect(throws: KeyProviderError.notAuthenticated) {
@@ -489,7 +489,7 @@ struct KeyProviderTests {
             kasPublicKeyPEM: "",
             sessionManager: TDF3MediaSession(),
             authTokenProvider: { kas.expectedBearer },
-            kasKeyClient: StandardTDFKASKeyClient(urlSession: kas.install())
+            kasKeyClient: StandardTDFKASKeyClient(urlSession: kas.install(), allowedKASOrigins: [kas.platformBase])
         )
 
         let key = try await provider.unwrapSegmentKey(tdfData: try Fixture.tdfArchive(), useKASRewrap: true)

@@ -3,6 +3,7 @@ import Combine
 import CryptoKit
 import Foundation
 import OpenTDFKit
+import Synchronization
 
 #if canImport(UIKit) || canImport(AppKit)
 
@@ -10,6 +11,30 @@ import OpenTDFKit
 @available(iOS 18.0, macOS 15.0, tvOS 18.0, *)
 @MainActor
 public class TDF3StreamingPlayer: ObservableObject {
+    /// Default KAS server URL used when callers omit `kasURL`
+    private static let defaultKASURL = URL(string: "https://100.arkavo.net")!
+
+    private final class CleanupResources: @unchecked Sendable {
+        let player: AVPlayer
+        var timeObserver: Any?
+        var tempDirectory: URL?
+
+        init(player: AVPlayer) {
+            self.player = player
+        }
+
+        func cleanup() {
+            if let observer = timeObserver {
+                player.removeTimeObserver(observer)
+                timeObserver = nil
+            }
+            if let dir = tempDirectory {
+                try? FileManager.default.removeItem(at: dir)
+                tempDirectory = nil
+            }
+        }
+    }
+
     /// The underlying AVPlayer
     public let player: AVPlayer
 
@@ -31,8 +56,10 @@ public class TDF3StreamingPlayer: ObservableObject {
     /// Duration
     @Published public private(set) var duration: TimeInterval = 0
 
-    private var timeObserver: Any?
+    private let cleanupResources: Mutex<CleanupResources>
     private var cancellables = Set<AnyCancellable>()
+    private var loadGeneration: UInt64 = 0
+    private var pendingReadyWait: (id: UUID, cancel: () -> Void)?
 
     /// Resource loader delegate for TDF-packaged HLS
     private var resourceLoaderDelegate: HLSResourceLoaderDelegate?
@@ -55,7 +82,9 @@ public class TDF3StreamingPlayer: ObservableObject {
         deviceInfo: DeviceInfo,
         sessionID: UUID
     ) {
-        player = AVPlayer()
+        let avPlayer = AVPlayer()
+        player = avPlayer
+        cleanupResources = Mutex(CleanupResources(player: avPlayer))
 
         // Create content key session
         contentKeySession = AVContentKeySession(keySystem: .fairPlayStreaming)
@@ -75,14 +104,20 @@ public class TDF3StreamingPlayer: ObservableObject {
         setupObservers()
     }
 
-    // Note: Removed deinit due to Swift 6 Sendable constraints
-    // The timeObserver is automatically cleaned up when the player is deallocated
+    deinit {
+        cleanupResources.withLock { $0.cleanup() }
+    }
 
     /// Load and play TDF3-protected HLS stream
     public func loadStream(
         url: URL,
         session: MediaSession
     ) async throws {
+        loadGeneration &+= 1
+        let myGeneration = loadGeneration
+        cancelCurrentReadyWait()
+        cleanupLocalAsset()
+
         self.session = session
         status = .loading
 
@@ -99,6 +134,9 @@ public class TDF3StreamingPlayer: ObservableObject {
 
         // Wait for ready to play
         try await waitForReadyToPlay(playerItem: playerItem)
+        guard loadGeneration == myGeneration else {
+            throw CancellationError()
+        }
 
         status = .ready
     }
@@ -111,12 +149,21 @@ public class TDF3StreamingPlayer: ObservableObject {
     /// - Parameters:
     ///   - tdfData: TDF archive containing HLS content
     ///   - session: Media session for playback
+    ///   - kasURL: Trusted KAS URL for manifest validation (defaults to `https://100.arkavo.net`)
+    ///   - extractionLimits: Size and entry caps for archive extraction (defaults to `.default`)
     ///   - keyProvider: Callback to obtain decryption key from KAS
     public func loadFromTDF(
         tdfData: Data,
         session: MediaSession,
+        kasURL: URL? = nil,
+        extractionLimits: HLSTDFExtractor.ExtractionLimits = .default,
         keyProvider: @escaping (HLSManifest) async throws -> SymmetricKey
     ) async throws {
+        loadGeneration &+= 1
+        let myGeneration = loadGeneration
+        cancelCurrentReadyWait()
+        cleanupLocalAsset()
+
         self.session = session
         status = .loading
 
@@ -124,42 +171,61 @@ public class TDF3StreamingPlayer: ObservableObject {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("tdf-hls-\(UUID().uuidString)")
 
-        // Extract HLS from TDF
-        let extractor = HLSTDFExtractor(
-            kasURL: URL(string: "https://100.arkavo.net")! // Default KAS
-        )
-        let localAsset = try await extractor.extract(
-            tdfData: tdfData,
-            outputDirectory: tempDir
-        )
-        self.localAsset = localAsset
+        do {
+            // Extract HLS from TDF
+            let extractor = HLSTDFExtractor(kasURL: kasURL ?? Self.defaultKASURL, limits: extractionLimits)
+            let localAsset = try await extractor.extract(
+                tdfData: tdfData,
+                outputDirectory: tempDir
+            )
 
-        // Create asset with custom resource loader
-        let playlistURL = URL(string: "\(tdfHLSScheme)://playlist.m3u8")!
-        let asset = AVURLAsset(url: playlistURL)
+            // If another load or stop() superseded us while extracting, clean up our tempDir and abort
+            guard loadGeneration == myGeneration else {
+                try? FileManager.default.removeItem(at: tempDir)
+                throw CancellationError()
+            }
 
-        // Create and configure resource loader delegate
-        let delegate = HLSResourceLoaderDelegate(
-            localAsset: localAsset,
-            extractor: extractor
-        )
-        delegate.onKeyRequest = keyProvider
-        self.resourceLoaderDelegate = delegate
+            self.localAsset = localAsset
+            cleanupResources.withLock { $0.tempDirectory = localAsset.outputDirectory }
 
-        // Set delegate on resource loader
-        let loaderQueue = DispatchQueue(label: "com.arkavo.hlsResourceLoader.player")
-        asset.resourceLoader.setDelegate(delegate, queue: loaderQueue)
+            // Create asset with custom resource loader (explicit host + path)
+            let playlistURL = URL(string: "\(tdfHLSScheme)://local/playlist.m3u8")!
+            let asset = AVURLAsset(url: playlistURL)
 
-        // Create player item
-        let playerItem = AVPlayerItem(asset: asset)
+            // Create and configure resource loader delegate
+            let delegate = HLSResourceLoaderDelegate(
+                localAsset: localAsset,
+                extractor: extractor
+            )
+            delegate.onKeyRequest = keyProvider
+            self.resourceLoaderDelegate = delegate
 
-        // Replace current item
-        player.replaceCurrentItem(with: playerItem)
+            // Set delegate on resource loader
+            let loaderQueue = DispatchQueue(label: "com.arkavo.hlsResourceLoader.player")
+            asset.resourceLoader.setDelegate(delegate, queue: loaderQueue)
 
-        // Wait for ready to play
-        try await waitForReadyToPlay(playerItem: playerItem)
+            // Create player item
+            let playerItem = AVPlayerItem(asset: asset)
 
-        status = .ready
+            // Replace current item
+            player.replaceCurrentItem(with: playerItem)
+
+            // Wait for ready to play
+            try await waitForReadyToPlay(playerItem: playerItem)
+            guard loadGeneration == myGeneration else {
+                throw CancellationError()
+            }
+
+            status = .ready
+        } catch {
+            // Clean up extracted temp directory if extraction or player readiness fails
+            try? FileManager.default.removeItem(at: tempDir)
+            if self.localAsset?.outputDirectory == tempDir {
+                self.localAsset = nil
+                cleanupResources.withLock { $0.tempDirectory = nil }
+            }
+            throw error
+        }
     }
 
     /// Play the current stream
@@ -182,33 +248,49 @@ public class TDF3StreamingPlayer: ObservableObject {
 
     /// Stop playback and clean up
     public func stop() {
+        loadGeneration &+= 1
+        cancelCurrentReadyWait()
         player.pause()
         player.replaceCurrentItem(with: nil)
         session = nil
         status = .idle
 
-        // Clean up TDF resources
-        if let localAsset {
-            try? FileManager.default.removeItem(at: localAsset.outputDirectory)
-            self.localAsset = nil
-        }
+        cleanupLocalAsset()
         resourceLoaderDelegate = nil
     }
 
     // MARK: - Private
 
+    private func cancelCurrentReadyWait() {
+        let pending = pendingReadyWait
+        pendingReadyWait = nil
+        pending?.cancel()
+    }
+
+    private func cleanupLocalAsset() {
+        if let localAsset {
+            try? FileManager.default.removeItem(at: localAsset.outputDirectory)
+            self.localAsset = nil
+            cleanupResources.withLock { $0.tempDirectory = nil }
+        }
+    }
+
     private func setupObservers() {
-        // Observe time
+        // Observe time on main queue
         let interval = CMTime(seconds: 0.5, preferredTimescale: 600)
-        timeObserver = player.addPeriodicTimeObserver(
+        let observer = player.addPeriodicTimeObserver(
             forInterval: interval,
             queue: .main
         ) { [weak self] time in
-            self?.currentTime = time.seconds
+            MainActor.assumeIsolated {
+                self?.currentTime = time.seconds
+            }
         }
+        cleanupResources.withLock { $0.timeObserver = observer }
 
-        // Observe status
+        // Observe status on main queue so @MainActor @Published mutations are never off-thread
         player.publisher(for: \.currentItem?.status)
+            .receive(on: DispatchQueue.main)
             .sink { [weak self] status in
                 guard let status else { return }
                 switch status {
@@ -222,8 +304,9 @@ public class TDF3StreamingPlayer: ObservableObject {
             }
             .store(in: &cancellables)
 
-        // Observe duration
+        // Observe duration on main queue
         player.publisher(for: \.currentItem?.duration)
+            .receive(on: DispatchQueue.main)
             .sink { [weak self] duration in
                 guard let duration, duration.isNumeric else { return }
                 self?.duration = duration.seconds
@@ -231,25 +314,105 @@ public class TDF3StreamingPlayer: ObservableObject {
             .store(in: &cancellables)
     }
 
+    /// Synchronized, cancellation-safe KVO readiness waiter with `.initial` inspection and guaranteed one-shot resume.
+    private final class ReadyWaitBox: @unchecked Sendable {
+        var continuation: CheckedContinuation<Void, Error>?
+        var observer: NSKeyValueObservation?
+        var finished = false
+        var pendingResult: Result<Void, Error>?
+    }
+
     private func waitForReadyToPlay(playerItem: AVPlayerItem) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            var observer: NSKeyValueObservation?
-            observer = playerItem.observe(\.status, options: [.new]) { item, _ in
-                switch item.status {
-                case .readyToPlay:
-                    observer?.invalidate()
-                    continuation.resume()
-                case .failed:
-                    observer?.invalidate()
-                    if let error = item.error {
-                        continuation.resume(throwing: error)
-                    } else {
-                        continuation.resume(throwing: PlayerError.loadFailed)
-                    }
-                default:
-                    break
+        let waitToken = UUID()
+        defer {
+            // Clear only if this waiter still owns the cancellation slot (never clobber a replacement load)
+            if pendingReadyWait?.id == waitToken {
+                pendingReadyWait = nil
+            }
+        }
+        try await Self.waitForReadyToPlay(playerItem: playerItem) { [weak self] cancel in
+            self?.pendingReadyWait = (id: waitToken, cancel: cancel)
+        }
+    }
+
+    /// Internal testable helper for waiting on `AVPlayerItem.status` with `.initial` + `.new`,
+    /// synchronized one-shot resume, no retain cycles, and task/item-replacement cancellation.
+    static func waitForReadyToPlay(
+        playerItem: AVPlayerItem,
+        registerCancel: ((@escaping () -> Void) -> Void)? = nil
+    ) async throws {
+        let state = Mutex(ReadyWaitBox())
+
+        let finish: @Sendable (Result<Void, Error>) -> Void = { result in
+            let continuationToResume: CheckedContinuation<Void, Error>? = state.withLock { box in
+                guard !box.finished else { return nil }
+                box.finished = true
+                box.observer?.invalidate()
+                box.observer = nil
+                if let continuation = box.continuation {
+                    box.continuation = nil
+                    return continuation
+                } else {
+                    // Resolved synchronously (e.g. .initial KVO or immediate cancellation) before continuation stored
+                    box.pendingResult = result
+                    return nil
                 }
             }
+            continuationToResume?.resume(with: result)
+        }
+
+        registerCancel?({ finish(.failure(CancellationError())) })
+
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let immediateResult: Result<Void, Error>? = state.withLock { box in
+                    if let pending = box.pendingResult {
+                        box.pendingResult = nil
+                        return pending
+                    }
+                    if box.finished {
+                        return .failure(CancellationError())
+                    }
+                    box.continuation = continuation
+                    return nil
+                }
+
+                if let immediateResult {
+                    continuation.resume(with: immediateResult)
+                    return
+                }
+
+                if Task.isCancelled {
+                    finish(.failure(CancellationError()))
+                    return
+                }
+
+                // Observe with `.initial` and `.new` so an already-ready or already-failed item never hangs.
+                // Captures only `finish` (no strong capture of `observer` -> zero retain cycle).
+                let observation = playerItem.observe(\.status, options: [.initial, .new]) { item, _ in
+                    switch item.status {
+                    case .readyToPlay:
+                        finish(.success(()))
+                    case .failed:
+                        finish(.failure(item.error ?? PlayerError.loadFailed))
+                    default:
+                        break
+                    }
+                }
+
+                let shouldInvalidate = state.withLock { box -> Bool in
+                    if box.finished {
+                        return true
+                    }
+                    box.observer = observation
+                    return false
+                }
+                if shouldInvalidate {
+                    observation.invalidate()
+                }
+            }
+        } onCancel: {
+            finish(.failure(CancellationError()))
         }
     }
 }

@@ -129,7 +129,7 @@ public final class FMP4HLSGenerator {
         }
 
         // Init segment (MAP)
-        lines.append("#EXT-X-MAP:URI=\"\(config.initSegmentURI)\"")
+        lines.append("#EXT-X-MAP:URI=\"\(Self.sanitizeQuotedString(config.initSegmentURI))\"")
 
         // Segments with per-segment encryption state tracking
         for segment in segments {
@@ -162,15 +162,16 @@ public final class FMP4HLSGenerator {
             }
 
             // Duration
-            lines.append("#EXTINF:\(String(format: "%.5f", segment.duration)),")
+            let safeDuration = (segment.duration.isFinite && segment.duration >= 0) ? segment.duration : 0
+            lines.append("#EXTINF:\(String(format: "%.5f", safeDuration)),")
 
             // Byte range (if applicable)
             if let range = segment.byteRange {
                 lines.append("#EXT-X-BYTERANGE:\(range.length)@\(range.offset)")
             }
 
-            // URI
-            lines.append(segment.uri)
+            // URI (strip CR/LF/NUL to prevent playlist tag injection)
+            lines.append(Self.sanitizeURI(segment.uri))
         }
 
         // End tag for VOD
@@ -185,8 +186,8 @@ public final class FMP4HLSGenerator {
     private func generateKeyTag(_ fairplay: FairPlayConfig) -> String {
         var tag = "#EXT-X-KEY:METHOD=SAMPLE-AES"
 
-        // URI (skd:// for FairPlay)
-        tag += ",URI=\"\(fairplay.keyURI)\""
+        // URI (skd:// for FairPlay), sanitized against quoted-string / newline injection
+        tag += ",URI=\"\(Self.sanitizeQuotedString(fairplay.keyURI))\""
 
         // Key format
         tag += ",KEYFORMAT=\"com.apple.streamingkeydelivery\""
@@ -194,8 +195,8 @@ public final class FMP4HLSGenerator {
         // Key format versions
         tag += ",KEYFORMATVERSIONS=\"1\""
 
-        // IV (if explicit)
-        if let iv = fairplay.iv {
+        // IV (RFC 8216 requires a 16-byte / 128-bit IV; omit malformed IVs)
+        if let iv = fairplay.iv, iv.count == 16 {
             tag += ",IV=0x\(iv.hexString)"
         }
 
@@ -223,7 +224,7 @@ public final class FMP4HLSGenerator {
         // Variants
         for variant in variants {
             lines.append(generateStreamInf(variant))
-            lines.append(variant.uri)
+            lines.append(Self.sanitizeURI(variant.uri))
         }
 
         return lines.joined(separator: "\n")
@@ -248,9 +249,13 @@ public final class FMP4HLSGenerator {
     }
 
     private func generateMedia(_ rendition: AudioRendition) -> String {
-        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"\(rendition.groupID)\",NAME=\"\(rendition.name)\","
-            + "LANGUAGE=\"\(rendition.language)\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"\(rendition.channels)\","
-            + "URI=\"\(rendition.uri)\""
+        let groupID = Self.sanitizeQuotedString(rendition.groupID)
+        let name = Self.sanitizeQuotedString(rendition.name)
+        let language = Self.sanitizeQuotedString(rendition.language)
+        let uri = Self.sanitizeQuotedString(rendition.uri)
+        return "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"\(groupID)\",NAME=\"\(name)\","
+            + "LANGUAGE=\"\(language)\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"\(rendition.channels)\","
+            + "URI=\"\(uri)\""
     }
     /// Variant stream configuration
     public struct Variant {
@@ -328,21 +333,31 @@ public final class FMP4HLSGenerator {
             tag += ",AVERAGE-BANDWIDTH=\(avgBw)"
         }
 
-        tag += ",CODECS=\"\(variant.codecs)\""
+        tag += ",CODECS=\"\(Self.sanitizeQuotedString(variant.codecs))\""
 
         if let res = variant.resolution {
             tag += ",RESOLUTION=\(res.width)x\(res.height)"
         }
 
-        if let fps = variant.frameRate {
+        if let fps = variant.frameRate, fps.isFinite, fps > 0 {
             tag += ",FRAME-RATE=\(String(format: "%.3f", fps))"
         }
 
         if let audio = variant.audioGroup {
-            tag += ",AUDIO=\"\(audio)\""
+            tag += ",AUDIO=\"\(Self.sanitizeQuotedString(audio))\""
         }
 
         return tag
+    }
+
+    /// Strips CR, LF, NUL, and `"` per RFC 8216 §4.2 quoted-string grammar to prevent playlist injection
+    private static func sanitizeQuotedString(_ value: String) -> String {
+        String(value.unicodeScalars.filter { $0 != "\r" && $0 != "\n" && $0 != "\0" && $0 != "\"" })
+    }
+
+    /// Strips CR, LF, and NUL from standalone playlist URI lines to prevent tag injection
+    private static func sanitizeURI(_ value: String) -> String {
+        String(value.unicodeScalars.filter { $0 != "\r" && $0 != "\n" && $0 != "\0" })
     }
 }
 

@@ -12,17 +12,31 @@ public protocol ISOBox {
 }
 
 extension ISOBox {
-    /// Serialize complete box with size and type header
+    /// Returns the ISO BMFF header size (8 bytes for standard boxes, 16 bytes for 64-bit largesize boxes >= 4 GiB).
+    static func headerSize(forPayloadSize payloadSize: UInt64) -> Int {
+        let standardSize = UInt64(8) &+ payloadSize
+        if payloadSize <= UInt64(UInt32.max) - 8, standardSize <= UInt64(UInt32.max) {
+            return 8
+        }
+        return 16
+    }
+
+    /// Serialize complete box with size and type header (uses ISO BMFF 64-bit largesize if >= 4 GiB)
     public func serialize() -> Data {
         let payload = serializePayload()
         var data = Data()
 
-        // Box size (4 bytes) = size field (4) + type field (4) + payload
-        let size = UInt32(8 + payload.count)
-        data.append(size.bigEndianData)
-
-        // Box type (4 bytes)
-        data.append(type.data)
+        let standardSize = UInt64(8) + UInt64(payload.count)
+        if let size32 = UInt32(exactly: standardSize) {
+            data.append(size32.bigEndianData)
+            data.append(type.data)
+        } else {
+            // ISO/IEC 14496-12 §4.2: size == 1 signals a 64-bit largesize field following the box type
+            let largeSize = UInt64(16) + UInt64(payload.count)
+            data.append(UInt32(1).bigEndianData)
+            data.append(type.data)
+            data.append(largeSize.bigEndianData)
+        }
 
         // Payload
         data.append(payload)

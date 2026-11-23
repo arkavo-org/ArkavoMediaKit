@@ -1,4 +1,5 @@
 import AVFoundation
+import CryptoKit
 import Foundation
 
 // MARK: - fMP4 Recording Protection Service
@@ -100,12 +101,16 @@ public actor FMP4RecordingProtectionService {
             throw FMP4ProtectionError.noFormatDescription
         }
         let dimensions = try await videoTrack.load(.naturalSize)
-        let timescale = try await videoTrack.load(.naturalTimeScale)
+        let (videoWidth, videoHeight) = try Self.validateDimensions(dimensions)
+        let rawTimescale = try await videoTrack.load(.naturalTimeScale)
+        let validatedTimescale = try Self.validateTimescale(rawTimescale)
+        let timescale = rawTimescale
         let (trackSegments, totalSampleBytes) = try await videoTrack.load(.segments, .totalSampleDataLength)
         guard let h264Params = extractParameterSets(from: formatDesc),
               let videoCodec = h264Params.sps.first.flatMap(FairPlayPackage.avc1Codec(sps:)) else {
             throw FMP4ProtectionError.noParameterSets
         }
+        try Self.checkParameterSets(sps: h264Params.sps, pps: h264Params.pps)
         // The init's avcC declares 4-byte NAL unit lengths, and the samples are written as the source has them.
         try Self.checkNALLengthSize(h264Params.nalLengthSize)
         // Every video sample byte is written: an archive that would hold more than a ZIP can is refused now, before
@@ -144,8 +149,8 @@ public actor FMP4RecordingProtectionService {
         print("📦 Creating fMP4 writers with CBCS encryption...")
         let encryptionConfig = FMP4Writer.EncryptionConfig(keyID: keyID, constantIV: constantIV)
         let videoWriter = FMP4Writer(
-            tracks: [.h264Video(trackID: 1, width: UInt16(dimensions.width), height: UInt16(dimensions.height),
-                                timescale: UInt32(timescale), sps: h264Params.sps, pps: h264Params.pps)],
+            tracks: [.h264Video(trackID: 1, width: videoWidth, height: videoHeight,
+                                timescale: validatedTimescale, sps: h264Params.sps, pps: h264Params.pps)],
             encryption: encryptionConfig)
         let encryptor = CBCSEncryptor(key: videoKey, iv: constantIV)
         let nalLengthSize = h264Params.nalLengthSize
@@ -168,13 +173,9 @@ public actor FMP4RecordingProtectionService {
         while let sampleBuffer = output.copyNextSampleBuffer() {
             guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
 
-            var length: Int = 0
-            var dataPointer: UnsafeMutablePointer<Int8>?
-            CMBlockBufferGetDataPointer(dataBuffer, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &dataPointer)
-
-            guard let pointer = dataPointer else { continue }
-            let sampleData = Data(bytes: pointer, count: length)
-            bytesRead += Int64(length)
+            // Copy via CMBlockBufferCopyDataBytes so non-contiguous CMBlockBuffers never cause heap over-reads
+            let sampleData = try Self.copyBlockBufferData(dataBuffer)
+            bytesRead += Int64(sampleData.count)
 
             // Encrypt the sample using the actual NAL length size from the source video
             let encryptedResult = try encryptor.encryptVideoSample(sampleData, nalLengthSize: nalLengthSize,
@@ -203,27 +204,18 @@ public actor FMP4RecordingProtectionService {
                 }
             }
 
-            // Get timing info
+            // Get timing info safely (reject invalid/indefinite CMTime or overflow instead of trapping)
             let duration = CMSampleBufferGetDuration(sampleBuffer)
-            let durationValue = UInt32(duration.value * Int64(timescale) / Int64(duration.timescale))
+            let durationValue = try Self.sampleDuration(from: duration, timescale: timescale)
 
             // Calculate Composition Time Offset (CTS) for B-frame support
-            // CTS = PTS - DTS (tells decoder when to display the frame relative to decode time)
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
             if pts.isNumeric, duration.isNumeric {
                 readEnd = max(readEnd, pts + duration)
             }
             let dts = CMSampleBufferGetDecodeTimeStamp(sampleBuffer)
-            if firstDecodeTime == nil { firstDecodeTime = dts.isNumeric ? dts : pts }
-            var compositionTimeOffset: Int32 = 0
-
-            // Only calculate CTS if both PTS and DTS are valid
-            if pts.isValid && dts.isValid && pts != dts {
-                // Convert both timestamps to the output timescale
-                let ptsInTimescale = Int64(pts.value) * Int64(timescale) / Int64(pts.timescale)
-                let dtsInTimescale = Int64(dts.value) * Int64(timescale) / Int64(dts.timescale)
-                compositionTimeOffset = Int32(ptsInTimescale - dtsInTimescale)
-            }
+            if firstDecodeTime == nil { firstDecodeTime = dts.isNumeric ? dts : (pts.isNumeric ? pts : nil) }
+            let compositionTimeOffset = try Self.compositionTimeOffset(pts: pts, dts: dts, timescale: timescale)
 
             // Check if sync sample
             let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
@@ -334,26 +326,33 @@ public actor FMP4RecordingProtectionService {
 
         print("   Created \(durations.count) segments per component")
 
+        // Release in-memory sample buffers now that all segments are written to tempDir to avoid RAM amplification
+        let videoSampleCount = samples.count
+        let audioChannels = sound?.source.channels
+        let hasSound = sound != nil
+        samples.removeAll(keepingCapacity: false)
+        sound = nil
+
         // 8. The playlists: one media playlist per component, each with the video's EXTINF values and target duration,
         // and the master playlist (ADR-0055 §4)
         print("📋 Generating HLS playlists...")
-        let components: [FairPlayComponent] = sound == nil ? [.video] : [.video, .audio]
+        let components: [FairPlayComponent] = !hasSound ? [.video] : [.video, .audio]
         let targetDuration = Self.targetDuration(forSegmentDurations: durations)
         for component in components {
             let playlist = FairPlayPackage.mediaPlaylist(component: component, policyUUID: contentKeyID, iv: constantIV,
                                                          durations: durations, targetDuration: targetDuration)
             try Data(playlist.utf8).write(to: tempDir.appendingPathComponent(FairPlayPackage.playlistName(component)))
         }
-        let bandwidth = FairPlayPackage.bandwidth(segmentBytes: sound == nil ? [videoBytes] : [videoBytes, audioBytes],
+        let bandwidth = FairPlayPackage.bandwidth(segmentBytes: !hasSound ? [videoBytes] : [videoBytes, audioBytes],
                                                   durations: durations)
         guard let master = FairPlayPackage.masterPlaylist(FairPlayPackage.MasterPlaylist(
             bandwidth: bandwidth.peak,
             averageBandwidth: bandwidth.average,
             videoCodec: videoCodec,
-            width: Int(dimensions.width),
-            height: Int(dimensions.height),
-            frameRate: Double(samples.count) / videoEnd,
-            audioChannels: sound?.source.channels
+            width: Int(videoWidth),
+            height: Int(videoHeight),
+            frameRate: Double(videoSampleCount) / videoEnd,
+            audioChannels: audioChannels
         )) else {
             // passThrough admitted only channel counts the master playlist states.
             throw FMP4ProtectionError.packagingFailed("the master playlist cannot state the audio's channel count")
@@ -368,12 +367,13 @@ public actor FMP4RecordingProtectionService {
                 + durations.indices.map { FairPlayPackage.segmentName(component, index: $0) }
         }
         if profile == .keyEnvelope {
-            let mediaFiles = try Dictionary(uniqueKeysWithValues: entryNames.map {
-                ($0, try Data(contentsOf: tempDir.appendingPathComponent($0)))
+            // Stream-hash each media file from disk instead of loading the entire video into RAM
+            let mediaDigests = try Dictionary(uniqueKeysWithValues: entryNames.map {
+                ($0, try Self.sha256Base64(ofFileAt: tempDir.appendingPathComponent($0)))
             })
             let envelope = try FairPlayKeyEnvelope.build(
                 componentKeys: componentKeys, iv: constantIV, assetID: assetID, policyJSON: policy,
-                mediaFiles: mediaFiles, kasURL: kasURL, publicKey: kasKey, kasKeyID: envelopeKeyID)
+                mediaDigests: mediaDigests, kasURL: kasURL, publicKey: kasKey, kasKeyID: envelopeKeyID)
             enhancedManifestData = envelope.manifest
             try envelope.payload.write(to: tempDir.appendingPathComponent(FairPlayKeyEnvelope.payloadName))
             entryNames.append(FairPlayKeyEnvelope.payloadName)
@@ -389,6 +389,113 @@ public actor FMP4RecordingProtectionService {
 
         print("✅ fMP4 FairPlay protection complete: \(archive.count) bytes")
         return archive
+    }
+
+    // MARK: - Safe Sample Buffer, Timing, and Dimension Helpers
+
+    /// Validates H.264 SPS/PPS counts and byte lengths against ISO/IEC 14496-15 `avcC` limits
+    /// before handing them to `FMP4Writer` / `AVCDecoderConfigurationRecord`.
+    static func checkParameterSets(sps: [Data], pps: [Data]) throws {
+        guard sps.count <= 31 else {
+            throw FMP4ProtectionError.packagingFailed("H.264 stream has \(sps.count) SPS entries (maximum 31)")
+        }
+        guard pps.count <= 255 else {
+            throw FMP4ProtectionError.packagingFailed("H.264 stream has \(pps.count) PPS entries (maximum 255)")
+        }
+        guard sps.allSatisfy({ $0.count <= Int(UInt16.max) }) else {
+            throw FMP4ProtectionError.packagingFailed("H.264 SPS entry exceeds 65535 bytes")
+        }
+        guard pps.allSatisfy({ $0.count <= Int(UInt16.max) }) else {
+            throw FMP4ProtectionError.packagingFailed("H.264 PPS entry exceeds 65535 bytes")
+        }
+    }
+
+    /// Copies all bytes from a `CMBlockBuffer` safely via `CMBlockBufferCopyDataBytes`,
+    /// handling non-contiguous buffers without heap buffer over-reads.
+    static func copyBlockBufferData(_ blockBuffer: CMBlockBuffer) throws -> Data {
+        let totalLength = CMBlockBufferGetDataLength(blockBuffer)
+        guard totalLength > 0 else { return Data() }
+        var data = Data(count: totalLength)
+        let status = data.withUnsafeMutableBytes { buffer -> OSStatus in
+            guard let baseAddress = buffer.baseAddress else {
+                return kCMBlockBufferBadPointerParameterErr
+            }
+            return CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: totalLength, destination: baseAddress)
+        }
+        guard status == kCMBlockBufferNoErr else {
+            throw FMP4ProtectionError.readFailed("CMBlockBufferCopyDataBytes failed (\(status))")
+        }
+        return data
+    }
+
+    static func validateDimensions(_ size: CGSize) throws -> (width: UInt16, height: UInt16) {
+        guard size.width.isFinite, size.height.isFinite,
+              size.width >= 1, size.height >= 1,
+              size.width <= Double(UInt16.max), size.height <= Double(UInt16.max),
+              let width = UInt16(exactly: size.width.rounded()),
+              let height = UInt16(exactly: size.height.rounded()),
+              width > 0, height > 0
+        else {
+            throw FMP4ProtectionError.readFailed("invalid video track dimensions: \(size.width)x\(size.height)")
+        }
+        return (width, height)
+    }
+
+    static func validateTimescale(_ timescale: CMTimeScale) throws -> UInt32 {
+        guard timescale > 0, let value = UInt32(exactly: timescale) else {
+            throw FMP4ProtectionError.readFailed("invalid video track timescale: \(timescale)")
+        }
+        return value
+    }
+
+    /// Converts a sample's `CMTime` duration into `timescale` ticks without division-by-zero or integer overflow traps.
+    static func sampleDuration(from duration: CMTime, timescale: CMTimeScale) throws -> UInt32 {
+        guard timescale > 0,
+              duration.isNumeric,
+              duration.timescale > 0,
+              duration.value >= 0
+        else {
+            throw FMP4ProtectionError.readFailed("invalid video sample duration")
+        }
+        let converted = CMTimeConvertScale(duration, timescale: timescale, method: .default)
+        guard converted.isNumeric,
+              converted.value >= 0,
+              let exact = UInt32(exactly: converted.value)
+        else {
+            throw FMP4ProtectionError.readFailed("video sample duration out of UInt32 range")
+        }
+        return exact
+    }
+
+    /// Computes composition time offset (`PTS - DTS`) in `timescale` ticks safely without trapping on invalid/indefinite `CMTime`.
+    static func compositionTimeOffset(pts: CMTime, dts: CMTime, timescale: CMTimeScale) throws -> Int32 {
+        guard timescale > 0,
+              pts.isNumeric, dts.isNumeric,
+              pts.timescale > 0, dts.timescale > 0,
+              pts != dts
+        else {
+            return 0
+        }
+        let delta = CMTimeSubtract(pts, dts)
+        guard delta.isNumeric else {
+            return 0
+        }
+        let converted = CMTimeConvertScale(delta, timescale: timescale, method: .default)
+        guard converted.isNumeric, let exact = Int32(exactly: converted.value) else {
+            throw FMP4ProtectionError.readFailed("composition time offset out of Int32 range")
+        }
+        return exact
+    }
+
+    /// Streams a file in 64 KiB chunks to compute its base64 SHA-256 digest without buffering the whole file in RAM.
+    private static func sha256Base64(ofFileAt url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while let chunk = try handle.read(upToCount: 64 * 1024), !chunk.isEmpty {
+            hasher.update(data: chunk)
+        }
+        return Data(hasher.finalize()).base64EncodedString()
     }
 
     // MARK: - Audio
@@ -777,18 +884,33 @@ public actor FMP4RecordingProtectionService {
     static func audioSpecificConfig(of format: CMAudioFormatDescription) -> Data? {
         var size = 0
         guard let cookie = CMAudioFormatDescriptionGetMagicCookie(format, sizeOut: &size), size > 0 else { return nil }
-        var bytes = [UInt8](UnsafeRawBufferPointer(start: cookie, count: size))
+        let bytes = [UInt8](UnsafeRawBufferPointer(start: cookie, count: size))
+        return audioSpecificConfig(fromMagicCookie: bytes)
+    }
+
+    /// Parses AudioSpecificConfig from raw magic cookie bytes (bare AudioSpecificConfig or MPEG-4 ES_Descriptor).
+    /// Follows ISO/IEC 14496-1 §7.2.6.5 field order: `streamDependenceFlag` (0x80), `URL_Flag` (0x40), `OCRstreamFlag` (0x20).
+    static func audioSpecificConfig(fromMagicCookie rawBytes: [UInt8]) -> Data? {
+        var bytes = rawBytes
         if bytes.count > 4, bytes[0 ..< 4] == [0, 0, 0, 0], bytes[4] == 0x03 { bytes.removeFirst(4) }
-        guard bytes.first == 0x03 else { return Data(bytes) }
-        // ES_Descriptor: ES_ID, flags and their optional fields, then the DecoderConfigDescriptor (tag 4), whose
-        // 13 fixed bytes precede the DecoderSpecificInfo (tag 5).
+        guard bytes.first == 0x03 else { return bytes.isEmpty ? nil : Data(bytes) }
+        // ES_Descriptor: ES_ID (2B), flags (1B), then optional fields in ISO/IEC 14496-1 order:
+        // 0x80 streamDependenceFlag (2B) -> 0x40 URL_Flag (1B len + len B) -> 0x20 OCRstreamFlag (2B),
+        // followed by DecoderConfigDescriptor (tag 4), whose 13 fixed bytes precede DecoderSpecificInfo (tag 5).
         guard let stream = descriptor(bytes, at: 0), stream.tag == 0x03, stream.body.count >= 3 else { return nil }
         let flags = bytes[stream.body.lowerBound + 2]
-        var cursor = stream.body.lowerBound + 3 + (flags & 0x80 != 0 ? 2 : 0) + (flags & 0x20 != 0 ? 2 : 0)
+        var cursor = stream.body.lowerBound + 3
+        if flags & 0x80 != 0 {
+            cursor += 2
+        }
         if flags & 0x40 != 0 {
             guard cursor < stream.body.upperBound else { return nil }
             cursor += 1 + Int(bytes[cursor])
         }
+        if flags & 0x20 != 0 {
+            cursor += 2
+        }
+        guard cursor <= stream.body.upperBound else { return nil }
         while cursor < stream.body.upperBound {
             guard let next = descriptor(bytes, at: cursor), next.body.upperBound <= stream.body.upperBound else {
                 return nil
@@ -973,14 +1095,15 @@ public actor FMP4RecordingProtectionService {
             return nil
         }
 
-        // Parse avcC to extract SPS/PPS and NAL length size
+        // Parse avcC to extract SPS/PPS and NAL length size (safe for non-zero Data.startIndex slices)
         // Format: configVersion(1) + profile(1) + compatibility(1) + level(1) + lengthSizeMinusOne(1)
         //         + numSPS(1) + [spsLen(2) + sps]* + numPPS(1) + [ppsLen(2) + pps]*
-        guard avcCData.count >= 8 else { return nil }
+        let bytes = [UInt8](avcCData)
+        guard bytes.count >= 8 else { return nil }
 
         // Extract NAL length size from byte 4 (lower 2 bits + 1)
         // Values: 0 → 1 byte, 1 → 2 bytes, 3 → 4 bytes
-        let lengthSizeMinusOne = Int(avcCData[4] & 0x03)
+        let lengthSizeMinusOne = Int(bytes[4] & 0x03)
         let nalLengthSize = lengthSizeMinusOne + 1
         print("📏 NAL length size from avcC: \(nalLengthSize) bytes")
 
@@ -989,31 +1112,31 @@ public actor FMP4RecordingProtectionService {
         var offset = 5  // Skip header (configVersion + profile + compatibility + level + lengthSizeMinusOne)
 
         // Number of SPS (lower 5 bits)
-        let numSPS = Int(avcCData[offset] & 0x1F)
+        let numSPS = Int(bytes[offset] & 0x1F)
         offset += 1
 
         for _ in 0..<numSPS {
-            guard offset + 2 <= avcCData.count else { break }
-            let spsLen = Int(avcCData[offset]) << 8 | Int(avcCData[offset + 1])
+            guard offset + 2 <= bytes.count else { break }
+            let spsLen = Int(bytes[offset]) << 8 | Int(bytes[offset + 1])
             offset += 2
-            guard offset + spsLen <= avcCData.count else { break }
-            sps.append(avcCData.subdata(in: offset..<(offset + spsLen)))
+            guard offset + spsLen <= bytes.count else { break }
+            sps.append(Data(bytes[offset..<(offset + spsLen)]))
             offset += spsLen
         }
 
-        guard offset < avcCData.count else {
+        guard offset < bytes.count else {
             return sps.isEmpty ? nil : H264Parameters(sps: sps, pps: pps, nalLengthSize: nalLengthSize)
         }
 
-        let numPPS = Int(avcCData[offset])
+        let numPPS = Int(bytes[offset])
         offset += 1
 
         for _ in 0..<numPPS {
-            guard offset + 2 <= avcCData.count else { break }
-            let ppsLen = Int(avcCData[offset]) << 8 | Int(avcCData[offset + 1])
+            guard offset + 2 <= bytes.count else { break }
+            let ppsLen = Int(bytes[offset]) << 8 | Int(bytes[offset + 1])
             offset += 2
-            guard offset + ppsLen <= avcCData.count else { break }
-            pps.append(avcCData.subdata(in: offset..<(offset + ppsLen)))
+            guard offset + ppsLen <= bytes.count else { break }
+            pps.append(Data(bytes[offset..<(offset + ppsLen)]))
             offset += ppsLen
         }
 
@@ -1113,7 +1236,8 @@ public actor FMP4RecordingProtectionService {
     ) throws -> Data {
         // Its size first, from the entries' sizes: nothing is read for an archive a ZIP cannot hold.
         let sizes = try entryNames.map { (name: $0, size: try entrySize(tempDir.appendingPathComponent($0))) }
-        try checkArchiveSize(archiveSize(entries: [(FairPlayPackage.manifestName, manifestData.count)] + sizes))
+        let totalArchiveSize = archiveSize(entries: [(FairPlayPackage.manifestName, manifestData.count)] + sizes)
+        try checkArchiveSize(totalArchiveSize)
 
         // Within the ceiling every field fits; a conversion that does not is a failure, never a trap.
         func field32(_ value: Int) throws -> UInt32 {
@@ -1129,21 +1253,18 @@ public actor FMP4RecordingProtectionService {
             return field
         }
 
-        // Create ZIP archive manually (simplified implementation)
+        // Pre-allocate the exact archive capacity and stream one file at a time from disk so
+        // we never hold both a full `files` array and the output `archive` buffer in RAM simultaneously.
         var archive = Data()
-
-        // Files to include: the manifest, then the playlists, inits and segments
-        var files: [(name: String, data: Data)] = [(FairPlayPackage.manifestName, manifestData)]
-        for name in entryNames {
-            files.append((name, try Data(contentsOf: tempDir.appendingPathComponent(name))))
+        if let capacity = Int(exactly: totalArchiveSize) {
+            archive.reserveCapacity(capacity)
         }
 
-        // Simple ZIP creation (no compression for media files)
         var centralDirectory = Data()
         var localOffset: UInt32 = 0
+        let totalEntryCount = 1 + entryNames.count
 
-        for file in files {
-            // Local file header
+        func appendEntry(name: String, data: Data) throws {
             var localHeader = Data()
             localHeader.append(contentsOf: [0x50, 0x4B, 0x03, 0x04]) // Signature
             localHeader.append(contentsOf: [0x14, 0x00])            // Version needed (2.0)
@@ -1152,33 +1273,22 @@ public actor FMP4RecordingProtectionService {
             localHeader.append(contentsOf: [0x00, 0x00])            // Last mod time
             localHeader.append(contentsOf: [0x00, 0x00])            // Last mod date
 
-            // CRC-32 (calculated)
-            let crc = crc32(file.data)
+            let crc = crc32(data)
             localHeader.append(crc.littleEndianData)
 
-            // Compressed size (same as uncompressed for store)
-            let size = try field32(file.data.count)
+            let size = try field32(data.count)
+            localHeader.append(size.littleEndianData)
             localHeader.append(size.littleEndianData)
 
-            // Uncompressed size
-            localHeader.append(size.littleEndianData)
-
-            // Filename length
-            let filenameData = Data(file.name.utf8)
+            let filenameData = Data(name.utf8)
             let filenameLength = try field16(filenameData.count)
             localHeader.append(filenameLength.littleEndianData)
-
-            // Extra field length
-            localHeader.append(contentsOf: [0x00, 0x00])
-
-            // Filename
+            localHeader.append(contentsOf: [0x00, 0x00])            // Extra field length
             localHeader.append(filenameData)
 
-            // File data
             archive.append(localHeader)
-            archive.append(file.data)
+            archive.append(data)
 
-            // Central directory entry
             var cdEntry = Data()
             cdEntry.append(contentsOf: [0x50, 0x4B, 0x01, 0x02]) // Signature
             cdEntry.append(contentsOf: [0x14, 0x00])            // Version made by
@@ -1203,6 +1313,13 @@ public actor FMP4RecordingProtectionService {
             localOffset = try field32(archive.count)
         }
 
+        // Write manifest first, then stream each media/envelope entry one at a time
+        try appendEntry(name: FairPlayPackage.manifestName, data: manifestData)
+        for name in entryNames {
+            let entryData = try Data(contentsOf: tempDir.appendingPathComponent(name))
+            try appendEntry(name: name, data: entryData)
+        }
+
         let cdOffset = archive.count
         archive.append(centralDirectory)
 
@@ -1211,8 +1328,8 @@ public actor FMP4RecordingProtectionService {
         eocd.append(contentsOf: [0x50, 0x4B, 0x05, 0x06]) // Signature
         eocd.append(contentsOf: [0x00, 0x00])            // Disk number
         eocd.append(contentsOf: [0x00, 0x00])            // CD start disk
-        eocd.append(try field16(files.count).littleEndianData)
-        eocd.append(try field16(files.count).littleEndianData)
+        eocd.append(try field16(totalEntryCount).littleEndianData)
+        eocd.append(try field16(totalEntryCount).littleEndianData)
         eocd.append(try field32(centralDirectory.count).littleEndianData)
         eocd.append(try field32(cdOffset).littleEndianData)
         eocd.append(contentsOf: [0x00, 0x00])            // Comment length
@@ -1222,10 +1339,12 @@ public actor FMP4RecordingProtectionService {
         return archive
     }
 
-    /// Simple CRC-32 implementation
+    private static let crcTable: [UInt32] = makeCRCTable()
+
+    /// Simple CRC-32 implementation using cached lookup table
     private static func crc32(_ data: Data) -> UInt32 {
         var crc: UInt32 = 0xFFFFFFFF
-        let table = makeCRCTable()
+        let table = crcTable
 
         for byte in data {
             let index = Int((crc ^ UInt32(byte)) & 0xFF)

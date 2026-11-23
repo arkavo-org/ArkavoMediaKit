@@ -56,8 +56,66 @@ public enum InputValidator {
     public enum Limits {
         public static let assetIDMaxLength = 256
         public static let userIDMaxLength = 256
+        public static let sessionIDMaxLength = 512
         public static let regionCodeLength = 2
         public static let policyAttributeMaxLength = 512
+    }
+
+    /// Strict RFC 3986 unreserved characters for percent-encoding query parameter values
+    private static let queryValueAllowed = CharacterSet(
+        charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+    )
+
+    /// Returns true if the URL uses HTTPS with a non-empty host, or cleartext HTTP strictly to a loopback host.
+    static func isAllowedHTTPSOrLoopbackHTTP(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(),
+              let host = url.host?.lowercased(),
+              !host.isEmpty
+        else {
+            return false
+        }
+        if scheme == "https" {
+            return true
+        }
+        if scheme == "http" {
+            return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
+        }
+        return false
+    }
+
+    /// Validate session ID (prevents URL path traversal / endpoint injection while accepting
+    /// production `arks` session IDs shaped like `<sub:asset_id:uuid>`).
+    /// - Parameter sessionID: Session identifier
+    /// - Throws: ValidationError.invalidSessionID if invalid
+    public static func validateSessionID(_ sessionID: String) throws {
+        guard !sessionID.isEmpty,
+              sessionID.utf8.count <= Limits.sessionIDMaxLength,
+              sessionID != ".",
+              sessionID != "..",
+              !sessionID.contains("..")
+        else {
+            throw ValidationError.invalidSessionID
+        }
+
+        // Allow printable single-path-segment ASCII (including ':', '|', '.', '-', '_', '@', '+', '~')
+        // while rejecting slashes, backslashes, query/fragment/percent delimiters, quotes, whitespace, and control chars.
+        let isValid = sessionID.utf8.allSatisfy { byte in
+            guard byte >= 0x21 && byte <= 0x7E else { return false }
+            switch byte {
+            case UInt8(ascii: "/"), UInt8(ascii: "\\"), UInt8(ascii: "?"),
+                 UInt8(ascii: "#"), UInt8(ascii: "%"), UInt8(ascii: "\""),
+                 UInt8(ascii: "'"), UInt8(ascii: "<"), UInt8(ascii: ">"),
+                 UInt8(ascii: "{"), UInt8(ascii: "}"),
+                 UInt8(ascii: "^"), UInt8(ascii: "`"):
+                return false
+            default:
+                return true
+            }
+        }
+
+        guard isValid else {
+            throw ValidationError.invalidSessionID
+        }
     }
 
     /// Validate asset ID
@@ -109,21 +167,21 @@ public enum InputValidator {
     }
 
     /// Validate region code (ISO 3166-1 alpha-2)
-    /// - Parameter regionCode: Two-letter region code
+    /// - Parameter regionCode: Two-letter ASCII uppercase region code
     /// - Throws: ValidationError if invalid
     public static func validateRegionCode(_ regionCode: String) throws {
-        guard regionCode.count == Limits.regionCodeLength else {
+        guard regionCode.utf8.count == Limits.regionCodeLength else {
             throw ValidationError.invalidRegionCode(regionCode)
         }
 
-        guard regionCode.unicodeScalars.allSatisfy({ CharacterSet.uppercaseLetters.contains($0) }) else {
+        guard regionCode.utf8.allSatisfy({ $0 >= UInt8(ascii: "A") && $0 <= UInt8(ascii: "Z") }) else {
             throw ValidationError.invalidRegionCode(regionCode)
         }
     }
 
     /// Validate and sanitize policy attribute
     /// - Parameter attribute: Policy attribute string
-    /// - Returns: Sanitized attribute
+    /// - Returns: Sanitized attribute safe for query parameter transmission
     /// - Throws: ValidationError if invalid
     public static func validatePolicyAttribute(_ attribute: String) throws -> String {
         guard !attribute.isEmpty else {
@@ -137,9 +195,9 @@ public enum InputValidator {
             )
         }
 
-        // URL-encode for safe transmission
+        // Percent-encode all non-unreserved characters so query delimiters (&, =, +, ;, ?, #) cannot inject params
         guard let encoded = attribute.addingPercentEncoding(
-            withAllowedCharacters: .urlQueryAllowed
+            withAllowedCharacters: queryValueAllowed
         ) else {
             throw ValidationError.invalidPolicyAttribute(attribute)
         }
@@ -148,15 +206,28 @@ public enum InputValidator {
     }
 
     /// Validate URL
-    /// - Parameter urlString: URL string
+    /// - Parameter urlString: URL string (requires https or tdf3 with a non-empty host; http only for loopback)
     /// - Throws: ValidationError if invalid
     public static func validateURL(_ urlString: String) throws -> URL {
         guard let url = URL(string: urlString),
-              let scheme = url.scheme,
-              ["http", "https", "tdf3"].contains(scheme) else {
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host?.lowercased(),
+              !host.isEmpty
+        else {
             throw ValidationError.invalidURL(urlString)
         }
 
-        return url
+        switch scheme {
+        case "https", "tdf3":
+            return url
+        case "http":
+            let normalizedHost = host.hasSuffix(".") ? String(host.dropLast()) : host
+            guard normalizedHost == "localhost" || normalizedHost == "127.0.0.1" || normalizedHost == "::1" else {
+                throw ValidationError.invalidURL(urlString)
+            }
+            return url
+        default:
+            throw ValidationError.invalidURL(urlString)
+        }
     }
 }

@@ -69,27 +69,66 @@ struct AVFoundationKeyRequest: FairPlayKeyRequesting {
 /// The delegate's HTTP, and the packager's for the envelope key: URLSession, or a test's.
 protocol FairPlayHTTP: Sendable {
     func data(for request: URLRequest) async throws -> (Data, URLResponse)
+    func data(for request: URLRequest, maxBytes: Int) async throws -> (Data, URLResponse)
+}
+
+extension FairPlayHTTP {
+    func data(for request: URLRequest, maxBytes: Int) async throws -> (Data, URLResponse) {
+        let (data, response) = try await data(for: request)
+        if response.expectedContentLength > Int64(maxBytes) || data.count > maxBytes {
+            throw BoundedResponseError.responseTooLarge(limit: maxBytes)
+        }
+        return (data, response)
+    }
 }
 
 /// URLSession, never following a redirect. Every request the delegate makes carries the bearer token, and the key
 /// request also the SPC and the archive manifest: a redirect (a 307 or 308 re-sends the body) would hand them to
 /// another server. Refused, the 3xx is the answer, which the delegate treats as a failure like any other non-2xx.
 /// The packager's envelope-key fetch fails on one too: the key it wraps to comes from the KAS server and nowhere else.
-struct URLSessionFairPlayHTTP: FairPlayHTTP {
-    /// The session every delegate shares. A session keeps its delegate until it is invalidated; this one never is.
-    private static let shared = URLSession(configuration: .default, delegate: RedirectRefusal(), delegateQueue: nil)
+final class URLSessionFairPlayHTTP: FairPlayHTTP {
+    /// Default maximum response size when callers do not pass a tighter per-endpoint limit (1 MiB).
+    static let defaultMaxResponseBytes = 1 * 1024 * 1024
+
+    /// The session every delegate shares. Ephemeral (no disk cache or persistent cookies), with explicit timeouts,
+    /// and never following redirects.
+    private static let shared: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 60
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.urlCache = nil
+        return URLSession(configuration: config, delegate: RedirectRefusal(), delegateQueue: nil)
+    }()
 
     private let session: URLSession
+    private let ownsSession: Bool
 
-    init() { session = Self.shared }
+    init() {
+        session = Self.shared
+        ownsSession = false
+    }
 
-    /// A session of its own with `configuration`, which also refuses every redirect.
+    /// A session of its own with `configuration`, which also refuses every redirect and cleans up on deinit.
     init(configuration: URLSessionConfiguration) {
-        session = URLSession(configuration: configuration, delegate: RedirectRefusal(), delegateQueue: nil)
+        let config = (configuration.copy() as? URLSessionConfiguration) ?? configuration
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        session = URLSession(configuration: config, delegate: RedirectRefusal(), delegateQueue: nil)
+        ownsSession = true
+    }
+
+    deinit {
+        if ownsSession {
+            session.finishTasksAndInvalidate()
+        }
     }
 
     func data(for request: URLRequest) async throws -> (Data, URLResponse) {
-        try await session.data(for: request)
+        try await session.boundedData(for: request, maxBytes: Self.defaultMaxResponseBytes)
+    }
+
+    func data(for request: URLRequest, maxBytes: Int) async throws -> (Data, URLResponse) {
+        try await session.boundedData(for: request, maxBytes: maxBytes)
     }
 }
 

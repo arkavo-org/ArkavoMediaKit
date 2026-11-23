@@ -2,6 +2,7 @@ import AVFoundation
 import CryptoKit
 import Foundation
 import OpenTDFKit
+import Synchronization
 
 /// Custom URL scheme for TDF-protected HLS content
 public let tdfHLSScheme = "tdf-hls"
@@ -9,17 +10,49 @@ public let tdfHLSScheme = "tdf-hls"
 /// AVAssetResourceLoaderDelegate for serving TDF-protected HLS content
 ///
 /// Intercepts requests for:
-/// - `tdf-hls://playlist.m3u8` - Returns the local playlist
-/// - `tdf-hls://segments/N.enc` - Decrypts and returns segment data
-/// - `tdf-hls://key` - Triggers key request via FairPlay or returns cached key
-public class HLSResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
+/// - `tdf-hls://local/playlist.m3u8` (or `tdf-hls://playlist.m3u8`) - Returns the local playlist
+/// - `tdf-hls://local/segments/N.enc` (or `tdf-hls://segments/N.enc`) - Decrypts and returns segment data
+public final class HLSResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelegate, Sendable {
+    enum ResourceRoute: Equatable, Sendable {
+        case playlist
+        case segment(Int)
+    }
+
+    private struct KeyCallbackBox: @unchecked Sendable {
+        let handler: (HLSManifest) async throws -> SymmetricKey
+    }
+
+    private struct InFlightSlot: Sendable {
+        var task: Task<Void, Never>?
+        var cancelled = false
+    }
+
+    private struct InFlightKeyRequest: Sendable {
+        let id: UInt64
+        let task: Task<SymmetricKey, Error>
+    }
+
+    private struct State: Sendable {
+        var symmetricKey: SymmetricKey?
+        var onKeyRequest: KeyCallbackBox?
+        var inFlightKeyRequest: InFlightKeyRequest?
+        var nextKeyRequestID: UInt64 = 0
+        var inFlightTasks: [ObjectIdentifier: InFlightSlot] = [:]
+    }
+
     private let localAsset: LocalHLSAsset
     private let extractor: HLSTDFExtractor
-    private var symmetricKey: SymmetricKey?
-    private let queue = DispatchQueue(label: "com.arkavo.hlsResourceLoader")
+    private let state = Mutex(State())
+    private let responseQueue = DispatchQueue(label: "com.arkavo.hlsResourceLoader")
 
-    /// Callback for key requests - implement for FairPlay integration
-    public var onKeyRequest: ((HLSManifest) async throws -> SymmetricKey)?
+    /// Callback for key requests - implement for KAS/FairPlay key retrieval
+    public var onKeyRequest: ((HLSManifest) async throws -> SymmetricKey)? {
+        get { state.withLock { $0.onKeyRequest?.handler } }
+        set {
+            let boxed = newValue.map(KeyCallbackBox.init(handler:))
+            state.withLock { $0.onKeyRequest = boxed }
+        }
+    }
 
     /// Initialize with extracted local HLS asset
     ///
@@ -39,9 +72,151 @@ public class HLSResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelegate,
     ///
     /// Call this after obtaining the key from KAS or FairPlay
     public func setSymmetricKey(_ key: SymmetricKey) {
-        queue.sync {
-            self.symmetricKey = key
+        state.withLock {
+            $0.symmetricKey = key
+            $0.inFlightKeyRequest = nil
         }
+    }
+
+    /// Resolves the symmetric key, coalescing concurrent `onKeyRequest` lookups onto a single shared task.
+    /// Clears the in-flight task upon completion or failure so retries work after transient errors.
+    func resolveSymmetricKey() async throws -> SymmetricKey {
+        enum Resolution {
+            case cached(SymmetricKey)
+            case inFlight(Task<SymmetricKey, Error>)
+            case missing
+        }
+
+        let resolution: Resolution = state.withLock { state in
+            if let cached = state.symmetricKey {
+                return .cached(cached)
+            }
+            if let existing = state.inFlightKeyRequest {
+                return .inFlight(existing.task)
+            }
+            guard let callback = state.onKeyRequest else {
+                return .missing
+            }
+            state.nextKeyRequestID &+= 1
+            let requestID = state.nextKeyRequestID
+            let manifest = self.localAsset.manifest
+            let task = Task<SymmetricKey, Error> { [weak self] in
+                do {
+                    let key = try await callback.handler(manifest)
+                    self?.state.withLock { state in
+                        if state.symmetricKey == nil {
+                            state.symmetricKey = key
+                        }
+                        if state.inFlightKeyRequest?.id == requestID {
+                            state.inFlightKeyRequest = nil
+                        }
+                    }
+                    return key
+                } catch {
+                    self?.state.withLock { state in
+                        if state.inFlightKeyRequest?.id == requestID {
+                            state.inFlightKeyRequest = nil
+                        }
+                    }
+                    throw error
+                }
+            }
+            state.inFlightKeyRequest = InFlightKeyRequest(id: requestID, task: task)
+            return .inFlight(task)
+        }
+
+        switch resolution {
+        case let .cached(key):
+            return key
+        case let .inFlight(task):
+            return try await task.value
+        case .missing:
+            throw HLSResourceLoaderError.keyNotAvailable
+        }
+    }
+
+    // MARK: - URL Routing & Range Helpers
+
+    /// Parses a `tdf-hls://` URL, supporting both authority-host form (`tdf-hls://playlist.m3u8`,
+    /// `tdf-hls://segments/0.enc`) and host+path form (`tdf-hls://local/playlist.m3u8`,
+    /// `tdf-hls://local/segments/0.enc`). Rejects negative indices, traversal, and raw key routes.
+    static func route(for url: URL) -> ResourceRoute? {
+        guard url.scheme?.lowercased() == tdfHLSScheme else {
+            return nil
+        }
+
+        // Build normalized path components from host (unless placeholder host "local") and path
+        var components: [String] = []
+        if let host = url.host, !host.isEmpty, host.lowercased() != "local" {
+            components.append(host)
+        }
+        let pathParts = url.path.split(separator: "/").map(String.init)
+        components.append(contentsOf: pathParts)
+
+        if components == ["playlist.m3u8"] {
+            return .playlist
+        }
+
+        if components.count == 2,
+           components[0] == "segments",
+           components[1].hasSuffix(".enc")
+        {
+            let digits = String(components[1].dropLast(4))
+            guard !digits.isEmpty,
+                  digits.allSatisfy({ $0.isASCII && $0.isNumber }),
+                  let index = Int(digits),
+                  index >= 0
+            else {
+                return nil
+            }
+            return .segment(index)
+        }
+
+        return nil
+    }
+
+    /// Safely computes a byte-range slice without negative-index or integer-overflow crashes.
+    /// Returns `nil` when `requestedOffset < 0`, `requestedLength < 0`, or `dataCount < 0`.
+    static func safeByteRange(requestedOffset: Int64, requestedLength: Int, dataCount: Int) -> Range<Int>? {
+        guard requestedOffset >= 0, requestedLength >= 0, dataCount >= 0 else {
+            return nil
+        }
+        guard requestedOffset < Int64(dataCount) else {
+            return dataCount ..< dataCount
+        }
+        let start = Int(requestedOffset)
+        let (rawEnd, overflow) = start.addingReportingOverflow(requestedLength)
+        let end = overflow ? dataCount : min(rawEnd, dataCount)
+        return start ..< end
+    }
+
+    /// Rewrites relative segment URIs line-by-line (never global `replacingOccurrences`) and strips
+    /// `#EXT-X-KEY` tags so AVPlayer does not double-decrypt segments decrypted locally by the delegate.
+    static func rewritePlaylistURLs(_ playlist: String) -> String {
+        let normalized = playlist.replacingOccurrences(of: "\r\n", with: "\n")
+        let lines = normalized.split(separator: "\n", omittingEmptySubsequences: false)
+        var rewritten: [String] = []
+        rewritten.reserveCapacity(lines.count)
+
+        for rawLine in lines {
+            let line = String(rawLine)
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("#EXT-X-KEY:") {
+                // Segments are decrypted locally in handleSegmentRequest; strip AES-128 key tag
+                // to avoid AVPlayer double-decryption and raw key exposure.
+                continue
+            }
+            if trimmed.hasPrefix("segments/"),
+               trimmed.hasSuffix(".enc"),
+               !trimmed.contains("..")
+            {
+                rewritten.append("\(tdfHLSScheme)://local/\(trimmed)")
+            } else {
+                rewritten.append(line)
+            }
+        }
+
+        return rewritten.joined(separator: "\n")
     }
 
     // MARK: - AVAssetResourceLoaderDelegate
@@ -51,198 +226,163 @@ public class HLSResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelegate,
         shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
     ) -> Bool {
         guard let url = loadingRequest.request.url,
-              url.scheme == tdfHLSScheme
+              let route = Self.route(for: url)
         else {
             return false
         }
 
-        // Handle different resource types
-        let path = url.path
-        if path.hasSuffix(".m3u8") {
+        switch route {
+        case .playlist:
             return handlePlaylistRequest(loadingRequest)
-        } else if path.contains("/segments/") && path.hasSuffix(".enc") {
-            return handleSegmentRequest(loadingRequest, path: path)
-        } else if path == "/key" {
-            return handleKeyRequest(loadingRequest)
+        case let .segment(segmentIndex):
+            return handleSegmentRequest(loadingRequest, segmentIndex: segmentIndex)
         }
-
-        return false
     }
 
     public func resourceLoader(
         _ resourceLoader: AVAssetResourceLoader,
         didCancel loadingRequest: AVAssetResourceLoadingRequest
     ) {
-        // Handle cancellation if needed
+        let id = ObjectIdentifier(loadingRequest)
+        let task: Task<Void, Never>? = state.withLock { state in
+            if var slot = state.inFlightTasks[id] {
+                slot.cancelled = true
+                let existingTask = slot.task
+                state.inFlightTasks.removeValue(forKey: id)
+                return existingTask
+            }
+            return nil
+        }
+        task?.cancel()
     }
 
     // MARK: - Request Handlers
 
     private func handlePlaylistRequest(_ loadingRequest: AVAssetResourceLoadingRequest) -> Bool {
-        queue.async { [weak self] in
+        let requestBox = LoadingRequestBox(loadingRequest)
+        responseQueue.async { [weak self] in
             guard let self else { return }
+            let req = requestBox.request
+            guard !req.isCancelled else { return }
 
             do {
-                // Read and modify playlist to use our custom scheme
-                var playlistContent = try String(contentsOf: localAsset.playlistURL, encoding: .utf8)
-
-                // Replace segment paths with our custom scheme
-                playlistContent = self.rewritePlaylistURLs(playlistContent)
-
-                // Add key URI for FairPlay
-                if !playlistContent.contains("#EXT-X-KEY:") {
-                    // Insert key tag before first segment
-                    let keyTag = "#EXT-X-KEY:METHOD=AES-128,URI=\"\(tdfHLSScheme)://key\"\n"
-                    if let range = playlistContent.range(of: "#EXTINF:") {
-                        playlistContent.insert(contentsOf: keyTag, at: range.lowerBound)
-                    }
-                }
+                let rawPlaylist = try String(contentsOf: localAsset.playlistURL, encoding: .utf8)
+                let playlistContent = Self.rewritePlaylistURLs(rawPlaylist)
 
                 guard let data = playlistContent.data(using: .utf8) else {
-                    loadingRequest.finishLoading(with: HLSResourceLoaderError.playlistEncodingFailed)
+                    req.finishLoading(with: HLSResourceLoaderError.playlistEncodingFailed)
                     return
                 }
 
-                loadingRequest.contentInformationRequest?.contentType = "application/x-mpegURL"
-                loadingRequest.contentInformationRequest?.contentLength = Int64(data.count)
-                loadingRequest.contentInformationRequest?.isByteRangeAccessSupported = false
+                req.contentInformationRequest?.contentType = "application/x-mpegURL"
+                req.contentInformationRequest?.contentLength = Int64(data.count)
+                req.contentInformationRequest?.isByteRangeAccessSupported = false
 
-                loadingRequest.dataRequest?.respond(with: data)
-                loadingRequest.finishLoading()
+                req.dataRequest?.respond(with: data)
+                req.finishLoading()
             } catch {
-                loadingRequest.finishLoading(with: error)
+                req.finishLoading(with: error)
             }
         }
         return true
     }
 
-    private func handleSegmentRequest(_ loadingRequest: AVAssetResourceLoadingRequest, path: String) -> Bool {
-        Task { [weak self] in
+    private func handleSegmentRequest(_ loadingRequest: AVAssetResourceLoadingRequest, segmentIndex: Int) -> Bool {
+        let requestBox = LoadingRequestBox(loadingRequest)
+        let requestID = ObjectIdentifier(loadingRequest)
+
+        // Reserve slot before launching Task so a fast-finishing task or immediate didCancel cannot race/leak
+        state.withLock { $0.inFlightTasks[requestID] = InFlightSlot() }
+
+        let task = Task { [weak self] in
             guard let self else { return }
+            defer {
+                _ = self.state.withLock { $0.inFlightTasks.removeValue(forKey: requestID) }
+            }
 
             do {
-                // Extract segment index from path (e.g., "/segments/0.enc" -> 0)
-                guard let indexString = path.components(separatedBy: "/").last?
-                    .replacingOccurrences(of: ".enc", with: ""),
-                    let segmentIndex = Int(indexString),
-                    segmentIndex < localAsset.segmentURLs.count
-                else {
-                    loadingRequest.finishLoading(with: HLSResourceLoaderError.invalidSegmentPath)
+                try Task.checkCancellation()
+
+                guard segmentIndex >= 0, segmentIndex < localAsset.segmentURLs.count else {
+                    finishOnQueue(requestBox, error: HLSResourceLoaderError.invalidSegmentPath)
                     return
                 }
 
-                // Get the symmetric key
-                var key = queue.sync { self.symmetricKey }
-                if key == nil {
-                    // Key not yet available - need to request it
-                    if let onKeyRequest = self.onKeyRequest {
-                        key = try await onKeyRequest(self.localAsset.manifest)
-                        self.setSymmetricKey(key!)
-                    } else {
-                        loadingRequest.finishLoading(with: HLSResourceLoaderError.keyNotAvailable)
-                        return
-                    }
-                }
+                // Obtain the symmetric key without blocking a dispatch queue, coalescing concurrent lookups
+                let symmetricKey = try await resolveSymmetricKey()
+                try Task.checkCancellation()
 
-                guard let symmetricKey = key else {
-                    loadingRequest.finishLoading(with: HLSResourceLoaderError.keyNotAvailable)
-                    return
-                }
-
-                // Read encrypted segment
+                // Read and decrypt segment
                 let segmentURL = localAsset.segmentURLs[segmentIndex]
                 let encryptedData = try Data(contentsOf: segmentURL)
+                try Task.checkCancellation()
 
-                // Decrypt segment (async call to actor)
-                let decryptedData = try await self.extractor.decryptSegment(
+                let decryptedData = try await extractor.decryptSegment(
                     segmentData: encryptedData,
                     segmentIndex: segmentIndex,
                     symmetricKey: symmetricKey,
                     manifest: localAsset.manifest
                 )
+                try Task.checkCancellation()
 
-                // Return decrypted data
-                loadingRequest.contentInformationRequest?.contentType = "video/MP2T"
-                loadingRequest.contentInformationRequest?.contentLength = Int64(decryptedData.count)
-                loadingRequest.contentInformationRequest?.isByteRangeAccessSupported = true
+                responseQueue.async {
+                    let req = requestBox.request
+                    guard !req.isCancelled else { return }
 
-                if let dataRequest = loadingRequest.dataRequest {
-                    let requestedOffset = Int(dataRequest.requestedOffset)
-                    let requestedLength = dataRequest.requestedLength
+                    req.contentInformationRequest?.contentType = "video/MP2T"
+                    req.contentInformationRequest?.contentLength = Int64(decryptedData.count)
+                    req.contentInformationRequest?.isByteRangeAccessSupported = true
 
-                    let availableData: Data
-                    if requestedOffset < decryptedData.count {
-                        let endOffset = min(requestedOffset + requestedLength, decryptedData.count)
-                        availableData = decryptedData.subdata(in: requestedOffset..<endOffset)
-                    } else {
-                        availableData = Data()
+                    if let dataRequest = req.dataRequest {
+                        guard let range = Self.safeByteRange(
+                            requestedOffset: dataRequest.requestedOffset,
+                            requestedLength: dataRequest.requestedLength,
+                            dataCount: decryptedData.count
+                        ) else {
+                            req.finishLoading(with: HLSResourceLoaderError.invalidByteRange)
+                            return
+                        }
+                        let availableData = range.isEmpty ? Data() : decryptedData.subdata(in: range)
+                        dataRequest.respond(with: availableData)
                     }
 
-                    dataRequest.respond(with: availableData)
+                    req.finishLoading()
                 }
-
-                loadingRequest.finishLoading()
-            } catch {
-                loadingRequest.finishLoading(with: error)
-            }
-        }
-        return true
-    }
-
-    private func handleKeyRequest(_ loadingRequest: AVAssetResourceLoadingRequest) -> Bool {
-        queue.async { [weak self] in
-            guard let self else { return }
-
-            // If we have a key, return it as raw bytes for AES-128
-            if let key = self.symmetricKey {
-                let keyData = key.withUnsafeBytes { Data($0) }
-
-                loadingRequest.contentInformationRequest?.contentType = "application/octet-stream"
-                loadingRequest.contentInformationRequest?.contentLength = Int64(keyData.count)
-
-                loadingRequest.dataRequest?.respond(with: keyData)
-                loadingRequest.finishLoading()
+            } catch is CancellationError {
                 return
+            } catch {
+                finishOnQueue(requestBox, error: error)
             }
+        }
 
-            // Request key via callback
-            if let onKeyRequest = self.onKeyRequest {
-                Task {
-                    do {
-                        let key = try await onKeyRequest(self.localAsset.manifest)
-                        self.setSymmetricKey(key)
-
-                        let keyData = key.withUnsafeBytes { Data($0) }
-                        loadingRequest.contentInformationRequest?.contentType = "application/octet-stream"
-                        loadingRequest.contentInformationRequest?.contentLength = Int64(keyData.count)
-                        loadingRequest.dataRequest?.respond(with: keyData)
-                        loadingRequest.finishLoading()
-                    } catch {
-                        loadingRequest.finishLoading(with: error)
-                    }
-                }
-            } else {
-                loadingRequest.finishLoading(with: HLSResourceLoaderError.keyNotAvailable)
+        // Attach the task only if the slot is still live (neither finished nor cancelled before registration)
+        let shouldCancel = state.withLock { state -> Bool in
+            guard var slot = state.inFlightTasks[requestID], !slot.cancelled else {
+                return true
             }
+            slot.task = task
+            state.inFlightTasks[requestID] = slot
+            return false
+        }
+        if shouldCancel {
+            task.cancel()
         }
         return true
     }
 
-    // MARK: - Helpers
-
-    private func rewritePlaylistURLs(_ playlist: String) -> String {
-        var result = playlist
-        // Replace segment references with our custom scheme
-        // Original: segments/0.enc
-        // New: tdf-hls://segments/0.enc
-        let lines = playlist.components(separatedBy: "\n")
-        for line in lines {
-            if line.hasPrefix("segments/") {
-                let newLine = "\(tdfHLSScheme)://\(line)"
-                result = result.replacingOccurrences(of: line, with: newLine)
-            }
+    private func finishOnQueue(_ requestBox: LoadingRequestBox, error: Error) {
+        responseQueue.async {
+            let req = requestBox.request
+            guard !req.isCancelled else { return }
+            req.finishLoading(with: error)
         }
-        return result
+    }
+
+    private struct LoadingRequestBox: @unchecked Sendable {
+        let request: AVAssetResourceLoadingRequest
+        init(_ request: AVAssetResourceLoadingRequest) {
+            self.request = request
+        }
     }
 }
 
@@ -258,8 +398,8 @@ public func createTDFHLSAsset(
     extractor: HLSTDFExtractor,
     keyProvider: @escaping (HLSManifest) async throws -> SymmetricKey
 ) -> (asset: AVURLAsset, delegate: HLSResourceLoaderDelegate) {
-    // Create URL with our custom scheme
-    let playlistURL = URL(string: "\(tdfHLSScheme)://playlist.m3u8")!
+    // Create URL with our custom scheme using an explicit host and path
+    let playlistURL = URL(string: "\(tdfHLSScheme)://local/playlist.m3u8")!
 
     // Create asset
     let asset = AVURLAsset(url: playlistURL)
@@ -279,9 +419,10 @@ public func createTDFHLSAsset(
 }
 
 /// Errors that can occur during HLS resource loading
-public enum HLSResourceLoaderError: Error, LocalizedError {
+public enum HLSResourceLoaderError: Error, LocalizedError, Equatable, Sendable {
     case playlistEncodingFailed
     case invalidSegmentPath
+    case invalidByteRange
     case keyNotAvailable
     case decryptionFailed
 
@@ -291,6 +432,8 @@ public enum HLSResourceLoaderError: Error, LocalizedError {
             "Failed to encode playlist as UTF-8"
         case .invalidSegmentPath:
             "Invalid segment path in request"
+        case .invalidByteRange:
+            "Invalid byte range in request"
         case .keyNotAvailable:
             "Decryption key not available"
         case .decryptionFailed:

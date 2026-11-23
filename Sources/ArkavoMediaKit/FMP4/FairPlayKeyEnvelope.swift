@@ -25,10 +25,11 @@ public enum FairPlayKeyEnvelope {
     }
 
     /// Whether `name` can be the payload entry: one root-level archive entry, distinct from the manifest and
-    /// the served media. Non-empty, not `.` or `..`, without `/` or `\`, not `FairPlayPackage.manifestName`,
-    /// and not a name `FairPlayPackage.isServed(_:)` accepts.
+    /// the served media. Non-empty, no ASCII control characters, not `.` or `..`, without `/` or `\`, not
+    /// `FairPlayPackage.manifestName`, and not a name `FairPlayPackage.isServed(_:)` accepts.
     public static func isPayloadEntryName(_ name: String) -> Bool {
         !name.isEmpty && name != "." && name != ".." && !name.contains("/") && !name.contains("\\")
+            && !name.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7F }
             && name != FairPlayPackage.manifestName && !FairPlayPackage.isServed(name)
     }
 
@@ -64,6 +65,7 @@ public enum FairPlayKeyEnvelope {
               integrity["encryptedSegmentSizeDefault"] as? Int == maximumPayloadSize,
               let root = integrity["rootSignature"] as? [String: String], root["alg"] == "HS256",
               let rootString = root["sig"], let rootBytes = Data(base64Encoded: rootString), rootBytes.count == 32,
+              rootBytes.base64EncodedString() == rootString,
               let segments = integrity["segments"] as? [[String: Any]], segments.count == 1,
               payload.count > 28, payload.count <= maximumPayloadSize,
               segments[0]["encryptedSegmentSize"] as? Int == payload.count,
@@ -115,19 +117,32 @@ public enum FairPlayKeyEnvelope {
         componentKeys: [FairPlayComponentKey], iv: Data, assetID: String, policyJSON: Data,
         mediaFiles: [String: Data], kasURL: URL, publicKey: SecKey, kasKeyID: String? = nil
     ) throws -> Package {
+        let digests = mediaFiles.mapValues { Data(SHA256.hash(data: $0)).base64EncodedString() }
+        return try build(
+            componentKeys: componentKeys, iv: iv, assetID: assetID, policyJSON: policyJSON,
+            mediaDigests: digests, kasURL: kasURL, publicKey: publicKey, kasKeyID: kasKeyID
+        )
+    }
+
+    /// Streaming-friendly internal builder taking precomputed base64 SHA-256 digests so callers need not hold
+    /// every media segment in RAM simultaneously.
+    static func build(
+        componentKeys: [FairPlayComponentKey], iv: Data, assetID: String, policyJSON: Data,
+        mediaDigests: [String: String], kasURL: URL, publicKey: SecKey, kasKeyID: String? = nil
+    ) throws -> Package {
         guard iv.count == 16 else { throw Error.invalidIV }
         guard !assetID.isEmpty, assetID.utf8.count <= 1024 else { throw Error.invalidAssetID }
-        guard !mediaFiles.isEmpty, mediaFiles.count <= maximumFiles,
-              mediaFiles.keys.allSatisfy(FairPlayPackage.isServed),
-              mediaFiles[FairPlayPackage.masterPlaylistName] != nil else { throw Error.invalidInventory }
+        guard !mediaDigests.isEmpty, mediaDigests.count <= maximumFiles,
+              mediaDigests.keys.allSatisfy(FairPlayPackage.isServed),
+              mediaDigests[FairPlayPackage.masterPlaylistName] != nil else { throw Error.invalidInventory }
         let policyWithComponents = try FairPlayComponents.insert(componentKeys, intoPolicyJSON: policyJSON)
         var policy = try object(policyWithComponents)
         for name in ["arkavo:fpsProfile", "arkavo:media", "arkavo:mediaIVs"] {
             guard policy[name] == nil else { throw Error.reservedPolicyMember }
         }
         let contentKeyID = try FairPlayPolicy.uuid(ofPolicyJSON: policyJSON)
-        let inventory = mediaFiles.keys.sorted().map { name in
-            ["name": name, "sha256": Data(SHA256.hash(data: mediaFiles[name]!)).base64EncodedString()]
+        let inventory = mediaDigests.keys.sorted().map { name in
+            ["name": name, "sha256": mediaDigests[name]!]
         }
         policy["arkavo:fpsProfile"] = profile
         policy["arkavo:media"] = inventory
@@ -186,7 +201,8 @@ public enum FairPlayKeyEnvelope {
 
     private static func object(_ data: Data) throws -> [String: Any] {
         guard FairPlayPolicy.isPlainUTF8Object(data),
-              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              JSONSerialization.isValidJSONObject(object)
         else { throw Error.invalidProfile }
         try FairPlayPolicy.checkStructure(of: data)
         return object

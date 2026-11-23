@@ -27,9 +27,19 @@ public struct DRMConfiguration: Sendable {
         heartbeatInterval: TimeInterval = 30,
         sessionTimeout: TimeInterval = 300
     ) throws {
-        // Validate HTTPS requirement
-        guard serverURL.scheme == "https" else {
+        // Validate HTTPS requirement and non-empty host
+        guard serverURL.scheme?.lowercased() == "https",
+              let host = serverURL.host,
+              !host.isEmpty
+        else {
             throw DRMConfigurationError.invalidServerURL
+        }
+
+        // Validate positive finite intervals to prevent spin-loop heartbeats or immediate expiration
+        guard heartbeatInterval.isFinite, heartbeatInterval > 0,
+              sessionTimeout.isFinite, sessionTimeout > 0
+        else {
+            throw DRMConfigurationError.invalidInterval
         }
 
         // Validate certificate data
@@ -45,11 +55,12 @@ public struct DRMConfiguration: Sendable {
 }
 
 /// DRM configuration errors
-public enum DRMConfigurationError: Error, LocalizedError {
+public enum DRMConfigurationError: Error, LocalizedError, Sendable {
     case certificateNotFound
     case certificateEmpty
     case certificateLoadFailed(Error)
     case invalidServerURL
+    case invalidInterval
 
     public var errorDescription: String? {
         switch self {
@@ -61,6 +72,8 @@ public enum DRMConfigurationError: Error, LocalizedError {
             "Failed to load FairPlay Streaming certificate: \(error.localizedDescription)"
         case .invalidServerURL:
             "Invalid media server URL"
+        case .invalidInterval:
+            "Heartbeat interval and session timeout must be positive finite values"
         }
     }
 }

@@ -12,7 +12,7 @@ public actor TDF3MediaSession {
     private let heartbeatTimeout: TimeInterval
 
     public init(heartbeatTimeout: TimeInterval = 300) {
-        self.heartbeatTimeout = heartbeatTimeout
+        self.heartbeatTimeout = (heartbeatTimeout.isFinite && heartbeatTimeout > 0) ? heartbeatTimeout : 300
     }
 
     /// Start a new media session
@@ -32,10 +32,13 @@ public actor TDF3MediaSession {
             try InputValidator.validateRegionCode(region)
         }
 
+        // Remove expired sessions for this user before checking concurrency limits
+        pruneExpiredSessions(for: userID)
+
         // Check concurrency limit if policy specifies
         if let maxStreams = policy?.maxConcurrentStreams {
             let currentStreams = activeStreamsPerUser[userID]?.count ?? 0
-            if currentStreams >= maxStreams {
+            if maxStreams <= 0 || currentStreams >= maxStreams {
                 throw SessionError.concurrencyLimitExceeded(current: currentStreams, max: maxStreams)
             }
         }
@@ -65,6 +68,19 @@ public actor TDF3MediaSession {
     ) throws {
         guard var session = sessions[sessionID] else {
             throw SessionError.sessionNotFound(sessionID: sessionID)
+        }
+
+        // Reject expired sessions rather than reviving them
+        let elapsed = Date().timeIntervalSince(session.lastHeartbeat)
+        if elapsed > heartbeatTimeout {
+            try endSession(sessionID: sessionID)
+            throw SessionError.sessionExpired(sessionID: sessionID)
+        }
+
+        // Ending playback removes the session from active tracking
+        if state == .ended {
+            try endSession(sessionID: sessionID)
+            return
         }
 
         session.updateHeartbeat(state: state)
@@ -102,7 +118,8 @@ public actor TDF3MediaSession {
 
     /// Get active stream count for a user
     public func getActiveStreamCount(userID: String) -> Int {
-        activeStreamsPerUser[userID]?.count ?? 0
+        pruneExpiredSessions(for: userID)
+        return activeStreamsPerUser[userID]?.count ?? 0
     }
 
     /// Clean up expired sessions
@@ -124,17 +141,31 @@ public actor TDF3MediaSession {
 
     /// Get all active sessions for a user
     public func getUserSessions(userID: String) -> [MediaSession] {
+        pruneExpiredSessions(for: userID)
         guard let sessionIDs = activeStreamsPerUser[userID] else {
             return []
         }
 
         return sessionIDs.compactMap { sessions[$0] }
     }
+
+    private func pruneExpiredSessions(for userID: String) {
+        guard let sessionIDs = activeStreamsPerUser[userID] else { return }
+        let now = Date()
+        for sessionID in sessionIDs {
+            if let session = sessions[sessionID],
+               now.timeIntervalSince(session.lastHeartbeat) > heartbeatTimeout
+            {
+                try? endSession(sessionID: sessionID)
+            }
+        }
+    }
 }
 
 /// Session-related errors
-public enum SessionError: Error, LocalizedError {
+public enum SessionError: Error, LocalizedError, Sendable {
     case sessionNotFound(sessionID: UUID)
+    case sessionNotFoundWithID(String)
     case sessionExpired(sessionID: UUID)
     case concurrencyLimitExceeded(current: Int, max: Int)
     case invalidSession
@@ -142,6 +173,8 @@ public enum SessionError: Error, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case let .sessionNotFound(sessionID):
+            "Session not found: \(sessionID)"
+        case let .sessionNotFoundWithID(sessionID):
             "Session not found: \(sessionID)"
         case let .sessionExpired(sessionID):
             "Session expired: \(sessionID)"

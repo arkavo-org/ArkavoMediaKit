@@ -23,8 +23,12 @@ public struct HLSPlaylistGenerator {
         ]
 
         for variant in variants {
-            lines.append("#EXT-X-STREAM-INF:BANDWIDTH=\(variant.bandwidth),RESOLUTION=\(variant.resolution)")
-            lines.append(variant.playlistURL.absoluteString)
+            var streamInf = "#EXT-X-STREAM-INF:BANDWIDTH=\(max(0, variant.bandwidth))"
+            if let resolution = Self.sanitizedResolution(variant.resolution) {
+                streamInf += ",RESOLUTION=\(resolution)"
+            }
+            lines.append(streamInf)
+            lines.append(Self.sanitizedPlaylistLine(variant.playlistURL.absoluteString))
         }
 
         return lines.joined(separator: "\n")
@@ -38,46 +42,40 @@ public struct HLSPlaylistGenerator {
     /// - Parameters:
     ///   - segments: Array of segment metadata (each referencing a .tdf file)
     ///   - assetID: Asset identifier
-    ///   - userID: User identifier for policy validation
-    ///   - sessionID: Playback session ID
+    ///   - userID: Unused in playlist query parameters (avoid leaking PII in cleartext playlists)
+    ///   - sessionID: Unused in playlist query parameters (avoid leaking session IDs in cleartext playlists)
     ///   - targetDuration: Target segment duration in seconds
     ///   - mediaSequence: Starting media sequence number
     /// - Returns: HLS media playlist string (.m3u8)
     public func generateMediaPlaylist(
         segments: [SegmentMetadata],
         assetID: String,
-        userID: String,
-        sessionID: UUID,
+        userID _: String,
+        sessionID _: UUID,
         targetDuration: Int = 10,
         mediaSequence: Int = 0
     ) -> String {
         var lines = [
             "#EXTM3U",
             "#EXT-X-VERSION:6",
-            "#EXT-X-TARGETDURATION:\(targetDuration)",
-            "#EXT-X-MEDIA-SEQUENCE:\(mediaSequence)",
+            "#EXT-X-TARGETDURATION:\(max(1, targetDuration))",
+            "#EXT-X-MEDIA-SEQUENCE:\(max(0, mediaSequence))",
         ]
 
         for segment in segments {
-            // For Standard TDF, we use a custom key URL that points to the KAS server
-            // The player will extract the manifest from the .tdf file and request unwrapping from KAS
-            let keyURL = generateKeyURL(
-                assetID: assetID,
-                userID: userID,
-                sessionID: sessionID,
-                segmentIndex: segment.index
-            )
-
-            // Convert IV to hex string for HLS compatibility
-            let ivHex = segment.iv.map { String(format: "%02x", $0) }.joined()
-
-            // Add key directive
-            // METHOD=AES-128 is standard HLS, but our .tdf files handle the actual encryption
-            lines.append("#EXT-X-KEY:METHOD=AES-128,URI=\"\(keyURL.absoluteString)\",IV=0x\(ivHex)")
+            // For Standard TDF, emit #EXT-X-KEY only when the segment carries a valid 16-byte AES-128 IV
+            // (RFC 8216 §4.3.2.4); omitting IV on METHOD=AES-128 would cause players to derive an IV from the
+            // media sequence number, which is invalid for 12-byte GCM nonces.
+            if segment.iv.count == 16, let keyURL = generateKeyURL(assetID: assetID, segmentIndex: segment.index) {
+                let sanitizedKeyURI = Self.sanitizedQuotedAttribute(keyURL.absoluteString)
+                let ivHex = segment.iv.map { String(format: "%02x", $0) }.joined()
+                lines.append("#EXT-X-KEY:METHOD=AES-128,URI=\"\(sanitizedKeyURI)\",IV=0x\(ivHex)")
+            }
 
             // Add segment - note this points to a .tdf file, not raw .ts
-            lines.append("#EXTINF:\(String(format: "%.3f", segment.duration)),")
-            lines.append(segment.url.absoluteString) // e.g., https://cdn.arkavo.net/asset/segment_0.tdf
+            let safeDuration = (segment.duration.isFinite && segment.duration >= 0) ? segment.duration : 0
+            lines.append("#EXTINF:\(String(format: "%.3f", safeDuration)),")
+            lines.append(Self.sanitizedPlaylistLine(segment.url.absoluteString))
         }
 
         lines.append("#EXT-X-ENDLIST")
@@ -93,33 +91,54 @@ public struct HLSPlaylistGenerator {
         sessionID: UUID,
         variant: PlaylistVariant
     ) -> String {
-        generateMediaPlaylist(
+        let maxDur = segments.map(\.duration).filter { $0.isFinite && $0 > 0 }.max() ?? 10.0
+        let safeCeil = min(ceil(maxDur), Double(Int.max / 2))
+        return generateMediaPlaylist(
             segments: segments,
             assetID: assetID,
             userID: userID,
             sessionID: sessionID,
-            targetDuration: Int(ceil(segments.map(\.duration).max() ?? 10.0))
+            targetDuration: max(1, Int(safeCeil))
         )
     }
 
-    /// Generate TDF3 key URL for a segment
+    /// Generate TDF3 key URL for a segment without embedding PII or session IDs in cleartext query parameters
     private func generateKeyURL(
         assetID: String,
-        userID: String,
-        sessionID: UUID,
         segmentIndex: Int
-    ) -> URL {
-        var components = URLComponents(url: kasBaseURL, resolvingAgainstBaseURL: false)!
+    ) -> URL? {
+        guard var components = URLComponents(url: kasBaseURL, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
         components.scheme = "tdf3"
         components.path = "/key"
         components.queryItems = [
             URLQueryItem(name: "asset", value: assetID),
-            URLQueryItem(name: "user", value: userID),
-            URLQueryItem(name: "session", value: sessionID.uuidString),
             URLQueryItem(name: "segment", value: String(segmentIndex)),
         ]
+        return components.url
+    }
 
-        return components.url!
+    /// Validates an HLS decimal-resolution (`<width>x<height>`) to prevent playlist tag injection
+    private static func sanitizedResolution(_ resolution: String) -> String? {
+        let parts = resolution.split(separator: "x", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let width = Int(parts[0]), width > 0,
+              let height = Int(parts[1]), height > 0,
+              parts[0].allSatisfy(\.isASCII), parts[0].allSatisfy(\.isNumber),
+              parts[1].allSatisfy(\.isASCII), parts[1].allSatisfy(\.isNumber)
+        else {
+            return nil
+        }
+        return "\(width)x\(height)"
+    }
+
+    private static func sanitizedPlaylistLine(_ value: String) -> String {
+        String(value.unicodeScalars.filter { $0 != "\r" && $0 != "\n" && $0 != "\0" })
+    }
+
+    private static func sanitizedQuotedAttribute(_ value: String) -> String {
+        String(value.unicodeScalars.filter { $0 != "\r" && $0 != "\n" && $0 != "\0" && $0 != "\"" })
     }
 
     /// Save playlist to file

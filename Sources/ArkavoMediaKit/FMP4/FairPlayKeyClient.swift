@@ -1,14 +1,29 @@
 import AVFoundation
 import Foundation
+import Synchronization
 
 // MARK: - FairPlay Key Client
 
 /// Client for FairPlay key delivery with TDF integration
-public final class FairPlayKeyClient {
+public final class FairPlayKeyClient: Sendable {
+    /// Maximum allowed response body sizes
+    private static let maxCertificateBytes = 64 * 1024
+    private static let maxJSONResponseBytes = 1 * 1024 * 1024
+
+    /// Dedicated ephemeral, redirect-refusing session shared across default clients
+    private static let defaultSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 60
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.urlCache = nil
+        return URLSession(configuration: config, delegate: RedirectRefusal(), delegateQueue: nil)
+    }()
+
     // MARK: - Types
 
     /// Session information
-    public struct Session {
+    public struct Session: Sendable {
         public let sessionId: String
         public let userId: String
         public let assetId: String
@@ -24,7 +39,7 @@ public final class FairPlayKeyClient {
 
     /// Key request configuration
     @available(*, deprecated, message: "Sends a manifest with no policy, which arks refuses since PR #75. Package with FMP4RecordingProtectionService and play with TDFContentKeyDelegate given the archive manifest.")
-    public struct KeyRequestConfig {
+    public struct KeyRequestConfig: Sendable {
         public let contentKey: Data      // 16-byte AES-128 key
         public let contentIV: Data       // 16-byte IV
         public let assetId: String
@@ -40,30 +55,72 @@ public final class FairPlayKeyClient {
 
     // MARK: - Properties
 
+    private struct State: Sendable {
+        var currentSession: Session?
+        var certificate: Data?
+    }
+
     private let serverURL: URL
     private let authToken: String?
     private let manifestBuilder: TDFManifestBuilder
-    private var currentSession: Session?
-    private var certificate: Data?
+    private let urlSession: URLSession
+    private let state = Mutex(State())
 
     // MARK: - Initialization
 
     /// Initialize FairPlay key client
     /// - Parameters:
-    ///   - serverURL: Base URL of the media server (e.g., https://100.arkavo.net)
+    ///   - serverURL: Base URL of the media server (must use HTTPS, e.g., https://100.arkavo.net)
     ///   - authToken: Optional Bearer token for authenticated requests
     public init(serverURL: URL, authToken: String? = nil) {
         self.serverURL = serverURL
         self.authToken = authToken
         self.manifestBuilder = TDFManifestBuilder(kasURL: serverURL)
+        self.urlSession = Self.defaultSession
     }
 
-    /// Prepare a request for the KAS/media server: opt into HTTP/3 and add auth.
-    ///
-    /// The KAS advertises `alt-svc: h3`; `assumesHTTP3Capable` lets the first hop
-    /// negotiate HTTP/3, falling back to HTTP/2 automatically for non-h3 servers.
+    /// Internal initializer allowing custom URLSession injection in tests
+    init(serverURL: URL, authToken: String? = nil, urlSession: URLSession) {
+        self.serverURL = serverURL
+        self.authToken = authToken
+        self.manifestBuilder = TDFManifestBuilder(kasURL: serverURL, urlSession: urlSession)
+        self.urlSession = urlSession
+    }
+
+    /// Read current session snapshot (internal for testing)
+    var activeSession: Session? {
+        state.withLock { $0.currentSession }
+    }
+
+    private func validateHTTPSServerURL() throws {
+        guard InputValidator.isAllowedHTTPSOrLoopbackHTTP(serverURL) else {
+            throw FairPlayKeyError.insecureServerURL
+        }
+    }
+
+    private func sessionEndpointURL(sessionId: String, trailingComponent: String? = nil) throws -> URL {
+        try validateHTTPSServerURL()
+        do {
+            try InputValidator.validateSessionID(sessionId)
+        } catch {
+            throw FairPlayKeyError.invalidSessionResponse
+        }
+        var url = serverURL
+            .appendingPathComponent("media")
+            .appendingPathComponent("v1")
+            .appendingPathComponent("session")
+            .appendingPathComponent(sessionId)
+        if let trailingComponent {
+            url = url.appendingPathComponent(trailingComponent)
+        }
+        return url
+    }
+
+    /// Prepare a request for the KAS/media server: opt into HTTP/3, set timeouts, disable caching, and add auth.
     private func prepareRequest(_ request: inout URLRequest) {
         request.assumesHTTP3Capable = true
+        request.timeoutInterval = 30
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         if let token = authToken {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
@@ -73,7 +130,8 @@ public final class FairPlayKeyClient {
 
     /// Fetch FairPlay application certificate from server
     public func fetchCertificate() async throws -> Data {
-        if let existing = certificate {
+        try validateHTTPSServerURL()
+        if let existing = state.withLock({ $0.certificate }) {
             return existing
         }
 
@@ -82,13 +140,26 @@ public final class FairPlayKeyClient {
         request.httpMethod = "GET"
         prepareRequest(&request)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await urlSession.boundedData(
+                for: request,
+                maxBytes: Self.maxCertificateBytes,
+                delegate: RedirectRefusal()
+            )
+        } catch BoundedResponseError.responseTooLarge {
+            throw FairPlayKeyError.certificateFetchFailed
+        }
 
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw FairPlayKeyError.certificateFetchFailed
         }
+        guard !data.isEmpty else {
+            throw FairPlayKeyError.certificateFetchFailed
+        }
 
-        certificate = data
+        state.withLock { $0.certificate = data }
         return data
     }
 
@@ -96,6 +167,7 @@ public final class FairPlayKeyClient {
 
     /// Start a new playback session
     public func startSession(userId: String, assetId: String) async throws -> Session {
+        try validateHTTPSServerURL()
         let url = serverURL.appendingPathComponent("media/v1/session/start")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -109,30 +181,42 @@ public final class FairPlayKeyClient {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await urlSession.boundedData(
+                for: request,
+                maxBytes: Self.maxJSONResponseBytes,
+                delegate: RedirectRefusal()
+            )
+        } catch BoundedResponseError.responseTooLarge {
+            throw FairPlayKeyError.invalidSessionResponse
+        }
 
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            let errorBody = String(data: data, encoding: .utf8) ?? ""
-            throw FairPlayKeyError.sessionStartFailed(errorBody)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            throw FairPlayKeyError.sessionStartFailed("HTTP \(statusCode)")
         }
 
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let sessionId = json["sessionId"] as? String else {
+              let sessionId = json["sessionId"] as? String,
+              (try? InputValidator.validateSessionID(sessionId)) != nil
+        else {
             throw FairPlayKeyError.invalidSessionResponse
         }
 
         let session = Session(sessionId: sessionId, userId: userId, assetId: assetId)
-        currentSession = session
+        state.withLock { $0.currentSession = session }
         return session
     }
 
     /// Send session heartbeat
     public func sendHeartbeat() async throws {
-        guard let session = currentSession else {
+        guard let session = state.withLock({ $0.currentSession }) else {
             throw FairPlayKeyError.noActiveSession
         }
 
-        let url = serverURL.appendingPathComponent("media/v1/session/\(session.sessionId)/heartbeat")
+        let url = try sessionEndpointURL(sessionId: session.sessionId, trailingComponent: "heartbeat")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -144,20 +228,29 @@ public final class FairPlayKeyClient {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (_, response) = try await URLSession.shared.data(for: request)
+        let response: URLResponse
+        do {
+            (_, response) = try await urlSession.boundedData(
+                for: request,
+                maxBytes: Self.maxJSONResponseBytes,
+                delegate: RedirectRefusal()
+            )
+        } catch BoundedResponseError.responseTooLarge {
+            throw FairPlayKeyError.heartbeatFailed
+        }
 
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw FairPlayKeyError.heartbeatFailed
         }
     }
 
-    /// End the current session
+    /// End the current session (never clears a newer session started concurrently during the network call)
     public func endSession() async throws {
-        guard let session = currentSession else {
+        guard let session = state.withLock({ $0.currentSession }) else {
             return
         }
 
-        let url = serverURL.appendingPathComponent("media/v1/session/\(session.sessionId)")
+        let url = try sessionEndpointURL(sessionId: session.sessionId)
         var request = URLRequest(url: url)
         request.httpMethod = "DELETE"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -166,13 +259,27 @@ public final class FairPlayKeyClient {
         let body: [String: Any] = ["userId": session.userId]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (_, response) = try await URLSession.shared.data(for: request)
+        let response: URLResponse
+        do {
+            (_, response) = try await urlSession.boundedData(
+                for: request,
+                maxBytes: Self.maxJSONResponseBytes,
+                delegate: RedirectRefusal()
+            )
+        } catch BoundedResponseError.responseTooLarge {
+            throw FairPlayKeyError.sessionEndFailed
+        }
 
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             throw FairPlayKeyError.sessionEndFailed
         }
 
-        currentSession = nil
+        // Only clear if the session has not been replaced by a newer startSession() while awaiting
+        state.withLock { s in
+            if s.currentSession?.sessionId == session.sessionId {
+                s.currentSession = nil
+            }
+        }
     }
 
     // MARK: - Key Request
@@ -184,9 +291,11 @@ public final class FairPlayKeyClient {
     /// - Returns: Content Key Context (CKC) data for AVContentKeyResponse
     @available(*, deprecated, message: "Sends a manifest with no policy, which arks refuses since PR #75. Package with FMP4RecordingProtectionService and play with TDFContentKeyDelegate given the archive manifest.")
     public func requestCKC(spcData: Data, config: KeyRequestConfig) async throws -> Data {
+        try validateHTTPSServerURL()
+
         // Ensure we have a session
         let session: Session
-        if let existing = currentSession, existing.assetId == config.assetId {
+        if let existing = state.withLock({ $0.currentSession }), existing.assetId == config.assetId {
             session = existing
         } else {
             session = try await startSession(userId: config.userId, assetId: config.assetId)
@@ -215,17 +324,29 @@ public final class FairPlayKeyClient {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            let errorBody = String(data: data, encoding: .utf8) ?? ""
-            throw FairPlayKeyError.ckcRequestFailed(errorBody)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await urlSession.boundedData(
+                for: request,
+                maxBytes: Self.maxJSONResponseBytes,
+                delegate: RedirectRefusal()
+            )
+        } catch BoundedResponseError.responseTooLarge {
+            throw FairPlayKeyError.invalidCKCResponse
         }
 
-        // Parse CKC response
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            throw FairPlayKeyError.ckcRequestFailed("HTTP \(statusCode)")
+        }
+
+        // Parse CKC response (reject empty CKC)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let ckcBase64 = json["wrappedKey"] as? String,
-              let ckcData = Data(base64Encoded: ckcBase64) else {
+              let ckcData = Data(base64Encoded: ckcBase64),
+              !ckcData.isEmpty
+        else {
             throw FairPlayKeyError.invalidCKCResponse
         }
 
@@ -234,7 +355,8 @@ public final class FairPlayKeyClient {
 
     /// Request CKC with pre-wrapped key data (when TDF manifest is provided)
     public func requestCKC(spcData: Data, tdfManifest: Data) async throws -> Data {
-        guard let session = currentSession else {
+        try validateHTTPSServerURL()
+        guard let session = state.withLock({ $0.currentSession }) else {
             throw FairPlayKeyError.noActiveSession
         }
 
@@ -253,16 +375,28 @@ public final class FairPlayKeyClient {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await urlSession.boundedData(
+                for: request,
+                maxBytes: Self.maxJSONResponseBytes,
+                delegate: RedirectRefusal()
+            )
+        } catch BoundedResponseError.responseTooLarge {
+            throw FairPlayKeyError.invalidCKCResponse
+        }
 
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            let errorBody = String(data: data, encoding: .utf8) ?? ""
-            throw FairPlayKeyError.ckcRequestFailed(errorBody)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            throw FairPlayKeyError.ckcRequestFailed("HTTP \(statusCode)")
         }
 
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let ckcBase64 = json["wrappedKey"] as? String,
-              let ckcData = Data(base64Encoded: ckcBase64) else {
+              let ckcData = Data(base64Encoded: ckcBase64),
+              !ckcData.isEmpty
+        else {
             throw FairPlayKeyError.invalidCKCResponse
         }
 
@@ -271,7 +405,8 @@ public final class FairPlayKeyClient {
 
     // MARK: - Errors
 
-    public enum FairPlayKeyError: Error, LocalizedError {
+    public enum FairPlayKeyError: Error, LocalizedError, Equatable, Sendable {
+        case insecureServerURL
         case certificateFetchFailed
         case sessionStartFailed(String)
         case invalidSessionResponse
@@ -283,6 +418,8 @@ public final class FairPlayKeyClient {
 
         public var errorDescription: String? {
             switch self {
+            case .insecureServerURL:
+                return "FairPlay server URL must use HTTPS"
             case .certificateFetchFailed:
                 return "Failed to fetch FairPlay certificate"
             case .sessionStartFailed(let error):
@@ -318,9 +455,9 @@ extension FairPlayKeyClient {
 
 /// AVContentKeySessionDelegate implementation for fMP4 FairPlay playback
 @available(*, deprecated, message: "Sends a manifest with no policy, which arks refuses since PR #75. Package with FMP4RecordingProtectionService and play with TDFContentKeyDelegate given the archive manifest.")
-public final class FMP4ContentKeyDelegate: NSObject, AVContentKeySessionDelegate {
+public final class FMP4ContentKeyDelegate: NSObject, AVContentKeySessionDelegate, Sendable {
     private let keyClient: FairPlayKeyClient
-    private var keyConfig: FairPlayKeyClient.KeyRequestConfig?
+    private let keyConfigStorage = Mutex<FairPlayKeyClient.KeyRequestConfig?>(nil)
 
     public init(keyClient: FairPlayKeyClient) {
         self.keyClient = keyClient
@@ -329,7 +466,12 @@ public final class FMP4ContentKeyDelegate: NSObject, AVContentKeySessionDelegate
 
     /// Set the key configuration for upcoming key requests
     public func setKeyConfig(_ config: FairPlayKeyClient.KeyRequestConfig) {
-        self.keyConfig = config
+        keyConfigStorage.withLock { $0 = config }
+    }
+
+    /// Read the key configuration (internal for testing)
+    var currentKeyConfig: FairPlayKeyClient.KeyRequestConfig? {
+        keyConfigStorage.withLock { $0 }
     }
 
     // MARK: - AVContentKeySessionDelegate
@@ -363,7 +505,7 @@ public final class FMP4ContentKeyDelegate: NSObject, AVContentKeySessionDelegate
     // MARK: - Key Request Handling
 
     private func handleKeyRequest(_ keyRequest: AVContentKeyRequest) async {
-        guard let config = keyConfig else {
+        guard let config = keyConfigStorage.withLock({ $0 }) else {
             let error = NSError(domain: "FMP4ContentKeyDelegate", code: 1,
                                userInfo: [NSLocalizedDescriptionKey: "No key configuration set"])
             keyRequest.processContentKeyResponseError(error)

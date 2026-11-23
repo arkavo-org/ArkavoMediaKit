@@ -49,6 +49,12 @@ public actor HLSConverter {
         outputDirectory: URL,
         segmentDuration: TimeInterval = defaultSegmentDuration
     ) async throws -> HLSConversionResult {
+        // Note: Double(Int.max) rounds up to 2^63 on 64-bit platforms, so cap strictly below Int.max
+        let maxSafeTargetDuration = Double(Int.max / 2)
+        guard segmentDuration.isFinite, segmentDuration > 0, ceil(segmentDuration) <= maxSafeTargetDuration else {
+            throw HLSConversionError.invalidSourceVideo("Segment duration must be a finite positive number within valid bounds")
+        }
+
         // Create output directory if needed
         try FileManager.default.createDirectory(
             at: outputDirectory,
@@ -62,8 +68,8 @@ public actor HLSConverter {
         let duration = try await asset.load(.duration)
         let totalDuration = CMTimeGetSeconds(duration)
 
-        guard totalDuration > 0 else {
-            throw HLSConversionError.invalidSourceVideo("Video has no duration")
+        guard duration.isNumeric, totalDuration.isFinite, totalDuration > 0 else {
+            throw HLSConversionError.invalidSourceVideo("Video has invalid or indefinite duration")
         }
 
         // Use manual segmentation for HLS output
@@ -92,6 +98,12 @@ public actor HLSConverter {
         outputDirectory: URL,
         segmentDuration: TimeInterval = defaultSegmentDuration
     ) async throws -> HLSConversionResult {
+        // Note: Double(Int.max) rounds up to 2^63 on 64-bit platforms, so cap strictly below Int.max
+        let maxSafeTargetDuration = Double(Int.max / 2)
+        guard segmentDuration.isFinite, segmentDuration > 0, ceil(segmentDuration) <= maxSafeTargetDuration else {
+            throw HLSConversionError.invalidSourceVideo("Segment duration must be a finite positive number within valid bounds")
+        }
+
         // Create output directory if needed
         try FileManager.default.createDirectory(
             at: outputDirectory,
@@ -103,12 +115,21 @@ public actor HLSConverter {
         let duration = try await asset.load(.duration)
         let totalDuration = CMTimeGetSeconds(duration)
 
-        guard totalDuration > 0 else {
-            throw HLSConversionError.invalidSourceVideo("Video has no duration")
+        guard duration.isNumeric, totalDuration.isFinite, totalDuration > 0 else {
+            throw HLSConversionError.invalidSourceVideo("Video has invalid or indefinite duration")
         }
 
-        // Calculate segment count and create segments
-        let segmentCount = Int(ceil(totalDuration / segmentDuration))
+        // Calculate segment count safely without float-to-Int traps
+        let rawSegmentCount = ceil(totalDuration / segmentDuration)
+        guard rawSegmentCount.isFinite, rawSegmentCount >= 1, rawSegmentCount <= 100_000 else {
+            throw HLSConversionError.invalidSourceVideo("Computed segment count is out of valid bounds")
+        }
+        let segmentCount = Int(rawSegmentCount)
+        let rawTargetDuration = ceil(segmentDuration)
+        guard rawTargetDuration.isFinite, rawTargetDuration >= 1, rawTargetDuration <= maxSafeTargetDuration else {
+            throw HLSConversionError.invalidSourceVideo("Target segment duration is out of valid bounds")
+        }
+        let targetDuration = Int(rawTargetDuration)
         var segmentURLs: [URL] = []
         var segmentDurations: [Double] = []
 
@@ -137,7 +158,7 @@ public actor HLSConverter {
             playlistURL: playlistURL,
             segmentURLs: segmentURLs,
             segmentDurations: segmentDurations,
-            targetDuration: Int(ceil(segmentDuration))
+            targetDuration: targetDuration
         )
 
         return HLSConversionResult(
@@ -178,40 +199,6 @@ public actor HLSConverter {
                 reason: error.localizedDescription
             )
         }
-    }
-
-    private func parsePlaylist(
-        playlistURL: URL,
-        baseDirectory: URL
-    ) throws -> (urls: [URL], durations: [Double]) {
-        let content = try String(contentsOf: playlistURL, encoding: .utf8)
-        let lines = content.components(separatedBy: .newlines)
-
-        var segmentURLs: [URL] = []
-        var segmentDurations: [Double] = []
-        var nextDuration: Double?
-
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-
-            if trimmed.hasPrefix("#EXTINF:") {
-                // Parse duration: #EXTINF:6.006,
-                let durationString = trimmed
-                    .replacingOccurrences(of: "#EXTINF:", with: "")
-                    .replacingOccurrences(of: ",", with: "")
-                if let duration = Double(durationString) {
-                    nextDuration = duration
-                }
-            } else if !trimmed.isEmpty && !trimmed.hasPrefix("#") {
-                // This is a segment filename
-                let segmentURL = baseDirectory.appendingPathComponent(trimmed)
-                segmentURLs.append(segmentURL)
-                segmentDurations.append(nextDuration ?? 6.0)
-                nextDuration = nil
-            }
-        }
-
-        return (segmentURLs, segmentDurations)
     }
 
     private func generatePlaylist(
