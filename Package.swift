@@ -42,6 +42,14 @@ let package = Package(
             ],
             swiftSettings: sharedSwiftSettings
         ),
+        .executableTarget(
+            name: "ForensicWatermarkCLI",
+            dependencies: [
+                "ArkavoMediaKit",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            swiftSettings: sharedSwiftSettings
+        ),
         .testTarget(
             name: "ArkavoMediaKitTests",
             dependencies: ["ArkavoMediaKit"],
