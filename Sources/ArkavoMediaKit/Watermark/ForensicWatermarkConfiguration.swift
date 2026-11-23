@@ -51,6 +51,10 @@ public enum WatermarkSpatialPattern: String, Sendable, Equatable, Hashable, Coda
 public enum ForensicWatermarkError: Error, LocalizedError, Sendable, Equatable {
     case invalidSessionID(String)
     case invalidConfiguration(String)
+    case invalidFrameData(String)
+    case sameInputOutputPath
+    case outputPathIsDirectory
+    case outputFileAlreadyExists(String)
     case unreadableVideo(String)
     case videoTrackMissing
     case readerFailed(String)
@@ -63,6 +67,14 @@ public enum ForensicWatermarkError: Error, LocalizedError, Sendable, Equatable {
             "Invalid watermark session ID: \(reason)"
         case let .invalidConfiguration(reason):
             "Invalid watermark configuration: \(reason)"
+        case let .invalidFrameData(reason):
+            "Invalid frame sample data: \(reason)"
+        case .sameInputOutputPath:
+            "Input and output video paths must not refer to the same file"
+        case .outputPathIsDirectory:
+            "Output video path refers to a directory"
+        case let .outputFileAlreadyExists(path):
+            "Output file already exists at \(path)"
         case let .unreadableVideo(reason):
             "Unable to read video asset: \(reason)"
         case .videoTrackMissing:
@@ -81,6 +93,8 @@ public enum ForensicWatermarkError: Error, LocalizedError, Sendable, Equatable {
 
 /// Validated opaque playback session identifier for forensic watermarking.
 ///
+/// Restricted to printable non-whitespace ASCII (`0x21...0x7E`, 1...256 bytes) to avoid
+/// Unicode canonical-equivalence mismatches between candidate deduplication and HMAC bytes.
 /// Keeps account-to-session mapping strictly outside `ArkavoMediaKit` and the video renderer.
 public struct WatermarkSessionCode: Sendable, Hashable, Codable {
     public static let maxByteLength = 256
@@ -92,12 +106,15 @@ public struct WatermarkSessionCode: Sendable, Hashable, Codable {
         guard !rawValue.isEmpty else {
             throw ForensicWatermarkError.invalidSessionID("Session ID must not be empty")
         }
-        guard rawValue.utf8.count <= Self.maxByteLength else {
+        let utf8 = rawValue.utf8
+        guard utf8.count <= Self.maxByteLength else {
             throw ForensicWatermarkError.invalidSessionID("Session ID exceeds \(Self.maxByteLength) bytes")
         }
-        for scalar in rawValue.unicodeScalars {
-            if CharacterSet.controlCharacters.contains(scalar) {
-                throw ForensicWatermarkError.invalidSessionID("Session ID must not contain control characters")
+        for byte in utf8 {
+            guard byte >= 0x21, byte <= 0x7E else {
+                throw ForensicWatermarkError.invalidSessionID(
+                    "Session ID must contain only printable non-whitespace ASCII characters"
+                )
             }
         }
         self.rawValue = rawValue
@@ -109,6 +126,10 @@ public struct WatermarkSessionCode: Sendable, Hashable, Codable {
 /// Parameters defining the player-only spatiotemporal forensic watermark signal.
 ///
 /// The playback overlay and offline detector must use the same configuration.
+/// Note: `domainSeparator` is a public domain tag, not a secret key; anyone with an opaque
+/// session ID can derive its prototype waveform. Production deployments requiring forgery
+/// resistance can supply a server-derived opaque per-session token as `sessionID` or a
+/// deployment-private `domainSeparator`.
 public struct ForensicWatermarkConfiguration: Sendable, Equatable, Hashable, Codable {
     /// Temporal chip rate in Hz. Each chip is one full sinusoidal bi-phase cycle (`sin(2 * pi * phase)`),
     /// ensuring zero DC per chip and staying well below 30 fps camera Nyquist (15 Hz).

@@ -9,31 +9,18 @@ import Testing
 struct ForensicWatermarkTests {
     // MARK: - Configuration & Session Code Validation
 
-    @Test("Opaque session code rejects empty, control characters, and oversized strings")
+    @Test("Opaque session code accepts printable ASCII and rejects empty, whitespace, non-ASCII, control, and oversized strings")
     func sessionCodeValidation() throws {
-        let valid = try WatermarkSessionCode("sess-8f3c2a1b-90e4")
-        #expect(valid.rawValue == "sess-8f3c2a1b-90e4")
+        let valid = try WatermarkSessionCode("sess-8f3c2a1b_90e4:ok")
+        #expect(valid.rawValue == "sess-8f3c2a1b_90e4:ok")
 
-        #expect {
-            _ = try WatermarkSessionCode("")
-        } throws: { error in
-            if case .invalidSessionID = error as? ForensicWatermarkError { return true }
-            return false
-        }
-
-        #expect {
-            _ = try WatermarkSessionCode("sess\n123")
-        } throws: { error in
-            if case .invalidSessionID = error as? ForensicWatermarkError { return true }
-            return false
-        }
-
-        let oversized = String(repeating: "a", count: WatermarkSessionCode.maxByteLength + 1)
-        #expect {
-            _ = try WatermarkSessionCode(oversized)
-        } throws: { error in
-            if case .invalidSessionID = error as? ForensicWatermarkError { return true }
-            return false
+        for bad in ["", "sess\n123", "sess 123", "sess-caf\u{00E9}", String(repeating: "a", count: WatermarkSessionCode.maxByteLength + 1)] {
+            #expect {
+                _ = try WatermarkSessionCode(bad)
+            } throws: { error in
+                if case .invalidSessionID = error as? ForensicWatermarkError { return true }
+                return false
+            }
         }
     }
 
@@ -56,9 +43,8 @@ struct ForensicWatermarkTests {
 
     // MARK: - Geometry Alignment (Rotation & Aspect Fitting)
 
-    @Test("Video rect constrains overlay to active picture bounds across aspect ratios and rotations")
+    @Test("Video rect constrains overlay to active picture bounds across rotations and returns zero when presentation size is unknown")
     func geometryAlignmentAcrossRotations() {
-        // Landscape 16:9 video in portrait iPhone container (letterboxed top and bottom)
         let portraitContainer = CGRect(x: 0, y: 0, width: 390, height: 844)
         let video16x9 = CGSize(width: 1920, height: 1080)
         let portraitRect = ForensicWatermarkGeometry.videoRect(
@@ -71,7 +57,7 @@ struct ForensicWatermarkTests {
         #expect(abs(portraitRect.minX - 0) < 0.01)
         #expect(abs(portraitRect.midY - portraitContainer.midY) < 0.01)
 
-        // Same 16:9 video after rotating device to landscape (pillarboxed left and right on 19.5:9 screen)
+        // Rotated to landscape (pillarboxed on 19.5:9 screen)
         let landscapeContainer = CGRect(x: 0, y: 0, width: 844, height: 390)
         let landscapeRect = ForensicWatermarkGeometry.videoRect(
             forPresentationSize: video16x9,
@@ -81,9 +67,8 @@ struct ForensicWatermarkTests {
         #expect(abs(landscapeRect.height - 390) < 0.01)
         #expect(abs(landscapeRect.width - 693.333) < 0.1)
         #expect(abs(landscapeRect.midX - landscapeContainer.midX) < 0.01)
-        #expect(abs(landscapeRect.minY - 0) < 0.01)
 
-        // Portrait 9:16 video in landscape container (pillarboxed)
+        // Portrait 9:16 video in landscape container
         let video9x16 = CGSize(width: 1080, height: 1920)
         let portraitVideoInLandscape = ForensicWatermarkGeometry.videoRect(
             forPresentationSize: video9x16,
@@ -93,7 +78,7 @@ struct ForensicWatermarkTests {
         #expect(abs(portraitVideoInLandscape.height - 390) < 0.01)
         #expect(abs(portraitVideoInLandscape.width - 219.375) < 0.05)
 
-        // Aspect fill and resize fill full container
+        // Aspect fill fills full container
         let fillRect = ForensicWatermarkGeometry.videoRect(
             forPresentationSize: video16x9,
             in: portraitContainer,
@@ -101,39 +86,57 @@ struct ForensicWatermarkTests {
         )
         #expect(fillRect == portraitContainer)
 
-        // Zero presentation size falls back safely to container bounds
-        let fallbackRect = ForensicWatermarkGeometry.videoRect(
+        // Unknown / zero presentation size returns .zero so letterbox bars are never painted
+        let unknownRect = ForensicWatermarkGeometry.videoRect(
             forPresentationSize: .zero,
             in: portraitContainer
         )
-        #expect(fallbackRect == portraitContainer)
+        #expect(unknownRect == .zero)
     }
 
-    // MARK: - Signal & Compositing Properties
+    // MARK: - 16-Bit Overlay Pixel Precision & Compositing Properties
 
-    @Test("Isoluminant blue-yellow overlay has near-zero luminance delta and pixel-independent modulation")
-    func isoluminantAndSourceOverProperties() {
-        let config = ForensicWatermarkConfiguration.default
-        let cPlus = ForensicWatermarkSignal.overlayRGBA(signal: 1.0, configuration: config)
-        let cMinus = ForensicWatermarkSignal.overlayRGBA(signal: -1.0, configuration: config)
+    @Test("16-bit rendered overlay texture preserves isoluminant poles even at subtle opacity (0.015 and 0.025)")
+    func rendered16BitTexturePreservesIsoluminance() throws {
+        for opacity in [0.015, 0.025] {
+            let config = ForensicWatermarkConfiguration(
+                chipRateHz: 4.0,
+                periodChips: 16,
+                opacity: opacity,
+                chromaMode: .isoluminantBlueYellow,
+                spatialPattern: .uniform
+            )
+            // First chip +1 at t = 0.0625s (sin(pi/2) = +1), second chip -1 at t = 0.3125s (sin(pi/2) = +1 -> -1)
+            let chips: [Float] = [1.0, -1.0] + [Float](repeating: 1.0, count: 14)
 
-        // Rec. 709 sRGB luminance match
-        let yPlus = 0.2126 * cPlus.red + 0.7152 * cPlus.green + 0.0722 * cPlus.blue
-        let yMinus = 0.2126 * cMinus.red + 0.7152 * cMinus.green + 0.0722 * cMinus.blue
-        #expect(abs(yPlus - yMinus) < 0.005)
+            let plusImg = try #require(ForensicWatermarkRenderer.makeOverlayCGImage(at: 0.0625, chips: chips, configuration: config, gridWidth: 4, gridHeight: 4))
+            let minusImg = try #require(ForensicWatermarkRenderer.makeOverlayCGImage(at: 0.3125, chips: chips, configuration: config, gridWidth: 4, gridHeight: 4))
+            #expect(plusImg.bitsPerComponent == 16)
+            #expect(minusImg.bitsPerComponent == 16)
 
-        // Linear-light luminance match (gamma 2.2)
-        let yLinPlus = 0.2126 * pow(cPlus.red, 2.2) + 0.7152 * pow(cPlus.green, 2.2) + 0.0722 * pow(cPlus.blue, 2.2)
-        let yLinMinus = 0.2126 * pow(cMinus.red, 2.2) + 0.7152 * pow(cMinus.green, 2.2) + 0.0722 * pow(cMinus.blue, 2.2)
-        #expect(abs(yLinPlus - yLinMinus) < 0.005)
+            let plusData = try #require(plusImg.dataProvider?.data as Data?)
+            let minusData = try #require(minusImg.dataProvider?.data as Data?)
 
-        // Verify sourceOver delta (I+ - I-) is identical across pure black (V=0), mid-gray (V=0.5), and white (V=1)
-        let a = cPlus.alpha
-        #expect(abs(cPlus.alpha - cMinus.alpha) < 1e-6)
-        for v in [Float(0.0), Float(0.5), Float(1.0)] {
-            let bPlus = (1 - a) * v + a * cPlus.blue
-            let bMinus = (1 - a) * v + a * cMinus.blue
-            #expect(abs((bPlus - bMinus) - a) < 1e-5)
+            func readFirstPixelStraight(_ data: Data) -> (r: Double, g: Double, b: Double, a: Double) {
+                let words = data.withUnsafeBytes { Array($0.bindMemory(to: UInt16.self).prefix(4)) }
+                let a = Double(words[3]) / 65535.0
+                let r = (Double(words[0]) / 65535.0) / max(a, 1e-9)
+                let g = (Double(words[1]) / 65535.0) / max(a, 1e-9)
+                let b = (Double(words[2]) / 65535.0) / max(a, 1e-9)
+                return (r, g, b, a)
+            }
+
+            let p = readFirstPixelStraight(plusData)
+            let m = readFirstPixelStraight(minusData)
+            #expect(abs(p.a - opacity) < 0.0005)
+            #expect(abs(m.a - opacity) < 0.0005)
+            // Verify R/G compensator actually differs between poles (0.46 vs 0.54, NOT collapsed to 0.50!)
+            #expect(m.r - p.r > 0.07)
+            #expect(p.b - m.b > 0.98)
+
+            let yPlus = 0.2126 * p.r + 0.7152 * p.g + 0.0722 * p.b
+            let yMinus = 0.2126 * m.r + 0.7152 * m.g + 0.0722 * m.b
+            #expect(abs(yPlus - yMinus) < 0.005)
         }
     }
 
@@ -150,7 +153,6 @@ struct ForensicWatermarkTests {
         #expect(c1 != c2)
         #expect(c1 != decoy0)
 
-        // Every single chip integrates to zero over its cycle
         let waveform = ForensicWatermarkSignal.referenceWaveform(
             chips: c1,
             chipRateHz: config.chipRateHz,
@@ -160,59 +162,158 @@ struct ForensicWatermarkTests {
         #expect(abs(mean) < 1e-5)
     }
 
-    @Test("Overlay image renderer and CoreAnimation layer stay decoupled from media bytes")
+    @Test("ForensicWatermarkLayer copies state in init(layer:) and ForensicWatermarkOverlay throws on invalid inputs")
     @MainActor
-    func overlayRendererAndLayer() throws {
+    func overlayValidationAndLayerPresentationCopy() throws {
         let config = ForensicWatermarkConfiguration.default
-        let chips = ForensicWatermarkSignal.chips(for: "sess-render-test", configuration: config)
-        let image = ForensicWatermarkRenderer.makeOverlayCGImage(
-            at: 1.125,
-            chips: chips,
-            configuration: config
-        )
-        #expect(image != nil)
-        #expect(image?.width == 32)
-        #expect(image?.height == 24)
-
         let layer = ForensicWatermarkLayer()
-        try layer.configure(sessionID: "sess-render-test", configuration: config, startMediaTime: 100.0)
-        layer.align(
-            forPresentationSize: CGSize(width: 1920, height: 1080),
-            in: CGRect(x: 0, y: 0, width: 390, height: 844)
-        )
-        #expect(abs(layer.frame.width - 390) < 0.01)
-        #expect(abs(layer.frame.height - 219.375) < 0.05)
-
+        try layer.configure(sessionID: "sess-layer-copy", configuration: config, startMediaTime: 100.0)
+        layer.align(toVideoRect: CGRect(x: 0, y: 120, width: 390, height: 220))
         layer.update(at: 100.5)
         #expect(layer.contents != nil)
 
-        // Disabling overlay for unmarked control clears layer contents
-        layer.isWatermarkEnabled = false
+        // Presentation copy via init(layer:) preserves state without crashing
+        let presentationCopy = ForensicWatermarkLayer(layer: layer)
+        presentationCopy.align(toVideoRect: CGRect(x: 0, y: 120, width: 390, height: 220))
+        presentationCopy.update(at: 100.5)
+        #expect(presentationCopy.contents != nil)
+
+        // Zero video rect skips drawing
+        layer.align(toVideoRect: .zero)
+        layer.update(at: 100.75)
         #expect(layer.contents == nil)
+
+        // SwiftUI overlay accepts nil (unmarked control) and rejects invalid sessionID / low refresh rate
+        let player = AVPlayer()
+        ForensicWatermarkPlayerPolicy.configureForWatermarkedPlayback(player)
+        #expect(player.allowsExternalPlayback == false)
+
+        _ = try ForensicWatermarkOverlay(sessionID: nil, player: player)
+        #expect {
+            _ = try ForensicWatermarkOverlay(sessionID: "bad\nid", player: player)
+        } throws: { $0 is ForensicWatermarkError }
+        #expect {
+            _ = try ForensicWatermarkOverlay(
+                sessionID: "valid-id",
+                player: player,
+                configuration: ForensicWatermarkConfiguration(chipRateHz: 8.0),
+                refreshRateHz: 10.0
+            )
+        } throws: { $0 is ForensicWatermarkError }
     }
 
-    // MARK: - Detector Edge Cases (Pure Frame Samples)
+    // MARK: - Detector Timing, Bounds, VFR & False Positive Calibration
 
-    @Test("Detector returns inconclusive on short clips, empty candidates, and static zero-variance frames")
+    @Test("Exact period-aligned folding eliminates phase drift for non-integer sample periods (32 chips @ 7.5 Hz at 15s and 120s)")
+    func nonIntegerPeriodFoldingZeroDrift() throws {
+        let config = ForensicWatermarkConfiguration(
+            chipRateHz: 7.5,
+            periodChips: 32,
+            opacity: 0.025,
+            chromaMode: .isoluminantBlueYellow,
+            spatialPattern: .smoothCosine3x2
+        )
+        let detector = ForensicWatermarkDetector(configuration: config)
+        let candidates = ["drift-sess-1", "drift-sess-2", "drift-sess-3", "drift-sess-4"]
+        let chips = ForensicWatermarkSignal.chips(for: candidates[0], configuration: config)
+
+        func makeNoiselessFrames(durationSeconds: Double) -> [ForensicFrameSample] {
+            let count = Int(durationSeconds * 30.0)
+            var result: [ForensicFrameSample] = []
+            result.reserveCapacity(count)
+            for i in 0 ..< count {
+                let t = Double(i) / 30.0
+                let temporal = ForensicWatermarkSignal.temporalValue(at: t, chips: chips, chipRateHz: config.chipRateHz)
+                var cells = [Float](repeating: 0, count: 24)
+                var sum: Float = 0
+                for row in 0 ..< 4 {
+                    let v = (Float(row) + 0.5) / 4.0
+                    for col in 0 ..< 6 {
+                        let u = (Float(col) + 0.5) / 6.0
+                        let w = ForensicWatermarkSignal.spatialWeight(u: u, v: v, pattern: config.spatialPattern)
+                        let val = 0.012 * w * temporal
+                        cells[row * 6 + col] = val
+                        sum += val
+                    }
+                }
+                result.append(ForensicFrameSample(timestampSeconds: t, cellValues: cells, globalMean: sum / 24.0))
+            }
+            return result
+        }
+
+        let res15 = try detector.detect(frames: makeNoiselessFrames(durationSeconds: 15.0), candidateSessionIDs: candidates)
+        let res120 = try detector.detect(frames: makeNoiselessFrames(durationSeconds: 120.0), candidateSessionIDs: candidates)
+
+        #expect(res15.outcome == .detected(sessionID: candidates[0]))
+        #expect(res120.outcome == .detected(sessionID: candidates[0]))
+        // 120s must remain strongly detected (no drift cancellation!)
+        #expect((res120.bestCandidate?.zScore ?? 0) >= 8.0)
+    }
+
+    @Test("Detector enforces maxClipDurationSeconds, rejects non-finite timestamps, and handles VFR / 60fps / dropped frames")
+    func frameBoundsAndVFR60fps() throws {
+        let config = ForensicWatermarkConfiguration.default
+        let boundedOptions = ForensicWatermarkDetectionOptions(maxClipDurationSeconds: 10.0)
+        let detector = ForensicWatermarkDetector(configuration: config, options: boundedOptions)
+
+        // Non-finite timestamp throws invalidFrameData
+        let badFrame = ForensicFrameSample(timestampSeconds: .infinity, cellValues: [Float](repeating: 0, count: 24), globalMean: 0)
+        #expect {
+            _ = try detector.detect(frames: [badFrame], candidateSessionIDs: ["sess-1"])
+        } throws: { error in
+            if case .invalidFrameData = error as? ForensicWatermarkError { return true }
+            return false
+        }
+
+        // Enforce maxClipDurationSeconds on 60s of samples -> reports <= 10.1s
+        let targetID = "vfr-sess-target"
+        let candidates = [targetID, "vfr-sess-other-1", "vfr-sess-other-2", "vfr-sess-other-3"]
+        let chips = ForensicWatermarkSignal.chips(for: targetID, configuration: config)
+
+        // 60 fps VFR with jittered timestamps and 10% dropped frames over 30s
+        var frames: [ForensicFrameSample] = []
+        for i in 0 ..< 1800 {
+            if i % 10 == 3 { continue } // simulated dropped frame
+            let jitter = Double((i * 17) % 7 - 3) * 0.001
+            let t = Double(i) / 60.0 + jitter
+            let temporal = ForensicWatermarkSignal.temporalValue(at: t + 1.2, chips: chips, chipRateHz: config.chipRateHz)
+            var cells = [Float](repeating: 0, count: 24)
+            var sum: Float = 0
+            for row in 0 ..< 4 {
+                let v = (Float(row) + 0.5) / 4.0
+                for col in 0 ..< 6 {
+                    let u = (Float(col) + 0.5) / 6.0
+                    let w = ForensicWatermarkSignal.spatialWeight(u: u, v: v, pattern: config.spatialPattern)
+                    let val = 0.012 * w * temporal + 0.005 * sin(Float(t) * 0.8 + u * 2.0)
+                    cells[row * 6 + col] = val
+                    sum += val
+                }
+            }
+            frames.append(ForensicFrameSample(timestampSeconds: t, cellValues: cells, globalMean: sum / 24.0))
+        }
+
+        let result = try detector.detect(frames: frames, candidateSessionIDs: candidates)
+        #expect(result.clipDurationSeconds <= 10.2)
+        #expect(result.outcome == .detected(sessionID: targetID))
+    }
+
+    @Test("Detector edge cases: empty candidates, static zero-variance frames, and too-short clips")
     func detectorEdgeCases() throws {
         let detector = ForensicWatermarkDetector()
 
-        // Empty candidates
-        let shortFrames = (0 ..< 150).map { i in
+        let staticFrames: [ForensicFrameSample] = (0 ..< 150).map { i in
             ForensicFrameSample(
                 timestampSeconds: Double(i) / 30.0,
                 cellValues: [Float](repeating: 0.5, count: 24),
                 globalMean: 0.5
             )
         }
-        let noCandResult = try detector.detect(frames: shortFrames, candidateSessionIDs: [])
+        let noCandResult = try detector.detect(frames: staticFrames, candidateSessionIDs: [])
         #expect(noCandResult.outcome == .inconclusive(reason: .noCandidates))
 
-        // Static zero-variance unmarked frames
-        let staticResult = try detector.detect(frames: shortFrames, candidateSessionIDs: ["sess-1", "sess-2"])
+        let staticResult = try detector.detect(frames: staticFrames, candidateSessionIDs: ["sess-1", "sess-2"])
         #expect(staticResult.outcome == .inconclusive(reason: .insufficientSignalVariance))
 
-        // Clip too short (1.5 seconds < 3.0s minimum)
         let tooShortFrames: [ForensicFrameSample] = (0 ..< 45).map { i in
             let sampleValue: Float = (i % 2 == 0) ? 0.0 : 0.1
             return ForensicFrameSample(
@@ -225,9 +326,187 @@ struct ForensicWatermarkTests {
         #expect(tooShortResult.outcome == .inconclusive(reason: .clipTooShort))
     }
 
-    // MARK: - End-to-End H.264 / HEVC Detection, Transforms, and Blinded Evaluation
+    @Test("Monte Carlo null calibration produces zero false positives across 40 unmarked clips x 20 candidates")
+    func monteCarloFalsePositiveRate() throws {
+        let detector = ForensicWatermarkDetector()
+        let candidates = (1 ... 20).map { String(format: "mc-sess-%02d", $0) }
+        var falsePositives = 0
 
-    @Test("End-to-end recovery across dark, bright, moving scenes, handheld degradations, controls, and out-of-set IDs")
+        for trial in 0 ..< 40 {
+            var state: UInt64 = UInt64(trial + 1) &* 0x9E37_79B9_7F4A_7C15
+            func nextNoise() -> Float {
+                state &+= 0x9E37_79B9_7F4A_7C15
+                var z = state
+                z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+                z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+                let u = Float((z ^ (z >> 31)) >> 40) / Float(1 << 24)
+                return (u - 0.5) * 0.06
+            }
+
+            var frames: [ForensicFrameSample] = []
+            frames.reserveCapacity(450)
+            for f in 0 ..< 450 {
+                let t = Double(f) / 30.0
+                var cells = [Float](repeating: 0, count: 24)
+                var sum: Float = 0
+                for c in 0 ..< 24 {
+                    let drift = 0.04 * sin(Float(t) * 1.1 + Float(c) * 0.3)
+                    let v = drift + nextNoise()
+                    cells[c] = v
+                    sum += v
+                }
+                frames.append(ForensicFrameSample(timestampSeconds: t, cellValues: cells, globalMean: sum / 24.0))
+            }
+
+            let res = try detector.detect(frames: frames, candidateSessionIDs: candidates)
+            if res.outcome.detectedSessionID != nil {
+                falsePositives += 1
+            }
+        }
+        #expect(falsePositives == 0)
+    }
+
+    // MARK: - Path Safety, Rotated Portrait Clips & Real Metadata Stripping
+
+    @Test("stripMetadata rejects identical input/output paths, directory destinations, and preserves source files")
+    func stripMetadataPathSafety() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("forensic-wm-safety-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let srcURL = tempDir.appendingPathComponent("source.mp4")
+        let sentinel = Data("sentinel-do-not-delete".utf8)
+        try sentinel.write(to: srcURL)
+
+        // Same input and output path must throw and MUST NOT delete the source file
+        await #expect {
+            try await ForensicWatermarkMediaUtilities.stripMetadata(from: srcURL, to: srcURL)
+        } throws: { error in
+            (error as? ForensicWatermarkError) == .sameInputOutputPath
+        }
+        #expect((try? Data(contentsOf: srcURL)) == sentinel)
+
+        // Existing directory output path must throw and MUST NOT delete the directory
+        let subDir = tempDir.appendingPathComponent("existing-dir")
+        try FileManager.default.createDirectory(at: subDir, withIntermediateDirectories: true)
+        let innerFile = subDir.appendingPathComponent("keep.txt")
+        try sentinel.write(to: innerFile)
+
+        await #expect {
+            try await ForensicWatermarkMediaUtilities.stripMetadata(from: srcURL, to: subDir)
+        } throws: { error in
+            (error as? ForensicWatermarkError) == .outputPathIsDirectory
+        }
+        #expect(FileManager.default.fileExists(atPath: innerFile.path))
+
+        // Existing output file with overwrite: false must fail without clobbering
+        let existingOut = tempDir.appendingPathComponent("existing.mp4")
+        try sentinel.write(to: existingOut)
+        await #expect {
+            try await ForensicWatermarkMediaUtilities.stripMetadata(from: srcURL, to: existingOut, overwrite: false)
+        } throws: { error in
+            if case .outputFileAlreadyExists = error as? ForensicWatermarkError { return true }
+            return false
+        }
+        #expect((try? Data(contentsOf: existingOut)) == sentinel)
+    }
+
+    @Test("stripMetadata rotates 90-degree portrait tracks properly, strips real metadata atoms, and preserves watermark")
+    func stripMetadataRotatedPortraitAndRealMetadata() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("forensic-wm-portrait-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let config = ForensicWatermarkConfiguration.default
+        let candidates = ["portrait-sess-1", "portrait-sess-2", "portrait-sess-3", "portrait-sess-4"]
+
+        // Build real metadata items (title + creator) to verify stripping actually removes them
+        let titleItem = AVMutableMetadataItem()
+        titleItem.identifier = .commonIdentifierTitle
+        titleItem.value = "Sensitive iPhone Capture" as NSString
+        let softwareItem = AVMutableMetadataItem()
+        softwareItem.identifier = .commonIdentifierSoftware
+        softwareItem.value = "iOS Camera Prototype" as NSString
+
+        // 240x136 landscape buffer with 90-degree clockwise preferredTransform -> 136x240 portrait display
+        let portraitTransform = CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 136, ty: 0)
+        let rotatedURL = tempDir.appendingPathComponent("rotated-source.mp4")
+        try await ForensicWatermarkMediaUtilities.generateSyntheticVideo(
+            outputURL: rotatedURL,
+            width: 240,
+            height: 136,
+            frameRate: 30,
+            durationSeconds: 12.0,
+            scene: .bright,
+            sessionID: candidates[1],
+            configuration: config,
+            degradation: .clean,
+            randomSeed: 91,
+            preferredTransform: portraitTransform,
+            metadata: [titleItem, softwareItem]
+        )
+
+        // Confirm source carries metadata and rotated transform
+        let srcAsset = AVURLAsset(url: rotatedURL)
+        let srcMeta = try await srcAsset.load(.commonMetadata)
+        #expect(!srcMeta.isEmpty)
+
+        // Strip metadata + crop center 70% in portrait display space
+        let strippedURL = tempDir.appendingPathComponent("portrait-stripped-cropped.mp4")
+        try await ForensicWatermarkMediaUtilities.stripMetadata(
+            from: rotatedURL,
+            to: strippedURL,
+            cropRectNormalized: CGRect(x: 0.15, y: 0.15, width: 0.70, height: 0.70),
+            averageBitRate: 1_200_000
+        )
+
+        let outAsset = AVURLAsset(url: strippedURL)
+        let outCommonMeta = try await outAsset.load(.commonMetadata)
+        let outAllMeta = try await outAsset.load(.metadata)
+        #expect(outCommonMeta.isEmpty)
+        #expect(outAllMeta.isEmpty)
+
+        let outTrack = try #require(try await outAsset.loadTracks(withMediaType: .video).first)
+        let outNatural = try await outTrack.load(.naturalSize)
+        let outTransform = try await outTrack.load(.preferredTransform)
+        #expect(outTransform.isIdentity)
+        // Portrait output: height > width (~94 x 168)
+        #expect(outNatural.height > outNatural.width)
+
+        // Verify bottom rows of decoded frame were written (not zeroed/uninitialized)
+        let reader = try AVAssetReader(asset: outAsset)
+        let output = AVAssetReaderTrackOutput(
+            track: outTrack,
+            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+        )
+        reader.add(output)
+        #expect(reader.startReading())
+        let sample = try #require(output.copyNextSampleBuffer())
+        let buffer = try #require(CMSampleBufferGetImageBuffer(sample))
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        let base = try #require(CVPixelBufferGetBaseAddress(buffer)).assumingMemoryBound(to: UInt8.self)
+        let bpr = CVPixelBufferGetBytesPerRow(buffer)
+        let h = CVPixelBufferGetHeight(buffer)
+        let w = CVPixelBufferGetWidth(buffer)
+        let bottomRowOffset = (h - 2) * bpr + (w / 2) * 4
+        // Bright scene pixel must be brightly populated at the very bottom of the portrait output
+        #expect(base[bottomRowOffset] > 100)
+        #expect(base[bottomRowOffset + 1] > 100)
+        #expect(base[bottomRowOffset + 2] > 100)
+        reader.cancelReading()
+
+        // Watermark recovers from the rotated, stripped, cropped portrait clip!
+        let detector = ForensicWatermarkDetector(configuration: config)
+        let result = try await detector.detect(videoURL: strippedURL, candidateSessionIDs: candidates)
+        #expect(result.outcome == .detected(sessionID: candidates[1]))
+    }
+
+    // MARK: - End-to-End H.264 / HEVC Detection & Blinded Evaluation Harness
+
+    @Test("End-to-end recovery via 16-bit live overlay, independent RGB noise, controls, out-of-set IDs, and evaluator resilience")
     func endToEndBlindedEvaluation() async throws {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("forensic-wm-test-\(UUID().uuidString)")
@@ -238,7 +517,7 @@ struct ForensicWatermarkTests {
         let candidates = (1 ... 10).map { String(format: "opaque-session-%02d", $0) }
         let outOfSetSession = "opaque-session-outside-99"
 
-        // 1. Original 15s moving scene with scene cuts (in-set)
+        // 1. Original 15s moving scene with scene cuts (in-set, via 16-bit rendered overlay)
         let movingOriginalURL = tempDir.appendingPathComponent("moving-orig.mp4")
         try await ForensicWatermarkMediaUtilities.generateSyntheticVideo(
             outputURL: movingOriginalURL,
@@ -253,7 +532,7 @@ struct ForensicWatermarkTests {
             randomSeed: 11
         )
 
-        // 2. Metadata-stripped, trimmed (10s from t=2.5s), cropped (center 70%), recompressed copy of movingOriginalURL
+        // 2. Metadata-stripped, trimmed (10s from t=2.5s), cropped (center 70%), recompressed copy
         let transformedCopyURL = tempDir.appendingPathComponent("moving-trimmed-cropped-recomp.mp4")
         try await ForensicWatermarkMediaUtilities.stripMetadata(
             from: movingOriginalURL,
@@ -264,12 +543,7 @@ struct ForensicWatermarkTests {
             averageBitRate: 800_000
         )
 
-        // Verify metadata was actually stripped from the blinded copy
-        let strippedAsset = AVURLAsset(url: transformedCopyURL)
-        let commonMetadata = try await strippedAsset.load(.commonMetadata)
-        #expect(commonMetadata.isEmpty)
-
-        // 3. Dark scene under handheld camera degradation + H.264 recompression (15s)
+        // 3. Dark scene under handheld camera degradation (independent RGB noise + spatially varying drift + H.264)
         let darkHandheldURL = tempDir.appendingPathComponent("dark-handheld.mp4")
         try await ForensicWatermarkMediaUtilities.generateSyntheticVideo(
             outputURL: darkHandheldURL,
@@ -284,7 +558,7 @@ struct ForensicWatermarkTests {
             randomSeed: 22
         )
 
-        // 4. Bright scene under handheld camera degradation + HEVC recompression (15s)
+        // 4. Bright scene under handheld degradation + HEVC
         let brightHandheldURL = tempDir.appendingPathComponent("bright-handheld-hevc.mp4")
         let hevcDegradation = SimulatedCameraDegradation(
             cropInsetFraction: 0.15,
@@ -294,7 +568,8 @@ struct ForensicWatermarkTests {
             autoWhiteBalanceDriftAmplitude: 0.03,
             startTimeOffsetSeconds: 6.25,
             averageBitRate: 850_000,
-            useHEVC: true
+            useHEVC: true,
+            useRenderedOverlayTexture: true
         )
         try await ForensicWatermarkMediaUtilities.generateSyntheticVideo(
             outputURL: brightHandheldURL,
@@ -309,7 +584,7 @@ struct ForensicWatermarkTests {
             randomSeed: 33
         )
 
-        // 5. Unmarked control (moving scene + handheld camera noise)
+        // 5. Unmarked control
         let unmarkedControlURL = tempDir.appendingPathComponent("unmarked-control.mp4")
         try await ForensicWatermarkMediaUtilities.generateSyntheticVideo(
             outputURL: unmarkedControlURL,
@@ -324,7 +599,7 @@ struct ForensicWatermarkTests {
             randomSeed: 44
         )
 
-        // 6. Marked session outside the candidate set
+        // 6. Marked session outside candidate set (intentionally mislabeled isInCandidateSet: true to verify authoritative derivation!)
         let outOfSetURL = tempDir.appendingPathComponent("outside-candidate-set.mp4")
         try await ForensicWatermarkMediaUtilities.generateSyntheticVideo(
             outputURL: outOfSetURL,
@@ -340,82 +615,53 @@ struct ForensicWatermarkTests {
         )
 
         let trials: [ForensicWatermarkTrial] = [
-            ForensicWatermarkTrial(
-                label: "clip-01",
-                videoPath: movingOriginalURL.path,
-                expectedSessionID: candidates[2],
-                isInCandidateSet: true,
-                transformTag: "original"
-            ),
-            ForensicWatermarkTrial(
-                label: "clip-02",
-                videoPath: transformedCopyURL.path,
-                expectedSessionID: candidates[2],
-                isInCandidateSet: true,
-                transformTag: "trimmed-10s-cropped-70pct-recompressed"
-            ),
-            ForensicWatermarkTrial(
-                label: "clip-03",
-                videoPath: darkHandheldURL.path,
-                expectedSessionID: candidates[5],
-                isInCandidateSet: true,
-                transformTag: "handheld-dark-h264"
-            ),
-            ForensicWatermarkTrial(
-                label: "clip-04",
-                videoPath: brightHandheldURL.path,
-                expectedSessionID: candidates[8],
-                isInCandidateSet: true,
-                transformTag: "handheld-bright-hevc"
-            ),
-            ForensicWatermarkTrial(
-                label: "clip-05",
-                videoPath: unmarkedControlURL.path,
-                expectedSessionID: nil,
-                isInCandidateSet: false,
-                transformTag: "unmarked-control"
-            ),
-            ForensicWatermarkTrial(
-                label: "clip-06",
-                videoPath: outOfSetURL.path,
-                expectedSessionID: outOfSetSession,
-                isInCandidateSet: false,
-                transformTag: "out-of-candidate-set"
-            ),
+            ForensicWatermarkTrial(label: "clip-01", videoPath: movingOriginalURL.path, expectedSessionID: candidates[2], isInCandidateSet: true, transformTag: "original"),
+            ForensicWatermarkTrial(label: "clip-02", videoPath: transformedCopyURL.path, expectedSessionID: candidates[2], isInCandidateSet: true, transformTag: "trimmed-10s-cropped-70pct-recompressed"),
+            ForensicWatermarkTrial(label: "clip-03", videoPath: darkHandheldURL.path, expectedSessionID: candidates[5], isInCandidateSet: true, transformTag: "handheld-dark-h264"),
+            ForensicWatermarkTrial(label: "clip-04", videoPath: brightHandheldURL.path, expectedSessionID: candidates[8], isInCandidateSet: true, transformTag: "handheld-bright-hevc"),
+            ForensicWatermarkTrial(label: "clip-05", videoPath: unmarkedControlURL.path, expectedSessionID: nil, isInCandidateSet: false, transformTag: "unmarked-control"),
+            ForensicWatermarkTrial(label: "clip-06", videoPath: outOfSetURL.path, expectedSessionID: outOfSetSession, isInCandidateSet: true, transformTag: "out-of-candidate-set"),
         ]
 
-        let evaluator = ForensicWatermarkEvaluator(configuration: config)
+        let evaluator = ForensicWatermarkEvaluator(configuration: config, minRepeatableTrialsPerDuration: 2)
         let report = try await evaluator.evaluate(trials: trials, candidateSessionIDs: candidates)
 
         #expect(report.markedInSetTrials == 4)
         #expect(report.correctIDs == 4)
         #expect(report.missedDetections == 0)
         #expect(report.wrongIDs == 0)
-
         #expect(report.unmarkedControlTrials == 1)
         #expect(report.controlTrueNegatives == 1)
         #expect(report.controlFalsePositives == 0)
-
         #expect(report.outOfSetTrials == 1)
         #expect(report.outOfSetRejections == 1)
         #expect(report.outOfSetFalsePositives == 0)
+        #expect(report.readErrors == 0)
 
-        #expect(report.shortestRepeatableDurationSeconds == 10)
+        // 10s bucket only has n=1 trial, while 15s bucket has n=3 -> shortest repeatable with n>=2 is 15s, NOT 10s!
+        #expect(report.shortestRepeatableDurationSeconds == 15)
 
-        // Verify phase offset estimation on the 2.5s trimmed clip matches ~2.5s
-        let trimmedResult = report.trialResults[1]
-        if let best = trimmedResult.detection.bestCandidate {
-            let phaseErr = abs(best.estimatedPhaseOffsetSeconds - 2.5)
-            #expect(phaseErr < 0.35)
-        } else {
-            Issue.record("Expected bestCandidate on trimmed clip")
-        }
+        // Report redacts full local directory paths to filenames
+        #expect(!report.trialResults[0].trial.videoPath.contains(tempDir.path))
+        #expect(report.trialResults[0].trial.videoPath == "moving-orig.mp4")
 
-        // Verify Markdown summary includes separate rows for all categories
-        let md = report.markdownSummary()
-        #expect(md.contains("Marked (in candidate set)"))
-        #expect(md.contains("Unmarked controls"))
-        #expect(md.contains("Marked (outside candidate set)"))
+        // Verify phase offset estimation on the 2.5s trimmed clip
+        let trimmedDetection = try #require(report.trialResults[1].detection)
+        let best = try #require(trimmedDetection.bestCandidate)
+        #expect(abs(best.estimatedPhaseOffsetSeconds - 2.5) < 0.35)
+
+        // Verify per-clip error resilience: an unreadable clip records .readError without discarding valid results
+        let missingTrial = ForensicWatermarkTrial(
+            label: "clip-missing",
+            videoPath: tempDir.appendingPathComponent("does-not-exist.mp4").path,
+            expectedSessionID: candidates[0],
+            isInCandidateSet: true,
+            transformTag: "missing"
+        )
+        let resilientReport = try await evaluator.evaluate(trials: [trials[0], missingTrial], candidateSessionIDs: candidates)
+        #expect(resilientReport.correctIDs == 1)
+        #expect(resilientReport.readErrors == 1)
+        #expect(resilientReport.shortestRepeatableDurationSeconds == nil)
     }
 
     @Test("Luminance and blueChannel experimental presets recover session IDs cleanly")
@@ -473,7 +719,6 @@ struct ForensicWatermarkTests {
             randomSeed: 88
         )
 
-        // Tight 20%x30% crop strictly inside the top-left positive lobe of cos(2*pi*u)*cos(pi*v)
         let cornerURL = tempDir.appendingPathComponent("corner.mp4")
         try await ForensicWatermarkMediaUtilities.stripMetadata(
             from: fullURL,

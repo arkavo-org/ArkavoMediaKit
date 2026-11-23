@@ -35,7 +35,7 @@ struct WatermarkSignalOptions: ParsableArguments {
     @Option(name: .long, help: "Spatial pattern: smoothCosine3x2, smoothCosine2x2, or uniform")
     var spatialPattern: String = WatermarkSpatialPattern.smoothCosine3x2.rawValue
 
-    @Option(name: .long, help: "Minimum decoy-calibrated z-score for detection (default: 5.0)")
+    @Option(name: .long, help: "Base minimum decoy-calibrated z-score for detection (default: 5.0)")
     var minZScore: Double = 5.0
 
     @Option(name: .long, help: "Minimum z-score margin over runner-up/max decoy (default: 2.0)")
@@ -74,24 +74,24 @@ struct WatermarkSignalOptions: ParsableArguments {
 }
 
 private func loadCandidateSessionIDs(inline: String?, filePath: String?) throws -> [String] {
-    var ids: [String] = []
+    var rawIDs: [String] = []
     if let inline {
-        ids.append(contentsOf: inline.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+        rawIDs.append(contentsOf: inline.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
     }
     if let filePath {
         let content = try String(contentsOfFile: filePath, encoding: .utf8)
-        ids.append(
+        rawIDs.append(
             contentsOf: content
                 .split(whereSeparator: \.isNewline)
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty && !$0.hasPrefix("#") }
         )
     }
-    let filtered = ids.filter { !$0.isEmpty }
-    guard !filtered.isEmpty else {
-        throw ValidationError("Provide at least one candidate session ID via --candidates or --candidates-file")
+    let validated = try rawIDs.filter { !$0.isEmpty }.map { try WatermarkSessionCode($0).rawValue }
+    guard !validated.isEmpty else {
+        throw ValidationError("Provide at least one valid ASCII candidate session ID via --candidates or --candidates-file")
     }
-    return filtered
+    return validated
 }
 
 // MARK: - detect
@@ -150,22 +150,22 @@ struct DetectCommand: AsyncParsableCommand {
             if let best = result.bestCandidate {
                 print(
                     String(
-                        format: "Top candidate: %@ (z=%.2f, margin=%.2f, raw=%.2f, phase=%.2fs)",
+                        format: "Top candidate: %@ (z=%.2f, threshold=%.2f, margin=%.2f, phase=%.2fs)",
                         best.sessionID,
                         best.zScore,
+                        result.nullStatistics.effectiveZScoreThreshold,
                         best.marginOverRunnerUp,
-                        best.rawScore,
                         best.estimatedPhaseOffsetSeconds
                     )
                 )
             }
             print(
                 String(
-                    format: "Empirical null (%d decoys): mean=%.2f, std=%.2f, max=%.2f",
+                    format: "Empirical null (%d decoys): mean=%.2f, std=%.2f, maxZ=%.2f",
                     result.nullStatistics.decoyCount,
                     result.nullStatistics.mean,
                     result.nullStatistics.standardDeviation,
-                    result.nullStatistics.maxDecoyScore
+                    result.nullStatistics.maxDecoyZScore
                 )
             )
         }
@@ -189,6 +189,9 @@ struct EvaluateCommand: AsyncParsableCommand {
     @Option(name: .long, help: "Newline-delimited file of candidate session IDs")
     var candidatesFile: String?
 
+    @Option(name: .long, help: "Minimum marked trials per duration bucket to claim repeatable recovery (default: 2)")
+    var minRepeatableTrials: Int = 2
+
     @Flag(name: .long, help: "Emit JSON report instead of Markdown")
     var json: Bool = false
 
@@ -202,7 +205,11 @@ struct EvaluateCommand: AsyncParsableCommand {
         let manifestData = try Data(contentsOf: URL(fileURLWithPath: manifest))
         let trials = try JSONDecoder().decode([ForensicWatermarkTrial].self, from: manifestData)
 
-        let evaluator = ForensicWatermarkEvaluator(configuration: config, options: options)
+        let evaluator = ForensicWatermarkEvaluator(
+            configuration: config,
+            options: options,
+            minRepeatableTrialsPerDuration: max(1, minRepeatableTrials)
+        )
         let report = try await evaluator.evaluate(trials: trials, candidateSessionIDs: candidateIDs)
 
         if json {
@@ -221,7 +228,7 @@ struct EvaluateCommand: AsyncParsableCommand {
 struct StripMetadataCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "strip-metadata",
-        abstract: "Produce a blinded, metadata-stripped (and optionally trimmed/cropped/recompressed) copy of a clip."
+        abstract: "Produce a blinded, upright, metadata-stripped (and optionally trimmed/cropped/recompressed) copy of a clip."
     )
 
     @Argument(help: "Input video file path")
@@ -242,6 +249,9 @@ struct StripMetadataCommand: AsyncParsableCommand {
     @Option(name: .long, help: "Target H.264 bitrate in bps (default: 2500000)")
     var bitrate: Int = 2_500_000
 
+    @Flag(name: .long, help: "Allow atomically overwriting an existing destination file")
+    var overwrite: Bool = false
+
     mutating func run() async throws {
         var cropRect: CGRect?
         if let inset = cropInset {
@@ -256,7 +266,8 @@ struct StripMetadataCommand: AsyncParsableCommand {
             trimStartSeconds: trimStart,
             trimDurationSeconds: trimDuration,
             cropRectNormalized: cropRect,
-            averageBitRate: bitrate
+            averageBitRate: bitrate,
+            overwrite: overwrite
         )
         print("Wrote metadata-stripped clip to \(outputPath)")
     }
@@ -267,7 +278,7 @@ struct StripMetadataCommand: AsyncParsableCommand {
 struct SimulateCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "simulate",
-        abstract: "Generate a synthetic blinded experiment matrix (original, trimmed, cropped, recompressed, controls) and evaluate it."
+        abstract: "Generate a synthetic blinded experiment matrix (16-bit live overlay, independent RGB noise, trimmed, cropped, recompressed, controls) and evaluate it."
     )
 
     @Option(name: .long, help: "Working directory for generated clips (default: temporary directory)")
@@ -317,21 +328,23 @@ struct SimulateCommand: AsyncParsableCommand {
             Spec(label: "clip-01", sessionID: candidates[0], inSet: true, duration: 15, scene: .movingWithSceneCuts, degradation: .clean, tag: "original-15s-moving", seed: 101),
             Spec(label: "clip-02", sessionID: candidates[3], inSet: true, duration: 15, scene: .dark, degradation: .handheldRecompressed, tag: "handheld-recompressed-15s-dark", seed: 102),
             Spec(label: "clip-03", sessionID: candidates[7], inSet: true, duration: 15, scene: .bright, degradation: .handheldRecompressed, tag: "handheld-recompressed-15s-bright", seed: 103),
-            Spec(label: "clip-04", sessionID: candidates[10], inSet: true, duration: 10, scene: .movingWithSceneCuts, degradation: .handheldRecompressed, tag: "trimmed-10s-handheld", seed: 104),
-            Spec(label: "clip-05", sessionID: candidates[5], inSet: true, duration: 5, scene: .movingWithSceneCuts, degradation: .handheldRecompressed, tag: "trimmed-5s-handheld", seed: 105),
+            Spec(label: "clip-04", sessionID: candidates[10], inSet: true, duration: 10, scene: .movingWithSceneCuts, degradation: .handheldRecompressed, tag: "trimmed-10s-handheld-a", seed: 104),
+            Spec(label: "clip-05", sessionID: candidates[4], inSet: true, duration: 10, scene: .dark, degradation: .handheldRecompressed, tag: "trimmed-10s-handheld-b", seed: 105),
+            Spec(label: "clip-06", sessionID: candidates[5], inSet: true, duration: 5, scene: .movingWithSceneCuts, degradation: .handheldRecompressed, tag: "trimmed-5s-handheld-a", seed: 106),
+            Spec(label: "clip-07", sessionID: candidates[8], inSet: true, duration: 5, scene: .bright, degradation: .handheldRecompressed, tag: "trimmed-5s-handheld-b", seed: 107),
             Spec(
-                label: "clip-06",
+                label: "clip-08",
                 sessionID: candidates[2],
                 inSet: true,
                 duration: 15,
                 scene: .movingWithSceneCuts,
                 degradation: SimulatedCameraDegradation(cropInsetFraction: 0.25, handheldJitterFraction: 0.02, sensorNoiseStdDev: 0.02, autoExposureDriftAmplitude: 0.05, autoWhiteBalanceDriftAmplitude: 0.03, startTimeOffsetSeconds: 7.1, averageBitRate: 800_000),
                 tag: "cropped-50pct-recompressed-15s",
-                seed: 106
+                seed: 108
             ),
-            Spec(label: "clip-07", sessionID: nil, inSet: false, duration: 15, scene: .movingWithSceneCuts, degradation: .handheldRecompressed, tag: "unmarked-control-moving", seed: 201),
-            Spec(label: "clip-08", sessionID: nil, inSet: false, duration: 15, scene: .dark, degradation: .clean, tag: "unmarked-control-dark", seed: 202),
-            Spec(label: "clip-09", sessionID: outOfSetID, inSet: false, duration: 15, scene: .movingWithSceneCuts, degradation: .handheldRecompressed, tag: "outside-candidate-set-15s", seed: 301),
+            Spec(label: "clip-09", sessionID: nil, inSet: false, duration: 15, scene: .movingWithSceneCuts, degradation: .handheldRecompressed, tag: "unmarked-control-moving", seed: 201),
+            Spec(label: "clip-10", sessionID: nil, inSet: false, duration: 15, scene: .dark, degradation: .clean, tag: "unmarked-control-dark", seed: 202),
+            Spec(label: "clip-11", sessionID: outOfSetID, inSet: false, duration: 15, scene: .movingWithSceneCuts, degradation: .handheldRecompressed, tag: "outside-candidate-set-15s", seed: 301),
         ]
 
         var trials: [ForensicWatermarkTrial] = []
@@ -358,7 +371,7 @@ struct SimulateCommand: AsyncParsableCommand {
                     transformTag: spec.tag,
                     playbackDevice: "SyntheticSimulator",
                     captureDevice: "SyntheticCamera",
-                    cameraSettings: "320x180@30fps H.264"
+                    cameraSettings: "320x180@30fps H.264 (16-bit live overlay)"
                 )
             )
         }

@@ -36,26 +36,25 @@ public enum WatermarkVideoGravity: String, Sendable, Equatable, Hashable, Codabl
 public enum ForensicWatermarkGeometry {
     /// Computes the displayed picture rectangle for a video of `presentationSize` inside `containerBounds`.
     ///
+    /// Returns `.zero` until both `containerBounds` and `presentationSize` have positive finite dimensions
+    /// so the overlay never paints over letterbox/pillarbox bars while a FairPlay item is still loading.
+    ///
     /// - Parameters:
     ///   - presentationSize: The `AVPlayerItem.presentationSize` (which already accounts for track `preferredTransform`).
     ///   - containerBounds: The coordinate space of the player container view.
     ///   - gravity: Video gravity mode (defaults to `.resizeAspect`).
-    /// - Returns: The sub-rectangle within `containerBounds` occupied by the rendered video picture.
+    /// - Returns: The sub-rectangle within `containerBounds` occupied by the rendered video picture, or `.zero` if unknown.
     public static func videoRect(
         forPresentationSize presentationSize: CGSize,
         in containerBounds: CGRect,
         gravity: WatermarkVideoGravity = .resizeAspect
     ) -> CGRect {
         guard containerBounds.width.isFinite, containerBounds.height.isFinite,
-              containerBounds.width > 0, containerBounds.height > 0
-        else {
-            return .zero
-        }
-
-        guard presentationSize.width.isFinite, presentationSize.height.isFinite,
+              containerBounds.width > 0, containerBounds.height > 0,
+              presentationSize.width.isFinite, presentationSize.height.isFinite,
               presentationSize.width > 0, presentationSize.height > 0
         else {
-            return containerBounds
+            return .zero
         }
 
         switch gravity {

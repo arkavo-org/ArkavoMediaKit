@@ -8,7 +8,11 @@ import Foundation
 
 /// Tunable parameters for the offline forensic watermark detector.
 public struct ForensicWatermarkDetectionOptions: Sendable, Equatable, Codable {
-    /// Uniform resampling rate in Hz used before bandpass filtering and FFT correlation.
+    /// Target uniform resampling rate in Hz used before bandpass filtering and FFT correlation.
+    ///
+    /// The detector snaps this rate slightly to `round(periodSeconds * sampleRateHz) / periodSeconds`
+    /// so every repeating code period contains an exact integer number of samples with zero cumulative
+    /// phase drift on arbitrarily long recordings.
     public let sampleRateHz: Double
 
     /// Number of horizontal coarse spatial cells extracted per video frame.
@@ -20,14 +24,18 @@ public struct ForensicWatermarkDetectionOptions: Sendable, Equatable, Codable {
     /// Number of deterministic domain-separated decoy codes evaluated per clip for empirical null calibration.
     public let decoyCount: Int
 
-    /// Minimum calibrated z-score required to declare a positive detection instead of `.inconclusive`.
+    /// Base minimum decoy-calibrated z-score required to declare a positive detection instead of `.inconclusive`.
+    ///
+    /// For multi-candidate searches, the effective threshold is adjusted upward by
+    /// `candidateCountPenaltyScale * ln(candidateCount)` to account for extreme-value multiple testing.
     public let minZScore: Double
+
+    /// Extreme-value multiple-testing scale (`~0.78` for Gumbel right tails) applied as
+    /// `candidateCountPenaltyScale * ln(max(1, candidateCount))` on top of `minZScore`.
+    public let candidateCountPenaltyScale: Double
 
     /// Minimum calibrated z-score separation between the top candidate and runner-up (or max decoy).
     public let minMarginOverRunnerUp: Double
-
-    /// Minimum ratio of the top candidate's raw score over the strongest decoy score.
-    public let minRatioOverMaxDecoy: Double
 
     /// Minimum analyzed clip duration in seconds required to attempt detection.
     public let minDurationSeconds: Double
@@ -41,8 +49,8 @@ public struct ForensicWatermarkDetectionOptions: Sendable, Equatable, Codable {
         gridRows: Int = 4,
         decoyCount: Int = 64,
         minZScore: Double = 5.0,
+        candidateCountPenaltyScale: Double = 0.78,
         minMarginOverRunnerUp: Double = 2.0,
-        minRatioOverMaxDecoy: Double = 1.15,
         minDurationSeconds: Double = 3.0,
         maxClipDurationSeconds: Double = 120.0
     ) {
@@ -51,13 +59,19 @@ public struct ForensicWatermarkDetectionOptions: Sendable, Equatable, Codable {
         self.gridRows = gridRows
         self.decoyCount = decoyCount
         self.minZScore = minZScore
+        self.candidateCountPenaltyScale = candidateCountPenaltyScale
         self.minMarginOverRunnerUp = minMarginOverRunnerUp
-        self.minRatioOverMaxDecoy = minRatioOverMaxDecoy
         self.minDurationSeconds = minDurationSeconds
         self.maxClipDurationSeconds = maxClipDurationSeconds
     }
 
     public static let `default` = ForensicWatermarkDetectionOptions()
+
+    /// Computes the candidate-count-adjusted z-score threshold actually applied during decision making.
+    public func effectiveMinZScore(candidateCount: Int) -> Double {
+        let count = max(1, candidateCount)
+        return minZScore + candidateCountPenaltyScale * log(Double(count))
+    }
 
     public func validate(for configuration: ForensicWatermarkConfiguration) throws {
         guard sampleRateHz.isFinite, sampleRateHz >= configuration.chipRateHz * 4.0, sampleRateHz <= 120.0 else {
@@ -74,11 +88,11 @@ public struct ForensicWatermarkDetectionOptions: Sendable, Equatable, Codable {
         guard minZScore.isFinite, minZScore >= 2.0 else {
             throw ForensicWatermarkError.invalidConfiguration("minZScore must be >= 2.0")
         }
+        guard candidateCountPenaltyScale.isFinite, candidateCountPenaltyScale >= 0.0, candidateCountPenaltyScale <= 3.0 else {
+            throw ForensicWatermarkError.invalidConfiguration("candidateCountPenaltyScale must be in [0.0, 3.0]")
+        }
         guard minMarginOverRunnerUp.isFinite, minMarginOverRunnerUp >= 0.0 else {
             throw ForensicWatermarkError.invalidConfiguration("minMarginOverRunnerUp must be >= 0.0")
-        }
-        guard minRatioOverMaxDecoy.isFinite, minRatioOverMaxDecoy >= 1.0 else {
-            throw ForensicWatermarkError.invalidConfiguration("minRatioOverMaxDecoy must be >= 1.0")
         }
         guard minDurationSeconds.isFinite, minDurationSeconds > 0, maxClipDurationSeconds >= minDurationSeconds else {
             throw ForensicWatermarkError.invalidConfiguration("Invalid clip duration bounds")
@@ -111,24 +125,24 @@ public enum ForensicWatermarkDetectionOutcome: Sendable, Equatable, Codable {
 /// Detection score details for a single candidate session ID.
 public struct ForensicWatermarkCandidateScore: Sendable, Equatable, Codable {
     public let sessionID: String
-    /// Raw combined correlation metric before final decoy calibration.
-    public let rawScore: Double
-    /// Empirical decoy-calibrated z-score.
+    /// Best channel standardized score (`max(z_spatial, z_global)`) prior to combined-max decoy calibration.
+    public let combinedChannelScore: Double
+    /// Empirical decoy-calibrated z-score of the combined-max statistic.
     public let zScore: Double
     /// Estimated clip start phase within the periodic watermark cycle, in seconds.
     public let estimatedPhaseOffsetSeconds: Double
-    /// Separation in calibrated z-score units between this candidate and the strongest competitor.
+    /// Separation in calibrated z-score units between this candidate and the strongest competitor (runner-up or max decoy).
     public let marginOverRunnerUp: Double
 
     public init(
         sessionID: String,
-        rawScore: Double,
+        combinedChannelScore: Double,
         zScore: Double,
         estimatedPhaseOffsetSeconds: Double,
         marginOverRunnerUp: Double
     ) {
         self.sessionID = sessionID
-        self.rawScore = rawScore
+        self.combinedChannelScore = combinedChannelScore
         self.zScore = zScore
         self.estimatedPhaseOffsetSeconds = estimatedPhaseOffsetSeconds
         self.marginOverRunnerUp = marginOverRunnerUp
@@ -141,12 +155,23 @@ public struct ForensicWatermarkNullStatistics: Sendable, Equatable, Codable {
     public let mean: Double
     public let standardDeviation: Double
     public let maxDecoyScore: Double
+    public let maxDecoyZScore: Double
+    public let effectiveZScoreThreshold: Double
 
-    public init(decoyCount: Int, mean: Double, standardDeviation: Double, maxDecoyScore: Double) {
+    public init(
+        decoyCount: Int,
+        mean: Double,
+        standardDeviation: Double,
+        maxDecoyScore: Double,
+        maxDecoyZScore: Double,
+        effectiveZScoreThreshold: Double
+    ) {
         self.decoyCount = decoyCount
         self.mean = mean
         self.standardDeviation = standardDeviation
         self.maxDecoyScore = maxDecoyScore
+        self.maxDecoyZScore = maxDecoyZScore
+        self.effectiveZScoreThreshold = effectiveZScoreThreshold
     }
 }
 
@@ -200,11 +225,14 @@ public struct ForensicFrameSample: Sendable, Equatable {
 ///
 /// Requires no clip metadata, screen calibration, or playback timestamps:
 /// - Extracts coarse spatial grid time series using actual frame presentation timestamps (VFR-safe).
+/// - Resamples onto a period-aligned uniform grid (with bin averaging when input FPS exceeds the grid rate)
+///   so multi-period folding accumulates zero cumulative phase drift on long clips.
 /// - Subtracts per-frame spatial mean to cancel camera auto-exposure, auto-white-balance, and room flicker,
 ///   while retaining the global mean channel to survive extreme single-lobe crops.
-/// - Applies zero-phase bandpass filtering around `chipRateHz` and robust MAD soft-clipping for scene cuts.
+/// - Applies reflective-padded zero-phase bandpass filtering around `chipRateHz` and robust MAD soft-clipping.
 /// - Uses FFT-accelerated circular matched filtering across all temporal lags and calibrates every clip
-///   empirically against domain-separated decoy sequences so unmarked and out-of-set clips return `.inconclusive`.
+///   empirically against domain-separated decoy sequences with candidate-count multiple-testing adjustment
+///   so unmarked and out-of-set clips return `.inconclusive`.
 public struct ForensicWatermarkDetector: Sendable {
     public let configuration: ForensicWatermarkConfiguration
     public let options: ForensicWatermarkDetectionOptions
@@ -268,27 +296,34 @@ public struct ForensicWatermarkDetector: Sendable {
         samples.reserveCapacity(600)
         var firstTimestamp: Double?
 
-        while let sampleBuffer = trackOutput.copyNextSampleBuffer() {
-            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            guard pts.isValid, pts.isNumeric else { continue }
-            let seconds = pts.seconds
-            guard seconds.isFinite else { continue }
-            if firstTimestamp == nil {
-                firstTimestamp = seconds
+        do {
+            while let sampleBuffer = trackOutput.copyNextSampleBuffer() {
+                try Task.checkCancellation()
+                let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                guard pts.isValid, pts.isNumeric else { continue }
+                let seconds = pts.seconds
+                guard seconds.isFinite else { continue }
+                if firstTimestamp == nil {
+                    firstTimestamp = seconds
+                }
+                let relativeSeconds = seconds - (firstTimestamp ?? seconds)
+                if relativeSeconds > options.maxClipDurationSeconds {
+                    reader.cancelReading()
+                    break
+                }
+                guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { continue }
+                let sample = Self.sampleGrid(
+                    fromBGRA: pixelBuffer,
+                    timestampSeconds: relativeSeconds,
+                    columns: options.gridColumns,
+                    rows: options.gridRows,
+                    chromaMode: configuration.chromaMode
+                )
+                samples.append(sample)
             }
-            let relativeSeconds = seconds - (firstTimestamp ?? seconds)
-            if relativeSeconds > options.maxClipDurationSeconds {
-                break
-            }
-            guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { continue }
-            let sample = Self.sampleGrid(
-                fromBGRA: pixelBuffer,
-                timestampSeconds: relativeSeconds,
-                columns: options.gridColumns,
-                rows: options.gridRows,
-                chromaMode: configuration.chromaMode
-            )
-            samples.append(sample)
+        } catch {
+            reader.cancelReading()
+            throw error
         }
 
         if reader.status == .failed {
@@ -305,14 +340,25 @@ public struct ForensicWatermarkDetector: Sendable {
         try configuration.validate()
         try options.validate(for: configuration)
 
-        let uniqueCandidates = deduplicatedCandidates(candidateSessionIDs)
-        let sortedFrames = frames.sorted { $0.timestampSeconds < $1.timestampSeconds }
-        let frameCount = sortedFrames.count
+        let uniqueCandidates = try validatedUniqueCandidates(candidateSessionIDs)
+        let effectiveThreshold = options.effectiveMinZScore(candidateCount: uniqueCandidates.count)
+        let emptyNull = ForensicWatermarkNullStatistics(
+            decoyCount: options.decoyCount,
+            mean: 0,
+            standardDeviation: 0,
+            maxDecoyScore: 0,
+            maxDecoyZScore: 0,
+            effectiveZScoreThreshold: effectiveThreshold
+        )
+
+        // Validate finite timestamps and enforce maxClipDurationSeconds to bound allocation and runtime.
+        let validFrames = try validateAndBoundFrames(frames)
+        let frameCount = validFrames.count
 
         let durationSeconds: Double
         let estimatedFPS: Double
         if frameCount >= 2 {
-            let span = sortedFrames[frameCount - 1].timestampSeconds - sortedFrames[0].timestampSeconds
+            let span = validFrames[frameCount - 1].timestampSeconds - validFrames[0].timestampSeconds
             let avgStep = span / Double(frameCount - 1)
             durationSeconds = max(0, span + max(0, avgStep))
             estimatedFPS = avgStep > 1e-6 ? 1.0 / avgStep : 0
@@ -320,13 +366,6 @@ public struct ForensicWatermarkDetector: Sendable {
             durationSeconds = 0
             estimatedFPS = 0
         }
-
-        let emptyNull = ForensicWatermarkNullStatistics(
-            decoyCount: options.decoyCount,
-            mean: 0,
-            standardDeviation: 0,
-            maxDecoyScore: 0
-        )
 
         guard !uniqueCandidates.isEmpty else {
             return ForensicWatermarkDetectionResult(
@@ -352,16 +391,19 @@ public struct ForensicWatermarkDetector: Sendable {
             )
         }
 
+        // Exact period-aligned sample rate eliminates cumulative phase drift when folding long clips.
         let periodSamples = max(
             16,
             Int((configuration.periodSeconds * options.sampleRateHz).rounded())
         )
-        let cellCount = sortedFrames[0].cellValues.count
+        let alignedSampleRateHz = Double(periodSamples) / configuration.periodSeconds
+        let cellCount = validFrames[0].cellValues.count
 
         let prepared = prepareFoldedChannels(
-            frames: sortedFrames,
+            frames: validFrames,
             cellCount: cellCount,
-            periodSamples: periodSamples
+            periodSamples: periodSamples,
+            alignedSampleRateHz: alignedSampleRateHz
         )
 
         let useSpatialChannels = configuration.spatialPattern != .uniform && !prepared.spatialFolded.isEmpty
@@ -384,6 +426,7 @@ public struct ForensicWatermarkDetector: Sendable {
 
         let decoyMetrics = evaluateDecoys(
             correlator: correlator,
+            alignedSampleRateHz: alignedSampleRateHz,
             spatialSpectra: spatialSpectra,
             globalSpectrum: globalSpectrum
         )
@@ -392,7 +435,7 @@ public struct ForensicWatermarkDetector: Sendable {
             let template = ForensicWatermarkSignal.referenceWaveform(
                 chips: chips,
                 chipRateHz: configuration.chipRateHz,
-                sampleRateHz: options.sampleRateHz
+                sampleRateHz: alignedSampleRateHz
             )
             return evaluateTemplate(
                 id: sessionID,
@@ -407,13 +450,29 @@ public struct ForensicWatermarkDetector: Sendable {
             candidateMetrics: candidateMetrics,
             decoyMetrics: decoyMetrics,
             periodSamples: periodSamples,
+            alignedSampleRateHz: alignedSampleRateHz,
             durationSeconds: durationSeconds,
             frameCount: frameCount,
             estimatedFPS: estimatedFPS
         )
     }
 
-    // MARK: - Frame Grid Sampling
+    // MARK: - Frame Validation & Grid Sampling
+
+    private func validateAndBoundFrames(_ frames: [ForensicFrameSample]) throws -> [ForensicFrameSample] {
+        guard !frames.isEmpty else { return [] }
+        for frame in frames {
+            guard frame.timestampSeconds.isFinite, frame.globalMean.isFinite else {
+                throw ForensicWatermarkError.invalidFrameData("Frame contains non-finite timestamp or globalMean")
+            }
+            for v in frame.cellValues where !v.isFinite {
+                throw ForensicWatermarkError.invalidFrameData("Frame contains non-finite cell value")
+            }
+        }
+        let sorted = frames.sorted { $0.timestampSeconds < $1.timestampSeconds }
+        let t0 = sorted[0].timestampSeconds
+        return sorted.filter { ($0.timestampSeconds - t0) <= options.maxClipDurationSeconds }
+    }
 
     private static func sampleGrid(
         fromBGRA pixelBuffer: CVPixelBuffer,
@@ -506,23 +565,25 @@ public struct ForensicWatermarkDetector: Sendable {
     private func prepareFoldedChannels(
         frames: [ForensicFrameSample],
         cellCount: Int,
-        periodSamples: Int
+        periodSamples: Int,
+        alignedSampleRateHz: Double
     ) -> PreparedChannels {
         let t0 = frames[0].timestampSeconds
         let tEnd = frames[frames.count - 1].timestampSeconds
-        let uniformCount = max(2, Int(floor((tEnd - t0) * options.sampleRateHz)) + 1)
+        let boundedSpan = min(options.maxClipDurationSeconds, max(0, tEnd - t0))
+        let uniformCount = max(2, Int(floor(boundedSpan * alignedSampleRateHz)) + 1)
 
         let timestamps = frames.map { $0.timestampSeconds - t0 }
         let globalSeries = frames.map(\.globalMean)
-        let resampledGlobal = Self.resampleLinear(
+        let resampledGlobal = Self.resampleUniform(
             timestamps: timestamps,
             values: globalSeries,
-            sampleRateHz: options.sampleRateHz,
+            sampleRateHz: alignedSampleRateHz,
             outputCount: uniformCount
         )
 
         let biquad = BiquadBandpass(
-            sampleRateHz: options.sampleRateHz,
+            sampleRateHz: alignedSampleRateHz,
             centerFrequencyHz: configuration.chipRateHz,
             qualityFactor: 0.85
         )
@@ -543,10 +604,10 @@ public struct ForensicWatermarkDetector: Sendable {
                     let cellVal = cellIndex < frame.cellValues.count ? frame.cellValues[cellIndex] : frame.globalMean
                     diffSeries[frameIdx] = cellVal - frame.globalMean
                 }
-                let resampled = Self.resampleLinear(
+                let resampled = Self.resampleUniform(
                     timestamps: timestamps,
                     values: diffSeries,
-                    sampleRateHz: options.sampleRateHz,
+                    sampleRateHz: alignedSampleRateHz,
                     outputCount: uniformCount
                 )
                 if let folded = preprocessAndFold(resampled, biquad: biquad, periodSamples: periodSamples) {
@@ -572,7 +633,7 @@ public struct ForensicWatermarkDetector: Sendable {
         var negMean = -mean
         vDSP_vsadd(series, 1, &negMean, &centered, 1, vDSP_Length(series.count))
 
-        // Zero-phase bandpass around chipRateHz.
+        // Reflective-padded zero-phase bandpass around chipRateHz.
         var filtered = biquad.zeroPhaseFilter(centered)
 
         // Robust MAD soft-clipping suppresses sudden scene cuts and handheld bumps.
@@ -591,7 +652,7 @@ public struct ForensicWatermarkDetector: Sendable {
         var invRMS = 1.0 / rms
         vDSP_vsmul(filtered, 1, &invRMS, &filtered, 1, vDSP_Length(filtered.count))
 
-        // Coherently fold modulo periodSamples so clips longer than one period gain SNR.
+        // Coherently fold modulo exact periodSamples so clips longer than one period gain SNR with zero drift.
         var folded = [Float](repeating: 0, count: periodSamples)
         for idx in 0 ..< filtered.count {
             folded[idx % periodSamples] += filtered[idx]
@@ -606,7 +667,12 @@ public struct ForensicWatermarkDetector: Sendable {
         return folded
     }
 
-    private static func resampleLinear(
+    /// Resamples irregular timestamps onto a uniform grid.
+    ///
+    /// When the source frame rate exceeds `sampleRateHz` (e.g., 60 fps or 120 fps captures),
+    /// averages all frames falling inside each `[t - dt/2, t + dt/2]` bin as an anti-alias filter;
+    /// otherwise linearly interpolates between neighboring frames.
+    private static func resampleUniform(
         timestamps: [Double],
         values: [Float],
         sampleRateHz: Double,
@@ -614,28 +680,54 @@ public struct ForensicWatermarkDetector: Sendable {
     ) -> [Float] {
         guard !timestamps.isEmpty, timestamps.count == values.count else { return [] }
         var output = [Float](repeating: 0, count: outputCount)
-        var cursor = 0
         let lastIdx = timestamps.count - 1
         let dt = 1.0 / sampleRateHz
+        let halfDt = 0.5 * dt
+
+        var binCursor = 0
+        var interpCursor = 0
 
         for i in 0 ..< outputCount {
             let t = Double(i) * dt
-            while cursor < lastIdx - 1, timestamps[cursor + 1] < t {
-                cursor += 1
+            let winStart = t - halfDt
+            let winEnd = t + halfDt
+
+            while binCursor < lastIdx, timestamps[binCursor] < winStart {
+                binCursor += 1
+            }
+
+            // Box-average if 2+ source frames fall inside this output bin (anti-aliasing for 60/120 fps).
+            var sum: Double = 0
+            var count = 0
+            var scan = binCursor
+            while scan <= lastIdx, timestamps[scan] <= winEnd {
+                if timestamps[scan] >= winStart {
+                    sum += Double(values[scan])
+                    count += 1
+                }
+                scan += 1
+            }
+            if count >= 2 {
+                output[i] = Float(sum / Double(count))
+                continue
+            }
+
+            while interpCursor < lastIdx - 1, timestamps[interpCursor + 1] < t {
+                interpCursor += 1
             }
             if t <= timestamps[0] {
                 output[i] = values[0]
             } else if t >= timestamps[lastIdx] {
                 output[i] = values[lastIdx]
             } else {
-                let t0 = timestamps[cursor]
-                let t1 = timestamps[cursor + 1]
+                let t0 = timestamps[interpCursor]
+                let t1 = timestamps[interpCursor + 1]
                 let span = t1 - t0
                 if span > 1e-9 {
                     let frac = Float((t - t0) / span)
-                    output[i] = values[cursor] * (1.0 - frac) + values[cursor + 1] * frac
+                    output[i] = values[interpCursor] * (1.0 - frac) + values[interpCursor + 1] * frac
                 } else {
-                    output[i] = values[cursor]
+                    output[i] = values[interpCursor]
                 }
             }
         }
@@ -670,6 +762,7 @@ public struct ForensicWatermarkDetector: Sendable {
 
     private func evaluateDecoys(
         correlator: CircularFFTCorrelator,
+        alignedSampleRateHz: Double,
         spatialSpectra: [CircularFFTCorrelator.Spectrum],
         globalSpectrum: CircularFFTCorrelator.Spectrum?
     ) -> [CandidateChannelMetric] {
@@ -678,7 +771,7 @@ public struct ForensicWatermarkDetector: Sendable {
             let template = ForensicWatermarkSignal.referenceWaveform(
                 chips: chips,
                 chipRateHz: configuration.chipRateHz,
-                sampleRateHz: options.sampleRateHz
+                sampleRateHz: alignedSampleRateHz
             )
             return evaluateTemplate(
                 id: "decoy-\(index)",
@@ -706,12 +799,11 @@ public struct ForensicWatermarkDetector: Sendable {
             var combined = [Double](repeating: 0, count: n)
             for spectrum in spatialSpectra {
                 let corr = correlator.correlate(signalSpectrum: spectrum, templateSpectrum: templateSpectrum)
-                var rms: Float = 0
-                vDSP_rmsqv(corr, 1, &rms, vDSP_Length(n))
-                guard rms.isFinite, rms > 1e-9 else { continue }
-                let invRms = 1.0 / Double(rms)
+                let sidelobeScale = Self.robustSidelobeScale(corr)
+                guard sidelobeScale.isFinite, sidelobeScale > 1e-9 else { continue }
+                let invScale = 1.0 / sidelobeScale
                 for lag in 0 ..< n {
-                    let u = Double(corr[lag]) * invRms
+                    let u = Double(corr[lag]) * invScale
                     let excess = u * u - 1.0
                     if excess > 0 {
                         combined[lag] += excess
@@ -736,14 +828,13 @@ public struct ForensicWatermarkDetector: Sendable {
         var globalLag = 0
         if let globalSpectrum {
             let corr = correlator.correlate(signalSpectrum: globalSpectrum, templateSpectrum: templateSpectrum)
-            var rms: Float = 0
-            vDSP_rmsqv(corr, 1, &rms, vDSP_Length(n))
-            if rms.isFinite, rms > 1e-9 {
-                let invRms = 1.0 / Double(rms)
+            let sidelobeScale = Self.robustSidelobeScale(corr)
+            if sidelobeScale.isFinite, sidelobeScale > 1e-9 {
+                let invScale = 1.0 / sidelobeScale
                 var bestVal = -Double.infinity
                 var bestIdx = 0
                 for lag in 0 ..< n {
-                    let u = Double(corr[lag]) * invRms
+                    let u = Double(corr[lag]) * invScale
                     let val = u * u
                     if val > bestVal {
                         bestVal = val
@@ -768,6 +859,7 @@ public struct ForensicWatermarkDetector: Sendable {
         candidateMetrics: [CandidateChannelMetric],
         decoyMetrics: [CandidateChannelMetric],
         periodSamples: Int,
+        alignedSampleRateHz: Double,
         durationSeconds: Double,
         frameCount: Int,
         estimatedFPS: Double
@@ -777,54 +869,57 @@ public struct ForensicWatermarkDetector: Sendable {
         let spatialNull = Self.meanAndStd(spatialDecoys)
         let globalNull = Self.meanAndStd(globalDecoys)
 
-        func combinedMetric(for metric: CandidateChannelMetric) -> (raw: Double, lag: Int) {
-            var bestRaw = -Double.infinity
+        func combinedMetric(for metric: CandidateChannelMetric) -> (score: Double, lag: Int) {
+            var bestScore = -Double.infinity
             var bestLag = 0
             if let sp = metric.spatialPeak, !spatialDecoys.isEmpty {
                 let zSp = (sp - spatialNull.mean) / max(spatialNull.std, 1e-6)
-                if zSp > bestRaw {
-                    bestRaw = zSp
+                if zSp > bestScore {
+                    bestScore = zSp
                     bestLag = metric.spatialBestLag
                 }
             }
             if let gl = metric.globalPeak, !globalDecoys.isEmpty {
                 let zGl = (gl - globalNull.mean) / max(globalNull.std, 1e-6)
-                if zGl > bestRaw {
-                    bestRaw = zGl
+                if zGl > bestScore {
+                    bestScore = zGl
                     bestLag = metric.globalBestLag
                 }
             }
-            if !bestRaw.isFinite {
+            if !bestScore.isFinite {
                 return (0, 0)
             }
-            return (bestRaw, bestLag)
+            return (bestScore, bestLag)
         }
 
         // Calibrate the combined (max-of-channels) statistic against the decoys' exact combined distribution
         // so taking max(spatial, global) introduces zero multiple-testing inflation.
-        let decoyCombinedScores = decoyMetrics.map { combinedMetric(for: $0).raw }
+        let decoyCombinedScores = decoyMetrics.map { combinedMetric(for: $0).score }
         let combinedNull = Self.meanAndStd(decoyCombinedScores)
-        let maxDecoyRaw = decoyCombinedScores.max() ?? 0
-        let maxDecoyZ = (maxDecoyRaw - combinedNull.mean) / max(combinedNull.std, 1e-6)
+        let maxDecoyScore = decoyCombinedScores.max() ?? 0
+        let maxDecoyZ = (maxDecoyScore - combinedNull.mean) / max(combinedNull.std, 1e-6)
+        let effectiveThreshold = options.effectiveMinZScore(candidateCount: candidateMetrics.count)
 
         let nullStats = ForensicWatermarkNullStatistics(
             decoyCount: decoyMetrics.count,
             mean: combinedNull.mean,
             standardDeviation: combinedNull.std,
-            maxDecoyScore: maxDecoyRaw
+            maxDecoyScore: maxDecoyScore,
+            maxDecoyZScore: maxDecoyZ,
+            effectiveZScoreThreshold: effectiveThreshold
         )
 
-        struct RawScored {
+        struct ScoredItem {
             let id: String
-            let raw: Double
+            let channelScore: Double
             let z: Double
             let lag: Int
         }
 
-        let scored: [RawScored] = candidateMetrics.map { metric in
+        let scored: [ScoredItem] = candidateMetrics.map { metric in
             let combined = combinedMetric(for: metric)
-            let z = (combined.raw - combinedNull.mean) / max(combinedNull.std, 1e-6)
-            return RawScored(id: metric.id, raw: combined.raw, z: z, lag: combined.lag)
+            let z = (combined.score - combinedNull.mean) / max(combinedNull.std, 1e-6)
+            return ScoredItem(id: metric.id, channelScore: combined.score, z: z, lag: combined.lag)
         }.sorted { $0.z > $1.z }
 
         let runnerUpZ: Double = if scored.count >= 2 {
@@ -835,11 +930,11 @@ public struct ForensicWatermarkDetector: Sendable {
 
         let finalScores: [ForensicWatermarkCandidateScore] = scored.enumerated().map { idx, item in
             let phaseSamples = (periodSamples - (item.lag % periodSamples)) % periodSamples
-            let phaseSeconds = Double(phaseSamples) / options.sampleRateHz
+            let phaseSeconds = Double(phaseSamples) / alignedSampleRateHz
             let margin = (idx == 0) ? (item.z - runnerUpZ) : (item.z - scored[0].z)
             return ForensicWatermarkCandidateScore(
                 sessionID: item.id,
-                rawScore: item.raw,
+                combinedChannelScore: item.channelScore,
                 zScore: item.z,
                 estimatedPhaseOffsetSeconds: phaseSeconds,
                 marginOverRunnerUp: margin
@@ -858,11 +953,7 @@ public struct ForensicWatermarkDetector: Sendable {
             )
         }
 
-        // Check both calibrated z-score and positive ratio above strongest decoy.
-        let decoyPositiveFloor = max(1e-6, maxDecoyRaw)
-        let passesThreshold = top.zScore >= options.minZScore
-            && top.rawScore > maxDecoyRaw
-            && (maxDecoyRaw <= 0 || (top.rawScore / decoyPositiveFloor) >= options.minRatioOverMaxDecoy)
+        let passesThreshold = top.zScore >= effectiveThreshold && top.zScore > maxDecoyZ
         let passesMargin = top.marginOverRunnerUp >= options.minMarginOverRunnerUp
 
         let outcome: ForensicWatermarkDetectionOutcome
@@ -885,16 +976,32 @@ public struct ForensicWatermarkDetector: Sendable {
         )
     }
 
-    private func deduplicatedCandidates(_ candidates: [String]) -> [String] {
+    private func validatedUniqueCandidates(_ candidates: [String]) throws -> [String] {
         var seen = Set<String>()
         var result: [String] = []
         result.reserveCapacity(candidates.count)
-        for id in candidates where !id.isEmpty {
-            if seen.insert(id).inserted {
-                result.append(id)
+        for rawID in candidates {
+            let validated = try WatermarkSessionCode(rawID)
+            if seen.insert(validated.rawValue).inserted {
+                result.append(validated.rawValue)
             }
         }
         return result
+    }
+
+    /// Estimates correlation sidelobe scale via MAD (`1.4826 * median(|corr|)`) so a strong true peak
+    /// on short code periods does not inflate its own denominator (Peak-to-Sidelobe Ratio normalization).
+    private static func robustSidelobeScale(_ corr: [Float]) -> Double {
+        guard !corr.isEmpty else { return 0 }
+        let absVals = corr.map { abs($0) }.sorted()
+        let mad = Double(absVals[absVals.count / 2])
+        let scale = 1.4826 * mad
+        if scale > 1e-9 {
+            return scale
+        }
+        var rms: Float = 0
+        vDSP_rmsqv(corr, 1, &rms, vDSP_Length(corr.count))
+        return Double(rms)
     }
 
     private static func meanAndStd(_ values: [Double]) -> (mean: Double, std: Double) {
@@ -909,7 +1016,7 @@ public struct ForensicWatermarkDetector: Sendable {
     }
 }
 
-// MARK: - Zero-Phase Biquad Bandpass Filter
+// MARK: - Zero-Phase Biquad Bandpass Filter (Reflective Edge Padding)
 
 private struct BiquadBandpass {
     let b0: Float
@@ -917,6 +1024,7 @@ private struct BiquadBandpass {
     let b2: Float
     let a1: Float
     let a2: Float
+    let padLength: Int
 
     init(sampleRateHz: Double, centerFrequencyHz: Double, qualityFactor: Double) {
         let omega = 2.0 * Double.pi * centerFrequencyHz / sampleRateHz
@@ -930,14 +1038,32 @@ private struct BiquadBandpass {
         self.b2 = Float(-alpha / a0)
         self.a1 = Float((-2.0 * cosW) / a0)
         self.a2 = Float((1.0 - alpha) / a0)
+        self.padLength = max(4, Int((sampleRateHz / max(0.5, centerFrequencyHz)).rounded()) * 2)
     }
 
     func zeroPhaseFilter(_ input: [Float]) -> [Float] {
-        guard input.count >= 4 else { return input }
-        let forward = filterOnce(input)
+        let n = input.count
+        guard n >= 4 else { return input }
+
+        let pad = min(padLength, n - 1)
+        var padded = [Float](repeating: 0, count: n + 2 * pad)
+        let first = input[0]
+        let last = input[n - 1]
+        for i in 0 ..< pad {
+            padded[pad - 1 - i] = 2 * first - input[i + 1]
+        }
+        for i in 0 ..< n {
+            padded[pad + i] = input[i]
+        }
+        for i in 0 ..< pad {
+            padded[pad + n + i] = 2 * last - input[n - 2 - i]
+        }
+
+        let forward = filterOnce(padded)
         let reversedForward = Array(forward.reversed())
         let backward = filterOnce(reversedForward)
-        return Array(backward.reversed())
+        let unreversed = Array(backward.reversed())
+        return Array(unreversed[pad ..< (pad + n)])
     }
 
     private func filterOnce(_ input: [Float]) -> [Float] {

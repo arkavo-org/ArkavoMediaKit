@@ -21,6 +21,7 @@ public enum ForensicWatermarkTrialClassification: String, Sendable, Equatable, C
     case controlFalsePositive
     case outOfSetRejection
     case outOfSetFalsePositive
+    case readError
 }
 
 /// Specification of one blinded test clip for the evaluation harness.
@@ -31,7 +32,8 @@ public struct ForensicWatermarkTrial: Sendable, Equatable, Codable {
     public let videoPath: String
     /// Ground-truth opaque session ID used during playback, or `nil` for unmarked controls.
     public let expectedSessionID: String?
-    /// Whether `expectedSessionID` is present in the candidate list supplied to the detector.
+    /// Optional manifest annotation; during `evaluate`, candidate membership is derived authoritatively
+    /// from the candidate list passed to the detector.
     public let isInCandidateSet: Bool
     /// Transformation applied to the clip (e.g., `"original"`, `"trimmed-10s"`, `"cropped-60pct"`, `"recompressed"`).
     public let transformTag: String
@@ -64,6 +66,27 @@ public struct ForensicWatermarkTrial: Sendable, Equatable, Codable {
         guard expectedSessionID != nil else { return .unmarkedControl }
         return isInCandidateSet ? .markedInCandidateSet : .markedOutsideCandidateSet
     }
+
+    /// Authoritative ground-truth category derived directly from the detector's actual candidate set.
+    public func category(forCandidateSet candidateSet: Set<String>) -> ForensicWatermarkTrialCategory {
+        guard let expected = expectedSessionID else { return .unmarkedControl }
+        return candidateSet.contains(expected) ? .markedInCandidateSet : .markedOutsideCandidateSet
+    }
+
+    /// Copy with `videoPath` redacted to basename so serialized JSON reports never leak full local paths.
+    public func redactedForReport() -> ForensicWatermarkTrial {
+        let filename = URL(fileURLWithPath: videoPath).lastPathComponent
+        return ForensicWatermarkTrial(
+            label: label,
+            videoPath: filename.isEmpty ? label : filename,
+            expectedSessionID: expectedSessionID,
+            isInCandidateSet: isInCandidateSet,
+            transformTag: transformTag,
+            playbackDevice: playbackDevice,
+            captureDevice: captureDevice,
+            cameraSettings: cameraSettings
+        )
+    }
 }
 
 /// Outcome of evaluating a single trial.
@@ -71,18 +94,21 @@ public struct ForensicWatermarkTrialResult: Sendable, Equatable, Codable {
     public let trial: ForensicWatermarkTrial
     public let category: ForensicWatermarkTrialCategory
     public let classification: ForensicWatermarkTrialClassification
-    public let detection: ForensicWatermarkDetectionResult
+    public let detection: ForensicWatermarkDetectionResult?
+    public let errorDescription: String?
 
     public init(
         trial: ForensicWatermarkTrial,
         category: ForensicWatermarkTrialCategory,
         classification: ForensicWatermarkTrialClassification,
-        detection: ForensicWatermarkDetectionResult
+        detection: ForensicWatermarkDetectionResult?,
+        errorDescription: String? = nil
     ) {
         self.trial = trial
         self.category = category
         self.classification = classification
         self.detection = detection
+        self.errorDescription = errorDescription
     }
 }
 
@@ -121,6 +147,7 @@ public struct ForensicWatermarkEvaluationReport: Sendable, Equatable, Codable {
     public let options: ForensicWatermarkDetectionOptions
     public let candidateCount: Int
     public let totalTrials: Int
+    public let minRepeatableTrialsPerDuration: Int
 
     // Marked in-candidate-set counts
     public let markedInSetTrials: Int
@@ -138,13 +165,18 @@ public struct ForensicWatermarkEvaluationReport: Sendable, Equatable, Codable {
     public let outOfSetRejections: Int
     public let outOfSetFalsePositives: Int
 
-    /// Shortest duration bucket (in seconds) achieving 100% recovery with zero wrong IDs and at least one trial.
+    // Per-clip decode / read errors
+    public let readErrors: Int
+
+    /// Shortest duration bucket (in seconds) achieving 100% recovery with zero wrong IDs, at least
+    /// `minRepeatableTrialsPerDuration` independent marked trials, and zero false positives on controls/out-of-set clips.
     public let shortestRepeatableDurationSeconds: Int?
     public let durationBreakdown: [ForensicWatermarkDurationSummary]
     public let trialResults: [ForensicWatermarkTrialResult]
 
     /// Generates a human-readable Markdown report suitable for GitHub issues or experiment logs.
     public func markdownSummary() -> String {
+        let effectiveZ = options.effectiveMinZScore(candidateCount: candidateCount)
         var lines: [String] = []
         lines.append("## Forensic Watermark Blinded Evaluation Report")
         lines.append("")
@@ -156,7 +188,8 @@ public struct ForensicWatermarkEvaluationReport: Sendable, Equatable, Codable {
         )
         lines.append("- **Candidate set size**: \(candidateCount) (decoys per clip: \(options.decoyCount))")
         lines.append(
-            "- **Thresholds**: `minZScore=\(String(format: "%.1f", options.minZScore))`, "
+            "- **Thresholds**: `baseMinZ=\(String(format: "%.1f", options.minZScore))`, "
+                + "`effectiveMinZ=\(String(format: "%.2f", effectiveZ))`, "
                 + "`minMargin=\(String(format: "%.1f", options.minMarginOverRunnerUp))`"
         )
         lines.append("")
@@ -167,12 +200,19 @@ public struct ForensicWatermarkEvaluationReport: Sendable, Equatable, Codable {
         lines.append("| Marked (in candidate set) | \(markedInSetTrials) | \(correctIDs) | \(missedDetections) | \(wrongIDs) |")
         lines.append("| Unmarked controls | \(unmarkedControlTrials) | \(controlTrueNegatives) | 0 | \(controlFalsePositives) |")
         lines.append("| Marked (outside candidate set) | \(outOfSetTrials) | \(outOfSetRejections) | 0 | \(outOfSetFalsePositives) |")
+        if readErrors > 0 {
+            lines.append("| Unreadable clips (errors) | \(readErrors) | 0 | 0 | 0 |")
+        }
         lines.append("")
 
         if let shortest = shortestRepeatableDurationSeconds {
-            lines.append("- **Shortest duration with repeatable recovery**: \(shortest)s")
+            lines.append(
+                "- **Shortest duration with repeatable recovery** (`n >= \(minRepeatableTrialsPerDuration)`, 0 false positives): \(shortest)s"
+            )
         } else {
-            lines.append("- **Shortest duration with repeatable recovery**: None achieved")
+            lines.append(
+                "- **Shortest duration with repeatable recovery** (`n >= \(minRepeatableTrialsPerDuration)`, 0 false positives): None achieved"
+            )
         }
         lines.append("")
 
@@ -196,14 +236,21 @@ public struct ForensicWatermarkEvaluationReport: Sendable, Equatable, Codable {
         lines.append("| Clip | Category | Transform | Duration | Detected | z-score | Margin | Classification |")
         lines.append("| --- | --- | --- | ---: | --- | ---: | ---: | --- |")
         for item in trialResults {
-            let dur = String(format: "%.1fs", item.detection.clipDurationSeconds)
-            let detectedStr = item.detection.outcome.detectedSessionID ?? "inconclusive"
-            let zStr = item.detection.bestCandidate.map { String(format: "%.2f", $0.zScore) } ?? "-"
-            let marginStr = item.detection.bestCandidate.map { String(format: "%.2f", $0.marginOverRunnerUp) } ?? "-"
-            lines.append(
-                "| \(item.trial.label) | \(item.category.rawValue) | \(item.trial.transformTag) | \(dur) | "
-                    + "\(detectedStr) | \(zStr) | \(marginStr) | \(item.classification.rawValue) |"
-            )
+            if let detection = item.detection {
+                let dur = String(format: "%.1fs", detection.clipDurationSeconds)
+                let detectedStr = detection.outcome.detectedSessionID ?? "inconclusive"
+                let zStr = detection.bestCandidate.map { String(format: "%.2f", $0.zScore) } ?? "-"
+                let marginStr = detection.bestCandidate.map { String(format: "%.2f", $0.marginOverRunnerUp) } ?? "-"
+                lines.append(
+                    "| \(item.trial.label) | \(item.category.rawValue) | \(item.trial.transformTag) | \(dur) | "
+                        + "\(detectedStr) | \(zStr) | \(marginStr) | \(item.classification.rawValue) |"
+                )
+            } else {
+                lines.append(
+                    "| \(item.trial.label) | \(item.category.rawValue) | \(item.trial.transformTag) | - | "
+                        + "error | - | - | \(item.classification.rawValue) |"
+                )
+            }
         }
         return lines.joined(separator: "\n")
     }
@@ -214,60 +261,104 @@ public struct ForensicWatermarkEvaluationReport: Sendable, Equatable, Codable {
 /// Runs `ForensicWatermarkDetector` blinded across a set of trial clips and tabulates all error modes separately.
 public struct ForensicWatermarkEvaluator: Sendable {
     public let detector: ForensicWatermarkDetector
+    public let minRepeatableTrialsPerDuration: Int
 
-    public init(detector: ForensicWatermarkDetector = ForensicWatermarkDetector()) {
+    public init(
+        detector: ForensicWatermarkDetector = ForensicWatermarkDetector(),
+        minRepeatableTrialsPerDuration: Int = 2
+    ) {
         self.detector = detector
+        self.minRepeatableTrialsPerDuration = max(1, minRepeatableTrialsPerDuration)
     }
 
     public init(
         configuration: ForensicWatermarkConfiguration = .default,
-        options: ForensicWatermarkDetectionOptions = .default
+        options: ForensicWatermarkDetectionOptions = .default,
+        minRepeatableTrialsPerDuration: Int = 2
     ) {
         self.detector = ForensicWatermarkDetector(configuration: configuration, options: options)
+        self.minRepeatableTrialsPerDuration = max(1, minRepeatableTrialsPerDuration)
     }
 
     /// Evaluates every trial clip on disk blinded (only `videoPath` and `candidateSessionIDs` reach the detector).
+    ///
+    /// Candidate membership is derived authoritatively from `candidateSessionIDs`. Individual clip read failures
+    /// are captured as `.readError` entries instead of discarding the entire report.
     public func evaluate(
         trials: [ForensicWatermarkTrial],
         candidateSessionIDs: [String]
     ) async throws -> ForensicWatermarkEvaluationReport {
+        try detector.configuration.validate()
+        try detector.options.validate(for: detector.configuration)
+        var validatedCandidateSet = Set<String>()
+        var validatedCandidates: [String] = []
+        for id in candidateSessionIDs {
+            let code = try WatermarkSessionCode(id)
+            if validatedCandidateSet.insert(code.rawValue).inserted {
+                validatedCandidates.append(code.rawValue)
+            }
+        }
+
         var results: [ForensicWatermarkTrialResult] = []
         results.reserveCapacity(trials.count)
 
         for trial in trials {
-            let detection = try await detector.detect(
-                videoURL: URL(fileURLWithPath: trial.videoPath),
-                candidateSessionIDs: candidateSessionIDs
-            )
-            let classification = Self.classify(trial: trial, outcome: detection.outcome)
-            results.append(
-                ForensicWatermarkTrialResult(
-                    trial: trial,
-                    category: trial.category,
-                    classification: classification,
-                    detection: detection
+            try Task.checkCancellation()
+            let category = trial.category(forCandidateSet: validatedCandidateSet)
+            let redactedTrial = trial.redactedForReport()
+            do {
+                let detection = try await detector.detect(
+                    videoURL: URL(fileURLWithPath: trial.videoPath),
+                    candidateSessionIDs: validatedCandidates
                 )
-            )
+                let classification = Self.classify(
+                    category: category,
+                    expectedSessionID: trial.expectedSessionID,
+                    outcome: detection.outcome
+                )
+                results.append(
+                    ForensicWatermarkTrialResult(
+                        trial: redactedTrial,
+                        category: category,
+                        classification: classification,
+                        detection: detection
+                    )
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                results.append(
+                    ForensicWatermarkTrialResult(
+                        trial: redactedTrial,
+                        category: category,
+                        classification: .readError,
+                        detection: nil,
+                        errorDescription: error.localizedDescription
+                    )
+                )
+            }
         }
 
         return Self.summarize(
             results: results,
             configuration: detector.configuration,
             options: detector.options,
-            candidateCount: Set(candidateSessionIDs.filter { !$0.isEmpty }).count
+            candidateCount: validatedCandidates.count,
+            minRepeatableTrialsPerDuration: minRepeatableTrialsPerDuration
         )
     }
 
-    /// Classifies a single blinded detection outcome against ground truth.
+    /// Classifies a single blinded detection outcome against authoritative category and ground truth.
     public static func classify(
-        trial: ForensicWatermarkTrial,
+        category: ForensicWatermarkTrialCategory,
+        expectedSessionID: String?,
         outcome: ForensicWatermarkDetectionOutcome
     ) -> ForensicWatermarkTrialClassification {
-        switch trial.category {
+        switch category {
         case .markedInCandidateSet:
             switch outcome {
             case let .detected(sessionID):
-                return (sessionID == trial.expectedSessionID) ? .correctID : .wrongID
+                return (sessionID == expectedSessionID) ? .correctID : .wrongID
             case .inconclusive:
                 return .missedDetection
             }
@@ -295,7 +386,8 @@ public struct ForensicWatermarkEvaluator: Sendable {
         results: [ForensicWatermarkTrialResult],
         configuration: ForensicWatermarkConfiguration,
         options: ForensicWatermarkDetectionOptions,
-        candidateCount: Int
+        candidateCount: Int,
+        minRepeatableTrialsPerDuration: Int = 2
     ) -> ForensicWatermarkEvaluationReport {
         var markedInSet = 0
         var correctIDs = 0
@@ -310,6 +402,7 @@ public struct ForensicWatermarkEvaluator: Sendable {
         var outOfSetRejections = 0
         var outOfSetFalsePositives = 0
 
+        var readErrors = 0
         var durationMap: [Int: (trials: Int, correct: Int, missed: Int, wrong: Int)] = [:]
 
         for item in results {
@@ -335,10 +428,12 @@ public struct ForensicWatermarkEvaluator: Sendable {
             case .outOfSetFalsePositive:
                 outOfSet += 1
                 outOfSetFalsePositives += 1
+            case .readError:
+                readErrors += 1
             }
 
-            if item.category == .markedInCandidateSet {
-                let bucket = max(1, Int(item.detection.clipDurationSeconds.rounded()))
+            if item.category == .markedInCandidateSet, let detection = item.detection {
+                let bucket = max(1, Int(detection.clipDurationSeconds.rounded()))
                 var entry = durationMap[bucket] ?? (0, 0, 0, 0)
                 entry.trials += 1
                 switch item.classification {
@@ -362,15 +457,24 @@ public struct ForensicWatermarkEvaluator: Sendable {
             )
         }
 
-        let shortestRepeatable = breakdown.first { summary in
-            summary.markedTrialCount > 0 && summary.correctIDs == summary.markedTrialCount && summary.wrongIDs == 0
-        }?.durationSecondsBucket
+        let requiredCount = max(1, minRepeatableTrialsPerDuration)
+        let hasCleanControls = (controlFalsePositives == 0 && outOfSetFalsePositives == 0 && readErrors == 0)
+        let shortestRepeatable: Int? = if hasCleanControls {
+            breakdown.first { summary in
+                summary.markedTrialCount >= requiredCount
+                    && summary.correctIDs == summary.markedTrialCount
+                    && summary.wrongIDs == 0
+            }?.durationSecondsBucket
+        } else {
+            nil
+        }
 
         return ForensicWatermarkEvaluationReport(
             configuration: configuration,
             options: options,
             candidateCount: candidateCount,
             totalTrials: results.count,
+            minRepeatableTrialsPerDuration: requiredCount,
             markedInSetTrials: markedInSet,
             correctIDs: correctIDs,
             missedDetections: missedDetections,
@@ -381,6 +485,7 @@ public struct ForensicWatermarkEvaluator: Sendable {
             outOfSetTrials: outOfSet,
             outOfSetRejections: outOfSetRejections,
             outOfSetFalsePositives: outOfSetFalsePositives,
+            readErrors: readErrors,
             shortestRepeatableDurationSeconds: shortestRepeatable,
             durationBreakdown: breakdown,
             trialResults: results
