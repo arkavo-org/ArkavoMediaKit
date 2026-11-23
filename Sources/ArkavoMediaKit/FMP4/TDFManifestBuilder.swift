@@ -185,9 +185,7 @@ public final class TDFManifestBuilder: Sendable {
             return existing
         }
 
-        guard kasURL.scheme?.lowercased() == "https",
-              let host = kasURL.host, !host.isEmpty
-        else {
+        guard InputValidator.isAllowedHTTPSOrLoopbackHTTP(kasURL) else {
             throw TDFError.publicKeyFetchFailed
         }
 

@@ -105,6 +105,39 @@ struct AuditHLSAndPlayerTests {
         await #expect(throws: CancellationError.self) {
             try await raceTask.value
         }
+
+        // 3. Overlapping loadStream calls + stop(): completing waiter A must not clear waiter B's cancel handler
+        if #available(iOS 18.0, macOS 15.0, tvOS 18.0, *) {
+            let provider = StandardTDFKeyProvider(
+                kasURL: URL(string: "https://kas.example.com")!,
+                kasPublicKeyPEM: "",
+                sessionManager: TDF3MediaSession()
+            )
+            let player = TDF3StreamingPlayer(
+                keyProvider: provider,
+                policy: MediaDRMPolicy(),
+                deviceInfo: DeviceInfo(),
+                sessionID: UUID()
+            )
+            let sessionA = MediaSession(userID: "u1", assetID: "a1")
+            let sessionB = MediaSession(userID: "u1", assetID: "a2")
+            let loadA = Task {
+                try await player.loadStream(url: URL(string: "https://example.invalid/a.m3u8")!, session: sessionA)
+            }
+            try await Task.sleep(for: .milliseconds(30))
+            let loadB = Task {
+                try await player.loadStream(url: URL(string: "https://example.invalid/b.m3u8")!, session: sessionB)
+            }
+            // Wait for loadA to finish cancelling (its defer runs while loadB is active!)
+            await #expect(throws: CancellationError.self) {
+                try await loadA.value
+            }
+            // Now stop() must STILL cancel loadB (proving loadA's defer did NOT clear loadB's cancel handle)
+            player.stop()
+            await #expect(throws: CancellationError.self) {
+                try await loadB.value
+            }
+        }
     }
     #endif
 
@@ -274,9 +307,107 @@ struct AuditHLSAndPlayerTests {
                 manifest: badBindingManifest
             )
         }
+
+        // Stripping policy fails closed
+        let noPolicyManifest = HLSManifest(
+            assetID: "a1",
+            wrappedKey: "d2s=",
+            algorithm: "AES-256-GCM",
+            segmentIVs: [iv.base64EncodedString()],
+            segmentCount: 1,
+            totalDuration: 6.0,
+            encryptionMode: "GCM",
+            kasURL: URL(string: "https://kas.example.com")!,
+            policy: nil,
+            policyBindingAlg: nil,
+            policyBindingHash: nil
+        )
+        await #expect(throws: HLSTDFExtractorError.integrityCheckFailed) {
+            _ = try await extractor.decryptSegment(
+                segmentData: Data(repeating: 0xAA, count: 32),
+                segmentIndex: 0,
+                symmetricKey: dek,
+                manifest: noPolicyManifest
+            )
+        }
+
+        // CBC segment without integrityInformation fails closed; full HLSTDFPackager -> HLSTDFExtractor CBC round-trip succeeds
+        let cbcNoIntegrity = HLSManifest(
+            assetID: "a1",
+            wrappedKey: "d2s=",
+            algorithm: "AES-128-CBC",
+            segmentIVs: [Data(repeating: 0x07, count: 16).base64EncodedString()],
+            segmentCount: 1,
+            totalDuration: 6.0,
+            encryptionMode: "CBC",
+            kasURL: URL(string: "https://kas.example.com")!,
+            policy: policyBase64,
+            policyBindingAlg: "HS256",
+            policyBindingHash: goodBinding
+        )
+        await #expect(throws: HLSTDFExtractorError.integrityCheckFailed) {
+            _ = try await extractor.decryptSegment(
+                segmentData: Data(repeating: 0xBB, count: 32),
+                segmentIndex: 0,
+                symmetricKey: dek,
+                manifest: cbcNoIntegrity
+            )
+        }
+
+        let kas = try TestKASKeyPair()
+        let srcDir = FileManager.default.temporaryDirectory.appendingPathComponent("audit-pkg-src-\(UUID().uuidString)")
+        let outDir = FileManager.default.temporaryDirectory.appendingPathComponent("audit-pkg-out-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: srcDir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: srcDir)
+            try? FileManager.default.removeItem(at: outDir)
+        }
+        let segPlaintext = Data("CBC-segment-payload-bytes-authenticated".utf8)
+        let segFile = srcDir.appendingPathComponent("seg0.ts")
+        try segPlaintext.write(to: segFile)
+        let playlistFile = srcDir.appendingPathComponent("playlist.m3u8")
+        try "#EXTM3U\n".write(to: playlistFile, atomically: true, encoding: .utf8)
+        let convResult = HLSConversionResult(
+            playlistURL: playlistFile,
+            segmentURLs: [segFile],
+            segmentDurations: [6.0],
+            totalDuration: 6.0
+        )
+        let packager = HLSTDFPackager(
+            kasURL: URL(string: "https://kas.example.com")!,
+            kasPublicKeyPEM: kas.publicKeyPEM,
+            keySize: .bits128,
+            mode: .cbc
+        )
+        let packagedTDF = try await packager.package(hlsResult: convResult, assetID: "asset-cbc-rt")
+        let local = try await extractor.extract(tdfData: packagedTDF, outputDirectory: outDir)
+        let unwrappedKey = try TDFCrypto.unwrapSymmetricKeyWithRSA(
+            privateKeyPEM: kas.privateKeyPEM,
+            wrappedKey: local.manifest.wrappedKey
+        )
+        let encryptedSeg = try Data(contentsOf: local.segmentURLs[0])
+        let decryptedSeg = try await extractor.decryptSegment(
+            segmentData: encryptedSeg,
+            segmentIndex: 0,
+            symmetricKey: unwrappedKey,
+            manifest: local.manifest
+        )
+        #expect(decryptedSeg == segPlaintext)
+
+        // Tampering with CBC segment ciphertext is caught by manifest integrityInformation
+        var tamperedSeg = encryptedSeg
+        tamperedSeg[0] ^= 0xFF
+        await #expect(throws: HLSTDFExtractorError.integrityCheckFailed) {
+            _ = try await extractor.decryptSegment(
+                segmentData: tamperedSeg,
+                segmentIndex: 0,
+                symmetricKey: unwrappedKey,
+                manifest: local.manifest
+            )
+        }
     }
 
-    @Test("HLSPlaylistGenerator prevents tag injection, omits PII/session IDs, and guards 12-byte IVs; HLSConverter validates duration")
+    @Test("HLSPlaylistGenerator prevents tag injection, omits PII/session IDs, matches delegate URI parser, and guards huge finite durations")
     func playlistGeneratorAndConverterHardening() async throws {
         let gen = HLSPlaylistGenerator(
             kasBaseURL: URL(string: "https://kas.example.com")!,
@@ -296,37 +427,55 @@ struct AuditHLSAndPlayerTests {
         let sessionID = UUID()
         let gcmSegment = SegmentMetadata(
             index: 0,
-            duration: 6.0,
+            duration: .greatestFiniteMagnitude, // Huge finite duration must not trap in Int(ceil(...))
             url: URL(string: "https://cdn.example.com/seg0.tdf")!,
             tdfManifest: "bQ==",
-            iv: Data(repeating: 0xAA, count: 12), // 12-byte GCM nonce must not be emitted on AES-128
+            iv: Data(repeating: 0xAA, count: 12), // 12-byte GCM nonce must not emit broken METHOD=AES-128
             assetID: "asset-1"
         )
-        let mediaPlaylist = gen.generateMediaPlaylist(
-            segments: [gcmSegment],
+        let cbcSegment = SegmentMetadata(
+            index: 1,
+            duration: 6.0,
+            url: URL(string: "https://cdn.example.com/seg1.tdf")!,
+            tdfManifest: "bQ==",
+            iv: Data(repeating: 0xBB, count: 16),
+            assetID: "asset-1"
+        )
+        let variantPlaylist = gen.generateVariantPlaylist(
+            segments: [gcmSegment, cbcSegment],
             assetID: "asset-1",
             userID: "sensitive-user@example.com",
-            sessionID: sessionID
+            sessionID: sessionID,
+            variant: PlaylistVariant(bandwidth: 1_000_000, resolution: "1280x720", playlistURL: URL(string: "https://cdn.example.com/v.m3u8")!)
         )
-        #expect(!mediaPlaylist.contains("sensitive-user"))
-        #expect(!mediaPlaylist.contains(sessionID.uuidString))
-        #expect(!mediaPlaylist.contains("IV=0x"), "12-byte GCM nonce must not be emitted with METHOD=AES-128")
+        #expect(!variantPlaylist.contains("sensitive-user"))
+        #expect(!variantPlaylist.contains(sessionID.uuidString))
+        // Only the 16-byte IV segment gets #EXT-X-KEY:METHOD=AES-128, and its URI parses cleanly in StandardTDFContentKeyDelegate
+        let keyLines = variantPlaylist.components(separatedBy: "\n").filter { $0.hasPrefix("#EXT-X-KEY:") }
+        #expect(keyLines.count == 1)
+        #expect(keyLines[0].contains("IV=0x" + String(repeating: "bb", count: 16)))
+        #if canImport(UIKit) || canImport(AppKit)
+        if #available(iOS 18.0, macOS 15.0, tvOS 18.0, *) {
+            let uriStart = try #require(keyLines[0].range(of: "URI=\"")?.upperBound)
+            let uriEnd = try #require(keyLines[0][uriStart...].firstIndex(of: "\""))
+            let emittedURI = String(keyLines[0][uriStart ..< uriEnd])
+            let parsed = try StandardTDFContentKeyDelegate.parseKeyRequestURI(emittedURI)
+            #expect(parsed.assetID == "asset-1")
+            #expect(parsed.segmentIndex == 1)
+            #expect(parsed.userID == nil)
+        }
+        #endif
 
         let converter = HLSConverter()
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("audit-conv-\(UUID().uuidString)")
-        await #expect(throws: HLSConversionError.self) {
-            _ = try await converter.convert(
-                videoURL: URL(fileURLWithPath: "/nonexistent.mov"),
-                outputDirectory: tmp,
-                segmentDuration: 0
-            )
-        }
-        await #expect(throws: HLSConversionError.self) {
-            _ = try await converter.convert(
-                videoURL: URL(fileURLWithPath: "/nonexistent.mov"),
-                outputDirectory: tmp,
-                segmentDuration: .infinity
-            )
+        for badDuration in [0.0, .infinity, Double(Int.max)] {
+            await #expect(throws: HLSConversionError.self) {
+                _ = try await converter.convert(
+                    videoURL: URL(fileURLWithPath: "/nonexistent.mov"),
+                    outputDirectory: tmp,
+                    segmentDuration: badDuration
+                )
+            }
         }
     }
 }

@@ -28,14 +28,14 @@ public struct StandardTDFKASKeyClient: Sendable {
     }()
 
     private let urlSession: URLSession
-    private let allowedKASOrigins: Set<String>?
+    private let allowedKASOrigins: Set<String>
 
     /// - Parameters:
     ///   - urlSession: Session used for both the well-known fetch and the rewrap request.
     ///     Defaults to a redirect-refusing ephemeral session. Inject a stubbed session in tests.
-    ///   - allowedKASOrigins: Optional allowlist of trusted KAS origins (`scheme://host[:port]` or URLs).
-    ///     When provided, manifest KAS URLs and well-known discovered endpoints outside this allowlist
-    ///     are rejected before any credential-bearing request is sent.
+    ///   - allowedKASOrigins: Allowlist of trusted KAS origins (`scheme://host[:port]` or URLs).
+    ///     Fails closed by default when nil or empty so untrusted manifests cannot exfiltrate
+    ///     bearer tokens to arbitrary public HTTPS hosts.
     public init(
         urlSession: URLSession? = nil,
         allowedKASOrigins: Set<String>? = nil
@@ -46,7 +46,7 @@ public struct StandardTDFKASKeyClient: Sendable {
                 URL(string: entry).flatMap(Self.origin(of:)) ?? entry.lowercased()
             })
         } else {
-            self.allowedKASOrigins = nil
+            self.allowedKASOrigins = []
         }
     }
 
@@ -192,8 +192,10 @@ public struct StandardTDFKASKeyClient: Sendable {
     // MARK: - Internals
 
     private func validateAllowedOrigin(_ url: URL, rawURL: String) throws {
-        guard let allowedKASOrigins else { return }
-        guard let origin = Self.origin(of: url), allowedKASOrigins.contains(origin) else {
+        guard !allowedKASOrigins.isEmpty,
+              let origin = Self.origin(of: url),
+              allowedKASOrigins.contains(origin)
+        else {
             throw StandardTDFKASKeyClientError.untrustedKASOrigin(rawURL)
         }
     }

@@ -81,6 +81,38 @@ struct AuditCryptoAndPolicyTests {
         await #expect(throws: StandardTDFSegmentError.unsupportedEncryptionMethod) {
             _ = try await crypto.decryptSegment(tdfData: cbcTDF, symmetricKey: cbcKey)
         }
+
+        // Stripping policy fails closed
+        var strippedPolicyManifest = manifest
+        strippedPolicyManifest.encryptionInformation.policy = ""
+        let strippedPolicyTDF = try TDFArchiveWriter().buildArchive(manifest: strippedPolicyManifest, payload: payload)
+        await #expect(throws: StandardTDFSegmentError.integrityVerificationFailed) {
+            _ = try await crypto.decryptSegment(tdfData: strippedPolicyTDF, symmetricKey: dek)
+        }
+
+        // Legacy hex-form policyBinding (OpenTDFKit <= 4) still verifies cleanly
+        let rawHmac = Data(HMAC<SHA256>.authenticationCode(
+            for: Data(manifest.encryptionInformation.policy.utf8),
+            using: dek
+        ))
+        let hexBindingHash = Data(rawHmac.map { String(format: "%02x", $0) }.joined().utf8).base64EncodedString()
+        var legacyManifest = manifest
+        legacyManifest.encryptionInformation.keyAccess[0].policyBinding = TDFPolicyBinding(
+            alg: "HS256",
+            hash: hexBindingHash
+        )
+        let legacyTDF = try TDFArchiveWriter().buildArchive(manifest: legacyManifest, payload: payload)
+        #expect(try await crypto.decryptSegment(tdfData: legacyTDF, symmetricKey: dek) == plaintext)
+
+        // Stripping integrityInformation in CBC mode fails closed
+        let cbcReader = try TDFArchiveReader(data: cbcTDF)
+        var strippedCBCManifest = try cbcReader.manifest()
+        let cbcPayload = try cbcReader.payloadData()
+        strippedCBCManifest.encryptionInformation.integrityInformation = nil
+        let strippedCBCTDF = try TDFArchiveWriter().buildArchive(manifest: strippedCBCManifest, payload: cbcPayload)
+        await #expect(throws: StandardTDFSegmentError.integrityVerificationFailed) {
+            _ = try await cbcCrypto.decryptSegment(tdfData: strippedCBCTDF, symmetricKey: cbcKey)
+        }
     }
 
     // MARK: - MediaDRMPolicy ranked levels, fail-closed geo, concurrency boundary, rental & subscription

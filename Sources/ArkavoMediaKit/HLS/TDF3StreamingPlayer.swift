@@ -58,7 +58,8 @@ public class TDF3StreamingPlayer: ObservableObject {
 
     private let cleanupResources: Mutex<CleanupResources>
     private var cancellables = Set<AnyCancellable>()
-    private var cancelPendingReadyWait: (() -> Void)?
+    private var loadGeneration: UInt64 = 0
+    private var pendingReadyWait: (id: UUID, cancel: () -> Void)?
 
     /// Resource loader delegate for TDF-packaged HLS
     private var resourceLoaderDelegate: HLSResourceLoaderDelegate?
@@ -112,8 +113,9 @@ public class TDF3StreamingPlayer: ObservableObject {
         url: URL,
         session: MediaSession
     ) async throws {
-        cancelPendingReadyWait?()
-        cancelPendingReadyWait = nil
+        loadGeneration &+= 1
+        let myGeneration = loadGeneration
+        cancelCurrentReadyWait()
         cleanupLocalAsset()
 
         self.session = session
@@ -132,6 +134,9 @@ public class TDF3StreamingPlayer: ObservableObject {
 
         // Wait for ready to play
         try await waitForReadyToPlay(playerItem: playerItem)
+        guard loadGeneration == myGeneration else {
+            throw CancellationError()
+        }
 
         status = .ready
     }
@@ -145,15 +150,18 @@ public class TDF3StreamingPlayer: ObservableObject {
     ///   - tdfData: TDF archive containing HLS content
     ///   - session: Media session for playback
     ///   - kasURL: Trusted KAS URL for manifest validation (defaults to `https://100.arkavo.net`)
+    ///   - extractionLimits: Size and entry caps for archive extraction (defaults to `.default`)
     ///   - keyProvider: Callback to obtain decryption key from KAS
     public func loadFromTDF(
         tdfData: Data,
         session: MediaSession,
         kasURL: URL? = nil,
+        extractionLimits: HLSTDFExtractor.ExtractionLimits = .default,
         keyProvider: @escaping (HLSManifest) async throws -> SymmetricKey
     ) async throws {
-        cancelPendingReadyWait?()
-        cancelPendingReadyWait = nil
+        loadGeneration &+= 1
+        let myGeneration = loadGeneration
+        cancelCurrentReadyWait()
         cleanupLocalAsset()
 
         self.session = session
@@ -165,11 +173,18 @@ public class TDF3StreamingPlayer: ObservableObject {
 
         do {
             // Extract HLS from TDF
-            let extractor = HLSTDFExtractor(kasURL: kasURL ?? Self.defaultKASURL)
+            let extractor = HLSTDFExtractor(kasURL: kasURL ?? Self.defaultKASURL, limits: extractionLimits)
             let localAsset = try await extractor.extract(
                 tdfData: tdfData,
                 outputDirectory: tempDir
             )
+
+            // If another load or stop() superseded us while extracting, clean up our tempDir and abort
+            guard loadGeneration == myGeneration else {
+                try? FileManager.default.removeItem(at: tempDir)
+                throw CancellationError()
+            }
+
             self.localAsset = localAsset
             cleanupResources.withLock { $0.tempDirectory = localAsset.outputDirectory }
 
@@ -197,6 +212,9 @@ public class TDF3StreamingPlayer: ObservableObject {
 
             // Wait for ready to play
             try await waitForReadyToPlay(playerItem: playerItem)
+            guard loadGeneration == myGeneration else {
+                throw CancellationError()
+            }
 
             status = .ready
         } catch {
@@ -230,8 +248,8 @@ public class TDF3StreamingPlayer: ObservableObject {
 
     /// Stop playback and clean up
     public func stop() {
-        cancelPendingReadyWait?()
-        cancelPendingReadyWait = nil
+        loadGeneration &+= 1
+        cancelCurrentReadyWait()
         player.pause()
         player.replaceCurrentItem(with: nil)
         session = nil
@@ -242,6 +260,12 @@ public class TDF3StreamingPlayer: ObservableObject {
     }
 
     // MARK: - Private
+
+    private func cancelCurrentReadyWait() {
+        let pending = pendingReadyWait
+        pendingReadyWait = nil
+        pending?.cancel()
+    }
 
     private func cleanupLocalAsset() {
         if let localAsset {
@@ -299,10 +323,16 @@ public class TDF3StreamingPlayer: ObservableObject {
     }
 
     private func waitForReadyToPlay(playerItem: AVPlayerItem) async throws {
-        try await Self.waitForReadyToPlay(playerItem: playerItem) { [weak self] cancel in
-            self?.cancelPendingReadyWait = cancel
+        let waitToken = UUID()
+        defer {
+            // Clear only if this waiter still owns the cancellation slot (never clobber a replacement load)
+            if pendingReadyWait?.id == waitToken {
+                pendingReadyWait = nil
+            }
         }
-        cancelPendingReadyWait = nil
+        try await Self.waitForReadyToPlay(playerItem: playerItem) { [weak self] cancel in
+            self?.pendingReadyWait = (id: waitToken, cancel: cancel)
+        }
     }
 
     /// Internal testable helper for waiting on `AVPlayerItem.status` with `.initial` + `.new`,

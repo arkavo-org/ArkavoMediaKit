@@ -101,11 +101,19 @@ struct AuditSecurityNetworkTests {
         }
         defer { AuditStubURLProtocol.unregister(host: host) }
 
+        // 1. Default client (no allowlist) fails closed before contacting any public host
+        let defaultClient = StandardTDFKASKeyClient(urlSession: AuditStubURLProtocol.session())
+        let manifest = Self.makeManifest(kasURL: "https://\(host)/kas")
+        await #expect(throws: StandardTDFKASKeyClientError.untrustedKASOrigin("https://\(host)/kas")) {
+            _ = try await defaultClient.unwrapKey(manifest: manifest, authToken: "secret-oauth-bearer")
+        }
+        #expect(requested.withLock { $0 }.isEmpty, "Default client must fail closed without sending bearer token")
+
+        // 2. Explicit allowlist rejects untrusted origins
         let client = StandardTDFKASKeyClient(
             urlSession: AuditStubURLProtocol.session(),
             allowedKASOrigins: ["https://trusted.arkavo.net"]
         )
-        let manifest = Self.makeManifest(kasURL: "https://\(host)/kas")
 
         await #expect(throws: StandardTDFKASKeyClientError.untrustedKASOrigin("https://\(host)/kas")) {
             _ = try await client.unwrapKey(manifest: manifest, authToken: "secret-oauth-bearer")
@@ -277,7 +285,8 @@ struct AuditSecurityNetworkTests {
         let expectedWrappedKey = try #require(decodedManifest.encryptionInformation.keyAccess.first?.wrappedKey)
         #expect(response.wrappedKey == expectedWrappedKey, "wrappedKey must not be double-base64 encoded")
 
-        // 4. Offline RSA unwrap rejects tampered policyBinding
+        // 4. Offline RSA unwrap rejects tampered policyBinding AND empty/stripped policy,
+        //    while accepting legacy hex-form policyBinding
         var tamperedManifest = decodedManifest
         tamperedManifest.encryptionInformation.keyAccess[0].policyBinding = TDFPolicyBinding(
             alg: "HS256",
@@ -287,7 +296,26 @@ struct AuditSecurityNetworkTests {
         await #expect(throws: KeyProviderError.policyValidationFailed("Policy binding verification failed")) {
             _ = try await provider.unwrapSegmentKey(tdfData: tamperedArchive, useKASRewrap: false)
         }
-        _ = dek1
+
+        var emptyPolicyManifest = decodedManifest
+        emptyPolicyManifest.encryptionInformation.policy = ""
+        let emptyPolicyArchive = try TDFArchiveWriter().buildArchive(manifest: emptyPolicyManifest, payload: Data([1, 2, 3]))
+        await #expect(throws: KeyProviderError.policyValidationFailed("Missing manifest policy")) {
+            _ = try await provider.unwrapSegmentKey(tdfData: emptyPolicyArchive, useKASRewrap: false)
+        }
+
+        let rawHmac = Data(HMAC<SHA256>.authenticationCode(
+            for: Data(decodedManifest.encryptionInformation.policy.utf8),
+            using: dek1
+        ))
+        let legacyHexHash = Data(rawHmac.map { String(format: "%02x", $0) }.joined().utf8).base64EncodedString()
+        var legacyManifest = decodedManifest
+        legacyManifest.encryptionInformation.keyAccess[0].policyBinding = TDFPolicyBinding(alg: "HS256", hash: legacyHexHash)
+        let legacyArchive = try TDFArchiveWriter().buildArchive(manifest: legacyManifest, payload: Data([1, 2, 3]))
+        let unwrappedLegacy = try await provider.unwrapSegmentKey(tdfData: legacyArchive, useKASRewrap: false)
+        let unwrappedBytes = unwrappedLegacy.withUnsafeBytes { Data($0) }
+        let expectedBytes = dek1.withUnsafeBytes { Data($0) }
+        #expect(unwrappedBytes == expectedBytes)
     }
 
     @Test("MediaServerClient and FairPlayKeyClient reject sessionId path traversal and redirects")
@@ -319,7 +347,7 @@ struct AuditSecurityNetworkTests {
         let client = MediaServerClient(configuration: config, session: AuditStubURLProtocol.session())
 
         // Path traversal in sessionId is rejected before any network request
-        for badID in ["../admin", "a/b", "sess?x=1", "sess#frag", "..", "", "sess\\x"] {
+        for badID in ["../admin", "a/b", "sess?x=1", "sess#frag", "..", "", "sess\\x", "sess%2e%2e", "bad\nid"] {
             await #expect(throws: ValidationError.self) {
                 try await client.sendHeartbeat(sessionId: badID, state: "playing")
             }
@@ -328,6 +356,13 @@ struct AuditSecurityNetworkTests {
             }
         }
         #expect(requestedPaths.withLock { $0 }.isEmpty)
+
+        // Production arks session IDs (`<sub:asset_id:uuid>`, with colons and >128 chars) are accepted
+        let longSub = String(repeating: "a", count: 100)
+        let arksSessionID = "\(longSub):asset-uuid-1234:550e8400-e29b-41d4-a716-446655440000"
+        #expect(arksSessionID.count > 128)
+        try InputValidator.validateSessionID(arksSessionID)
+        try InputValidator.validateSessionID("user.sub@arkavo.net:asset_1:550e8400-e29b-41d4-a716-446655440000")
 
         // Malicious sessionId returned by server is also rejected
         await #expect(throws: ValidationError.self) {
@@ -434,7 +469,8 @@ struct AuditSecurityNetworkTests {
                 if path.hasSuffix("/certificate") {
                     body = Data(repeating: 0x30, count: 32)
                 } else if path.hasSuffix("/session/start") {
-                    body = Data(#"{"sessionId":"sess-ok-1"}"#.utf8)
+                    // Use production arks-shaped session ID (sub:asset:uuid with colons)
+                    body = Data(#"{"sessionId":"auth0|user.123:3f1c9e2a-7b4d-4e8f-9a21-5c6d7e8f9a0b:550e8400-e29b-41d4-a716-446655440000"}"#.utf8)
                 } else if path.hasSuffix("/key-request") {
                     let ckc = Data(repeating: 0x55, count: 32).base64EncodedString()
                     body = Data(#"{"error":null,"wrappedKey":"\#(ckc)"}"#.utf8)

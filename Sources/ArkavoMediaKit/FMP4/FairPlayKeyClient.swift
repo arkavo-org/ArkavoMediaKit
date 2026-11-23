@@ -93,9 +93,7 @@ public final class FairPlayKeyClient: Sendable {
     }
 
     private func validateHTTPSServerURL() throws {
-        guard serverURL.scheme?.lowercased() == "https",
-              let host = serverURL.host, !host.isEmpty
-        else {
+        guard InputValidator.isAllowedHTTPSOrLoopbackHTTP(serverURL) else {
             throw FairPlayKeyError.insecureServerURL
         }
     }

@@ -49,8 +49,10 @@ public actor HLSConverter {
         outputDirectory: URL,
         segmentDuration: TimeInterval = defaultSegmentDuration
     ) async throws -> HLSConversionResult {
-        guard segmentDuration.isFinite, segmentDuration > 0 else {
-            throw HLSConversionError.invalidSourceVideo("Segment duration must be a finite positive number")
+        // Note: Double(Int.max) rounds up to 2^63 on 64-bit platforms, so cap strictly below Int.max
+        let maxSafeTargetDuration = Double(Int.max / 2)
+        guard segmentDuration.isFinite, segmentDuration > 0, ceil(segmentDuration) <= maxSafeTargetDuration else {
+            throw HLSConversionError.invalidSourceVideo("Segment duration must be a finite positive number within valid bounds")
         }
 
         // Create output directory if needed
@@ -96,8 +98,10 @@ public actor HLSConverter {
         outputDirectory: URL,
         segmentDuration: TimeInterval = defaultSegmentDuration
     ) async throws -> HLSConversionResult {
-        guard segmentDuration.isFinite, segmentDuration > 0 else {
-            throw HLSConversionError.invalidSourceVideo("Segment duration must be a finite positive number")
+        // Note: Double(Int.max) rounds up to 2^63 on 64-bit platforms, so cap strictly below Int.max
+        let maxSafeTargetDuration = Double(Int.max / 2)
+        guard segmentDuration.isFinite, segmentDuration > 0, ceil(segmentDuration) <= maxSafeTargetDuration else {
+            throw HLSConversionError.invalidSourceVideo("Segment duration must be a finite positive number within valid bounds")
         }
 
         // Create output directory if needed
@@ -122,7 +126,7 @@ public actor HLSConverter {
         }
         let segmentCount = Int(rawSegmentCount)
         let rawTargetDuration = ceil(segmentDuration)
-        guard rawTargetDuration.isFinite, rawTargetDuration >= 1, rawTargetDuration <= Double(Int.max) else {
+        guard rawTargetDuration.isFinite, rawTargetDuration >= 1, rawTargetDuration <= maxSafeTargetDuration else {
             throw HLSConversionError.invalidSourceVideo("Target segment duration is out of valid bounds")
         }
         let targetDuration = Int(rawTargetDuration)

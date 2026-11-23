@@ -86,96 +86,45 @@ public final class StandardTDFContentKeyDelegate: NSObject, AVContentKeySessionD
 
     // MARK: - Key Request Handling
 
-    private func handleKeyRequest(_ keyRequest: AVContentKeyRequest, isRenewal: Bool) async throws {
-        // Extract segment information from the key request identifier
-        guard let identifier = keyRequest.identifier as? String,
-              let url = URL(string: identifier)
-        else {
-            throw ContentKeyError.invalidIdentifier
-        }
+    struct ParsedKeyRequest: Equatable, Sendable {
+        let assetID: String
+        let segmentIndex: Int
+        let userID: String?
+    }
 
-        // Parse segment index from URL
-        // Expected format: tdf3://kas.arkavo.net/key?segment=N&asset=ID&user=UID
-        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+    /// Parses a `tdf3://.../key?asset=ID&segment=N[&user=UID]` key URI.
+    /// `user` is optional because `HLSPlaylistGenerator` omits PII from playlists.
+    static func parseKeyRequestURI(_ identifier: String) throws -> ParsedKeyRequest {
+        guard let url = URL(string: identifier),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let segmentParam = components.queryItems?.first(where: { $0.name == "segment" }),
               let segmentIndexString = segmentParam.value,
               let segmentIndex = Int(segmentIndexString),
               segmentIndex >= 0,
               let assetParam = components.queryItems?.first(where: { $0.name == "asset" }),
-              let assetID = assetParam.value,
-              let userParam = components.queryItems?.first(where: { $0.name == "user" }),
-              let userID = userParam.value
+              let assetID = assetParam.value
         else {
             throw ContentKeyError.invalidURL
         }
 
         try InputValidator.validateAssetID(assetID)
-        try InputValidator.validateUserID(userID)
-
-        let cacheKey = CacheKey(assetID: assetID, segmentIndex: segmentIndex)
-
-        // Renewals must always re-validate policy and never short-circuit on cached DEKs.
-        if isRenewal {
-            dekCache.withLock { _ = $0.removeValue(forKey: cacheKey) }
+        let userID = components.queryItems?.first(where: { $0.name == "user" })?.value
+        if let userID {
+            try InputValidator.validateUserID(userID)
         }
-
-        // Download the .tdf segment file over HTTPS without following redirects
-        guard let tdfURL = try await fetchSegmentURL(assetID: assetID, segmentIndex: segmentIndex) else {
-            throw ContentKeyError.segmentNotFound
-        }
-        guard tdfURL.scheme?.lowercased() == "https",
-              let host = tdfURL.host, !host.isEmpty
-        else {
-            throw ContentKeyError.invalidURL
-        }
-
-        let (tdfData, response) = try await Self.downloadSession.data(from: tdfURL)
-        guard let http = response as? HTTPURLResponse, (200 ... 299).contains(http.statusCode) else {
-            throw ContentKeyError.segmentNotFound
-        }
-
-        // Parse TDF archive to extract manifest
-        let reader = try TDFArchiveReader(data: tdfData)
-        let manifest = try reader.manifest()
-
-        // Encode manifest as base64 for key request
-        let manifestData = try JSONEncoder().encode(manifest)
-        let manifestBase64 = manifestData.base64EncodedString()
-
-        // Always enforce session and policy checks before releasing any key
-        let accessRequest = KeyAccessRequest(
-            sessionID: sessionID,
-            userID: userID,
-            assetID: assetID,
-            segmentIndex: segmentIndex,
-            tdfManifest: manifestBase64
-        )
-        _ = try await keyProvider.requestKey(
-            request: accessRequest,
-            policy: policy,
-            deviceInfo: deviceInfo
-        )
-
-        let dek: SymmetricKey
-        if !isRenewal, let cachedDEK = dekCache.withLock({ $0[cacheKey] }) {
-            dek = cachedDEK
-        } else {
-            dek = try await keyProvider.unwrapSegmentKey(
-                tdfData: tdfData,
-                useKASRewrap: false
-            )
-            dekCache.withLock { $0[cacheKey] = dek }
-        }
-
-        // Provide key to AVPlayer
-        try provideKey(dek, to: keyRequest)
+        return ParsedKeyRequest(assetID: assetID, segmentIndex: segmentIndex, userID: userID)
     }
 
-    private func provideKey(_ key: SymmetricKey, to keyRequest: AVContentKeyRequest) throws {
-        // FairPlay requires a KSM-signed CKC generated from the player's SPC; raw symmetric DEKs
-        // must never be passed to AVContentKeyResponse(fairPlayStreamingKeyResponseData:).
-        _ = key
-        _ = keyRequest
+    private func handleKeyRequest(_ keyRequest: AVContentKeyRequest, isRenewal: Bool) async throws {
+        // Extract and validate segment information from the key request identifier
+        guard let identifier = keyRequest.identifier as? String else {
+            throw ContentKeyError.invalidIdentifier
+        }
+        let parsed = try Self.parseKeyRequestURI(identifier)
+        _ = (parsed, isRenewal)
+
+        // Fail immediately before performing network fetches: FairPlay requires a KSM-signed CKC
+        // generated from the player's SPC, and raw symmetric DEKs must never be passed as a CKC.
         throw ContentKeyError.notImplemented(
             "FairPlay CKC exchange is required; use TDFContentKeyDelegate for FairPlay playback."
         )

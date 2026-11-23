@@ -325,7 +325,7 @@ struct AuditFMP4AndConcurrencyTests {
         let mdhd = MediaHeaderBox(timescale: 90_000, language: "1! ")
         #expect(mdhd.language == 0x55C4)
 
-        // AACSampleEntry clamps 96 kHz without wrapping to bogus low rate
+        // AACSampleEntry writes 0 for 96 kHz per ISO/IEC 14496-12 §12.2.3 (exact rate in esds AudioSpecificConfig)
         let aac = AACSampleEntry(
             channelCount: 2,
             sampleRate: 96_000,
@@ -333,7 +333,11 @@ struct AuditFMP4AndConcurrencyTests {
         )
         let payload = aac.serializePayload()
         let rateField = UInt32(bigEndianData: payload.subdata(in: 24 ..< 28)) >> 16
-        #expect(rateField == UInt32(UInt16.max))
+        #expect(rateField == 0)
+
+        // ISOBox.headerSize switches from 8 bytes to 16 bytes for >4 GiB boxes (matching ISOBox.serialize)
+        #expect(ContainerBox.headerSize(forPayloadSize: UInt64(UInt32.max) - 8) == 8)
+        #expect(ContainerBox.headerSize(forPayloadSize: UInt64(UInt32.max) - 7) == 16)
 
         // FMP4HLSGenerator sanitizes quotes/newlines and omits non-16-byte IVs
         let hls = FMP4HLSGenerator(
@@ -426,6 +430,67 @@ struct AuditFMP4AndConcurrencyTests {
         await #expect(throws: SessionError.self) {
             try await manager.endSession(sessionId: "not-a-uuid")
         }
+
+        // 4. endAllSessions() does not stop heartbeat when a new session starts concurrently
+        let endAllHost = "msm-endall-\(UUID().uuidString.lowercased()).example.com"
+        let startSeq = Mutex(0)
+        let deleteSeq = Mutex(0)
+        let deleteEntered = Mutex<CheckedContinuation<Void, Never>?>(nil)
+        let deleteRelease = Mutex<CheckedContinuation<Void, Never>?>(nil)
+        let hbAfterEndAll = Mutex<CheckedContinuation<Void, Never>?>(nil)
+
+        ConcurrencyStubURLProtocol.register(host: endAllHost) { req, _ in
+            let url = req.url!
+            if url.path.hasSuffix("/session/start") {
+                let n = startSeq.withLock { $0 += 1; return $0 }
+                let body = Data(#"{"sessionId":"sess-endall-\#(n)","status":"active"}"#.utf8)
+                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!, body)
+            }
+            if req.httpMethod == "DELETE" {
+                let d = deleteSeq.withLock { $0 += 1; return $0 }
+                if d == 1 {
+                    deleteEntered.withLock { $0.take() }?.resume()
+                    await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                        deleteRelease.withLock { $0 = cont }
+                    }
+                }
+                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!, Data())
+            }
+            if url.path.hasSuffix("/heartbeat") {
+                hbAfterEndAll.withLock { $0.take() }?.resume()
+                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!, Data())
+            }
+            return (HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: nil)!, Data())
+        }
+        defer { ConcurrencyStubURLProtocol.unregister(host: endAllHost) }
+
+        let fastConfig = try DRMConfiguration(
+            serverURL: URL(string: "https://\(endAllHost)")!,
+            fpsCertificateData: Data([0x30]),
+            heartbeatInterval: 0.05,
+            sessionTimeout: 300
+        )
+        let fastManager = MediaSessionManager(
+            configuration: fastConfig,
+            client: MediaServerClient(configuration: fastConfig, session: ConcurrencyStubURLProtocol.session())
+        )
+        _ = try await fastManager.startSession(userID: "alice", assetID: "a1")
+        let endAllTask = Task { await fastManager.endAllSessions() }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            deleteEntered.withLock { $0 = cont }
+        }
+        // Start a brand-new session while endAllSessions is suspended in DELETE
+        let sNew = try await fastManager.startSession(userID: "alice", assetID: "a2")
+        deleteRelease.withLock { $0.take() }?.resume()
+        await endAllTask.value
+
+        #expect(await fastManager.activeSessionCount == 1)
+        #expect(await fastManager.session(for: sNew) != nil)
+        // Heartbeat task for sNew must still be running and fire promptly
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            hbAfterEndAll.withLock { $0 = cont }
+        }
+        await fastManager.endAllSessions()
     }
 
     @Test("FairPlayKeyClient endSession never clears a newer session started concurrently, and rejects empty cert/CKC")

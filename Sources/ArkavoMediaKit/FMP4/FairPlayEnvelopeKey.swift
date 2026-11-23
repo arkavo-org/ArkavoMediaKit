@@ -27,9 +27,7 @@ struct FairPlayEnvelopeKey {
     /// Fetches the key from `kasURL`. Requires HTTPS, HTTP 200, bounded response size, `alg` RSA-OAEP,
     /// a valid RSA public key of at least 2048 bits, and a `kid` matching SHA-256(SPKI DER)[0..<32].
     static func fetch(kasURL: URL, http: any FairPlayHTTP) async throws -> FairPlayEnvelopeKey {
-        guard kasURL.scheme?.lowercased() == "https",
-              let host = kasURL.host, !host.isEmpty
-        else {
+        guard InputValidator.isAllowedHTTPSOrLoopbackHTTP(kasURL) else {
             throw FairPlayEnvelopeKeyError.invalidResponse("KAS URL must use HTTPS")
         }
         var request = URLRequest(url: url(kasURL: kasURL))

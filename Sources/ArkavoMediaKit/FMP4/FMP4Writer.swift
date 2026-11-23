@@ -396,7 +396,10 @@ public final class FMP4Writer {
             generateTraf(fragment: fragment, dataOffsetBase: 0, trafOffset: 0).serialize().count
         }
         let moofSize = 8 + mfhdSize + trafSizes.reduce(0, +)
-        let mdatHeaderSize = 8 // mdat box header
+        let mdatPayloadSize = fragments.reduce(UInt64(0)) { total, fragment in
+            total + fragment.samples.reduce(UInt64(0)) { $0 + UInt64($1.data.count) }
+        }
+        let mdatHeaderSize = ContainerBox.headerSize(forPayloadSize: mdatPayloadSize)
 
         var moof = ContainerBox(type: .moof)
         moof.append(mfhd)

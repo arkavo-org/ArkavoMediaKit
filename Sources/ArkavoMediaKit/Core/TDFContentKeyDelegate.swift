@@ -276,9 +276,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
     init(manifest: Manifest, authToken: String?, serverURL: URL, http: any FairPlayHTTP) {
         self.manifest = manifest
         self.targets = Result {
-            guard serverURL.scheme?.lowercased() == "https",
-                  let host = serverURL.host, !host.isEmpty
-            else {
+            guard InputValidator.isAllowedHTTPSOrLoopbackHTTP(serverURL) else {
                 throw FairPlayError.sessionStartFailed("FairPlay server URL must use HTTPS")
             }
             if let payload = manifest.tdfPayload {
@@ -479,7 +477,8 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         guard (200 ... 299).contains(statusCode) else {
             throw FairPlayError.sessionStartFailed("HTTP \(statusCode)")
         }
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard data.count <= Self.maxSessionResponseBytes,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let sessionId = json["sessionId"] as? String,
               (try? InputValidator.validateSessionID(sessionId)) != nil
         else {
@@ -487,6 +486,9 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         }
         return sessionId
     }
+
+    private static var maxSessionResponseBytes: Int { 64 * 1024 }
+    private static var maxBinaryResponseBytes: Int { 256 * 1024 }
 
     /// End a session, best effort: a failure is logged and never fails the key.
     private func endSession(_ sessionId: String) async {
@@ -515,8 +517,8 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         guard (200 ... 299).contains(statusCode) else {
             throw FairPlayError.certificateFetchFailed("HTTP \(statusCode)")
         }
-        guard !data.isEmpty else {
-            throw FairPlayError.certificateFetchFailed("Empty certificate data")
+        guard !data.isEmpty, data.count <= Self.maxBinaryResponseBytes else {
+            throw FairPlayError.certificateFetchFailed("Invalid certificate data size")
         }
         return data
     }
@@ -556,7 +558,9 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
             // A refusal carries an error and a message, never a CKC; neither is kept.
             throw FairPlayError.ckcRequestFailed("HTTP \(statusCode)")
         }
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        guard data.count <= Self.maxBinaryResponseBytes,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
             throw FairPlayError.invalidCKCResponse("Response is not valid JSON")
         }
         if let errorValue = json["error"], !(errorValue is NSNull) {

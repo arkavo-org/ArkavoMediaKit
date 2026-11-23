@@ -32,14 +32,14 @@ public actor StandardTDFKeyProvider {
         sessionManager: TDF3MediaSession,
         rsaPrivateKeyPEM: String? = nil,
         authTokenProvider: (@Sendable () async -> String?)? = nil,
-        kasKeyClient: StandardTDFKASKeyClient = StandardTDFKASKeyClient()
+        kasKeyClient: StandardTDFKASKeyClient? = nil
     ) {
         self.kasURL = kasURL
         self.kasPublicKeyPEM = kasPublicKeyPEM
         self.sessionManager = sessionManager
         self.rsaPrivateKeyPEM = rsaPrivateKeyPEM
         self.authTokenProvider = authTokenProvider
-        self.kasKeyClient = kasKeyClient
+        self.kasKeyClient = kasKeyClient ?? StandardTDFKASKeyClient(allowedKASOrigins: [kasURL.absoluteString])
     }
 
     /// Request a key for a specific segment from KAS
@@ -257,24 +257,21 @@ public actor StandardTDFKeyProvider {
                 wrappedKey: wrappedKey
             )
 
-            // Verify policyBinding against the unwrapped DEK to prevent policy substitution
-            if !encInfo.policy.isEmpty {
-                guard keyAccess.policyBinding.alg == "HS256" else {
-                    throw KeyProviderError.policyValidationFailed("Unsupported policyBinding algorithm")
-                }
-                let expected = Data(HMAC<SHA256>.authenticationCode(
-                    for: Data(encInfo.policy.utf8),
-                    using: dek
-                ))
-                guard let actual = Data(base64Encoded: keyAccess.policyBinding.hash),
-                      actual.count == expected.count
-                else {
-                    throw KeyProviderError.policyValidationFailed("Policy binding verification failed")
-                }
-                let diff = zip(actual, expected).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) }
-                guard diff == 0 else {
-                    throw KeyProviderError.policyValidationFailed("Policy binding verification failed")
-                }
+            // Always require and verify policyBinding against the unwrapped DEK to prevent policy substitution/stripping.
+            guard !encInfo.policy.isEmpty else {
+                throw KeyProviderError.policyValidationFailed("Missing manifest policy")
+            }
+            guard keyAccess.policyBinding.alg == "HS256" else {
+                throw KeyProviderError.policyValidationFailed("Unsupported policyBinding algorithm")
+            }
+            guard let actual = Data(base64Encoded: keyAccess.policyBinding.hash),
+                  StandardTDFSegmentCrypto.verifyPolicyBinding(
+                      actual: actual,
+                      policyBase64: encInfo.policy,
+                      symmetricKey: dek
+                  )
+            else {
+                throw KeyProviderError.policyValidationFailed("Policy binding verification failed")
             }
 
             return dek

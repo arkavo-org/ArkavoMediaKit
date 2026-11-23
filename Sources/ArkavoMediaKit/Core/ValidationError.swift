@@ -56,7 +56,7 @@ public enum InputValidator {
     public enum Limits {
         public static let assetIDMaxLength = 256
         public static let userIDMaxLength = 256
-        public static let sessionIDMaxLength = 128
+        public static let sessionIDMaxLength = 512
         public static let regionCodeLength = 2
         public static let policyAttributeMaxLength = 512
     }
@@ -66,22 +66,51 @@ public enum InputValidator {
         charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
     )
 
-    /// Validate session ID (prevents URL path traversal / endpoint injection)
+    /// Returns true if the URL uses HTTPS with a non-empty host, or cleartext HTTP strictly to a loopback host.
+    static func isAllowedHTTPSOrLoopbackHTTP(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(),
+              let host = url.host?.lowercased(),
+              !host.isEmpty
+        else {
+            return false
+        }
+        if scheme == "https" {
+            return true
+        }
+        if scheme == "http" {
+            return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
+        }
+        return false
+    }
+
+    /// Validate session ID (prevents URL path traversal / endpoint injection while accepting
+    /// production `arks` session IDs shaped like `<sub:asset_id:uuid>`).
     /// - Parameter sessionID: Session identifier
     /// - Throws: ValidationError.invalidSessionID if invalid
     public static func validateSessionID(_ sessionID: String) throws {
         guard !sessionID.isEmpty,
-              sessionID.utf8.count <= Limits.sessionIDMaxLength
+              sessionID.utf8.count <= Limits.sessionIDMaxLength,
+              sessionID != ".",
+              sessionID != "..",
+              !sessionID.contains("..")
         else {
             throw ValidationError.invalidSessionID
         }
 
+        // Allow printable single-path-segment ASCII (including ':', '|', '.', '-', '_', '@', '+', '~')
+        // while rejecting slashes, backslashes, query/fragment/percent delimiters, quotes, whitespace, and control chars.
         let isValid = sessionID.utf8.allSatisfy { byte in
-            (byte >= UInt8(ascii: "A") && byte <= UInt8(ascii: "Z"))
-                || (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "z"))
-                || (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
-                || byte == UInt8(ascii: "-")
-                || byte == UInt8(ascii: "_")
+            guard byte >= 0x21 && byte <= 0x7E else { return false }
+            switch byte {
+            case UInt8(ascii: "/"), UInt8(ascii: "\\"), UInt8(ascii: "?"),
+                 UInt8(ascii: "#"), UInt8(ascii: "%"), UInt8(ascii: "\""),
+                 UInt8(ascii: "'"), UInt8(ascii: "<"), UInt8(ascii: ">"),
+                 UInt8(ascii: "{"), UInt8(ascii: "}"),
+                 UInt8(ascii: "^"), UInt8(ascii: "`"):
+                return false
+            default:
+                return true
+            }
         }
 
         guard isValid else {

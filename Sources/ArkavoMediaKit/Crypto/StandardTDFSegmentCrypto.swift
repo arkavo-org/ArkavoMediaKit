@@ -155,22 +155,19 @@ public actor StandardTDFSegmentCrypto {
         let method = encInfo.method
         let algorithm = method.algorithm
 
-        // Verify policy binding against the symmetric key when policy is present
-        if !encInfo.policy.isEmpty {
-            guard let keyAccess = encInfo.keyAccess.first,
-                  keyAccess.policyBinding.alg == "HS256"
-            else {
-                throw StandardTDFSegmentError.integrityVerificationFailed
-            }
-            let expectedBinding = Data(HMAC<SHA256>.authenticationCode(
-                for: Data(encInfo.policy.utf8),
-                using: symmetricKey
-            ))
-            guard let actualBinding = Data(base64Encoded: keyAccess.policyBinding.hash),
-                  Self.constantTimeEquals(actualBinding, expectedBinding)
-            else {
-                throw StandardTDFSegmentError.integrityVerificationFailed
-            }
+        // Always require and verify policy binding against the symmetric key (fail closed if policy is stripped).
+        // Accepts both the OpenTDF 5.0 spec form Base64(raw 32B HMAC) and the legacy hex form Base64(utf8(hex(HMAC))).
+        guard !encInfo.policy.isEmpty,
+              let keyAccess = encInfo.keyAccess.first,
+              keyAccess.policyBinding.alg == "HS256",
+              let actualBinding = Data(base64Encoded: keyAccess.policyBinding.hash),
+              Self.verifyPolicyBinding(
+                  actual: actualBinding,
+                  policyBase64: encInfo.policy,
+                  symmetricKey: symmetricKey
+              )
+        else {
+            throw StandardTDFSegmentError.integrityVerificationFailed
         }
 
         // Strict algorithm allowlist; refuse downgrade from configured GCM mode to unauthenticated CBC
@@ -226,19 +223,20 @@ public actor StandardTDFSegmentCrypto {
             guard iv.count == 16 else {
                 throw StandardTDFSegmentError.missingEncryptionParameters
             }
-            // Verify CBC integrity metadata when present (prevents unauthenticated ciphertext tampering)
-            if let integrity = encInfo.integrityInformation, !integrity.segments.isEmpty {
-                let computedSig = TDFCrypto.segmentSignature(
-                    segmentCiphertext: encryptedPayload,
-                    symmetricKey: symmetricKey
-                )
-                try Self.verifyIntegrity(
-                    integrity: integrity,
-                    segmentSignature: computedSig,
-                    encryptedSize: encryptedPayload.count,
-                    symmetricKey: symmetricKey
-                )
+            // CBC mode is unauthenticated at the cipher layer: require authentic integrity metadata (fail closed if stripped)
+            guard let integrity = encInfo.integrityInformation, !integrity.segments.isEmpty else {
+                throw StandardTDFSegmentError.integrityVerificationFailed
             }
+            let computedSig = TDFCrypto.segmentSignature(
+                segmentCiphertext: encryptedPayload,
+                symmetricKey: symmetricKey
+            )
+            try Self.verifyIntegrity(
+                integrity: integrity,
+                segmentSignature: computedSig,
+                encryptedSize: encryptedPayload.count,
+                symmetricKey: symmetricKey
+            )
 
             // CBC mode - no tag, ciphertext is the entire payload
             return try TDFCrypto.decryptPayloadCBC(
@@ -283,7 +281,24 @@ public actor StandardTDFSegmentCrypto {
         }
     }
 
-    private static func constantTimeEquals(_ lhs: Data, _ rhs: Data) -> Bool {
+    static func verifyPolicyBinding(
+        actual: Data,
+        policyBase64: String,
+        symmetricKey: SymmetricKey
+    ) -> Bool {
+        let rawDigest = Data(HMAC<SHA256>.authenticationCode(
+            for: Data(policyBase64.utf8),
+            using: symmetricKey
+        ))
+        if constantTimeEquals(actual, rawDigest) {
+            return true
+        }
+        // Legacy Go/OpenTDFKit <= 4 form: base64(utf8(lowercase hex(digest)))
+        let hexDigest = Data(rawDigest.map { String(format: "%02x", $0) }.joined().utf8)
+        return constantTimeEquals(actual, hexDigest)
+    }
+
+    static func constantTimeEquals(_ lhs: Data, _ rhs: Data) -> Bool {
         guard lhs.count == rhs.count else { return false }
         return zip(lhs, rhs).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
     }

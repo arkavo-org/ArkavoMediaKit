@@ -412,10 +412,11 @@ public struct AACSampleEntry: ISOBox {
         // Pre-defined + reserved
         data.append(Data(count: 4))
 
-        // Sample rate (16.16 fixed point; clamp high rates like 88.2/96 kHz rather than wrapping UInt32 << 16,
-        // as ISO/IEC 14496-12 AudioSpecificConfig inside esds carries the exact sampling frequency)
-        let clampedRate = min(sampleRate, UInt32(UInt16.max))
-        data.append((clampedRate << 16).bigEndianData)
+        // Sample rate (16.16 fixed point). Per ISO/IEC 14496-12 §12.2.3, rates > 65535 Hz
+        // (such as 88.2 / 96 kHz) cannot be represented in 16.16 fixed point and must be written as 0
+        // so readers obtain the exact sampling frequency from AudioSpecificConfig inside esds.
+        let fixedRate: UInt32 = sampleRate <= UInt32(UInt16.max) ? (sampleRate << 16) : 0
+        data.append(fixedRate.bigEndianData)
 
         // esds box
         data.append(esds.serialize())

@@ -179,9 +179,7 @@ public enum TDFProtectionCore {
 
     /// Internal overload supporting injected URLSession in tests
     static func fetchKASRSAPublicKey(kasURL: URL, algorithm: String = "rsa", session: URLSession) async throws -> String {
-        guard kasURL.scheme?.lowercased() == "https",
-              let host = kasURL.host, !host.isEmpty
-        else {
+        guard InputValidator.isAllowedHTTPSOrLoopbackHTTP(kasURL) else {
             throw TDFProtectionCoreError.invalidKASURL
         }
         do {

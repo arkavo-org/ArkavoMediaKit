@@ -98,12 +98,6 @@ final class URLSessionFairPlayHTTP: FairPlayHTTP {
     /// A session of its own with `configuration`, which also refuses every redirect and cleans up on deinit.
     init(configuration: URLSessionConfiguration) {
         let config = (configuration.copy() as? URLSessionConfiguration) ?? configuration
-        if config.timeoutIntervalForRequest <= 0 || config.timeoutIntervalForRequest == 60 {
-            config.timeoutIntervalForRequest = 30
-        }
-        if config.timeoutIntervalForResource <= 0 || config.timeoutIntervalForResource == 604_800 {
-            config.timeoutIntervalForResource = 60
-        }
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         session = URLSession(configuration: config, delegate: RedirectRefusal(), delegateQueue: nil)
         ownsSession = true

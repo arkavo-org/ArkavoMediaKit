@@ -22,10 +22,15 @@ public final class HLSResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDel
         let handler: (HLSManifest) async throws -> SymmetricKey
     }
 
+    private struct InFlightSlot: Sendable {
+        var task: Task<Void, Never>?
+        var cancelled = false
+    }
+
     private struct State: Sendable {
         var symmetricKey: SymmetricKey?
         var onKeyRequest: KeyCallbackBox?
-        var inFlightTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
+        var inFlightTasks: [ObjectIdentifier: InFlightSlot] = [:]
     }
 
     private let localAsset: LocalHLSAsset
@@ -172,7 +177,15 @@ public final class HLSResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDel
         didCancel loadingRequest: AVAssetResourceLoadingRequest
     ) {
         let id = ObjectIdentifier(loadingRequest)
-        let task = state.withLock { $0.inFlightTasks.removeValue(forKey: id) }
+        let task: Task<Void, Never>? = state.withLock { state in
+            if var slot = state.inFlightTasks[id] {
+                slot.cancelled = true
+                let existingTask = slot.task
+                state.inFlightTasks.removeValue(forKey: id)
+                return existingTask
+            }
+            return nil
+        }
         task?.cancel()
     }
 
@@ -210,6 +223,9 @@ public final class HLSResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDel
     private func handleSegmentRequest(_ loadingRequest: AVAssetResourceLoadingRequest, segmentIndex: Int) -> Bool {
         let requestBox = LoadingRequestBox(loadingRequest)
         let requestID = ObjectIdentifier(loadingRequest)
+
+        // Reserve slot before launching Task so a fast-finishing task or immediate didCancel cannot race/leak
+        state.withLock { $0.inFlightTasks[requestID] = InFlightSlot() }
 
         let task = Task { [weak self] in
             guard let self else { return }
@@ -283,7 +299,18 @@ public final class HLSResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDel
             }
         }
 
-        state.withLock { $0.inFlightTasks[requestID] = task }
+        // Attach the task only if the slot is still live (neither finished nor cancelled before registration)
+        let shouldCancel = state.withLock { state -> Bool in
+            guard var slot = state.inFlightTasks[requestID], !slot.cancelled else {
+                return true
+            }
+            slot.task = task
+            state.inFlightTasks[requestID] = slot
+            return false
+        }
+        if shouldCancel {
+            task.cancel()
+        }
         return true
     }
 

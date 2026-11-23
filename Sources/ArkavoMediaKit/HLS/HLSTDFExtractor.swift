@@ -227,23 +227,20 @@ public actor HLSTDFExtractor {
             throw HLSTDFExtractorError.segmentIVNotFound(index: segmentIndex)
         }
 
-        // Verify policyBinding against DEK whenever policy or binding metadata is present
-        if manifest.policy != nil || manifest.policyBindingHash != nil || manifest.policyBindingAlg != nil {
-            guard let policyBase64 = manifest.policy,
-                  manifest.policyBindingAlg == "HS256",
-                  let bindingHash = manifest.policyBindingHash,
-                  let actual = Data(base64Encoded: bindingHash)
-            else {
-                throw HLSTDFExtractorError.integrityCheckFailed
-            }
-            let expected = Data(HMAC<SHA256>.authenticationCode(
-                for: Data(policyBase64.utf8),
-                using: symmetricKey
-            ))
-            let diff = zip(actual, expected).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) }
-            guard actual.count == expected.count, diff == 0 else {
-                throw HLSTDFExtractorError.integrityCheckFailed
-            }
+        // Always require and verify policyBinding against DEK (fail closed if policy or binding is stripped).
+        // Accepts both OpenTDF 5.0 raw-digest Base64(HMAC) and legacy hex-form Base64(utf8(hex(HMAC))).
+        guard let policyBase64 = manifest.policy,
+              !policyBase64.isEmpty,
+              manifest.policyBindingAlg == "HS256",
+              let bindingHash = manifest.policyBindingHash,
+              let actual = Data(base64Encoded: bindingHash),
+              StandardTDFSegmentCrypto.verifyPolicyBinding(
+                  actual: actual,
+                  policyBase64: policyBase64,
+                  symmetricKey: symmetricKey
+              )
+        else {
+            throw HLSTDFExtractorError.integrityCheckFailed
         }
 
         let ivBase64 = manifest.segmentIVs[segmentIndex]
@@ -279,24 +276,80 @@ public actor HLSTDFExtractor {
                 throw HLSTDFExtractorError.segmentTooSmall
             }
             let ciphertext = segmentData.dropLast(tagSize)
-            let tag = segmentData.suffix(tagSize)
+            let tag = Data(segmentData.suffix(tagSize))
+
+            // Verify manifest integrity metadata if present
+            if manifest.segmentHashes != nil || manifest.rootSignatureSig != nil {
+                try Self.verifyManifestSegmentIntegrity(
+                    segmentSignature: tag,
+                    segmentIndex: segmentIndex,
+                    manifest: manifest,
+                    symmetricKey: symmetricKey
+                )
+            }
 
             return try TDFCrypto.decryptPayload(
                 ciphertext: Data(ciphertext),
                 iv: iv,
-                tag: Data(tag),
+                tag: tag,
                 symmetricKey: symmetricKey
             )
         } else {
             guard iv.count == 16 else {
                 throw HLSTDFExtractorError.invalidIV
             }
-            // CBC mode (FairPlay compatible)
+            // CBC is unauthenticated at the cipher layer: require authentic HS256 segment + root integrity metadata
+            let computedSig = TDFCrypto.segmentSignature(
+                segmentCiphertext: segmentData,
+                symmetricKey: symmetricKey
+            )
+            try Self.verifyManifestSegmentIntegrity(
+                segmentSignature: computedSig,
+                segmentIndex: segmentIndex,
+                manifest: manifest,
+                symmetricKey: symmetricKey
+            )
+
             return try TDFCrypto.decryptPayloadCBC(
                 ciphertext: segmentData,
                 iv: iv,
                 symmetricKey: symmetricKey
             )
+        }
+    }
+
+    private static func verifyManifestSegmentIntegrity(
+        segmentSignature: Data,
+        segmentIndex: Int,
+        manifest: HLSManifest,
+        symmetricKey: SymmetricKey
+    ) throws {
+        guard let hashes = manifest.segmentHashes,
+              segmentIndex >= 0, segmentIndex < hashes.count,
+              let expectedSegmentHash = Data(base64Encoded: hashes[segmentIndex]),
+              StandardTDFSegmentCrypto.constantTimeEquals(expectedSegmentHash, segmentSignature),
+              manifest.rootSignatureAlg == "HS256",
+              let rootSigBase64 = manifest.rootSignatureSig,
+              let actualRootSig = Data(base64Encoded: rootSigBase64)
+        else {
+            throw HLSTDFExtractorError.integrityCheckFailed
+        }
+        var rawHashes: [Data] = []
+        rawHashes.reserveCapacity(hashes.count)
+        for hashB64 in hashes {
+            guard let raw = Data(base64Encoded: hashB64) else {
+                throw HLSTDFExtractorError.integrityCheckFailed
+            }
+            rawHashes.append(raw)
+        }
+        let expectedRootBase64 = TDFCrypto.rootSignatureBase64(
+            rawSegmentSignatures: rawHashes,
+            symmetricKey: symmetricKey
+        )
+        guard let expectedRootSig = Data(base64Encoded: expectedRootBase64),
+              StandardTDFSegmentCrypto.constantTimeEquals(actualRootSig, expectedRootSig)
+        else {
+            throw HLSTDFExtractorError.integrityCheckFailed
         }
     }
 
@@ -343,6 +396,25 @@ public actor HLSTDFExtractor {
         let policyBindingAlg = policyBinding?["alg"]
         let policyBindingHash = policyBinding?["hash"]
 
+        // Extract optional OpenTDF integrityInformation (required for CBC authentication)
+        var segmentHashes: [String]?
+        var segmentHashAlg: String?
+        var rootSignatureAlg: String?
+        var rootSignatureSig: String?
+        if let integrityInfo = encInfo["integrityInformation"] as? [String: Any] {
+            segmentHashAlg = integrityInfo["segmentHashAlg"] as? String
+            if let rootSig = integrityInfo["rootSignature"] as? [String: Any] {
+                rootSignatureAlg = rootSig["alg"] as? String
+                rootSignatureSig = rootSig["sig"] as? String
+            }
+            if let segments = integrityInfo["segments"] as? [[String: Any]] {
+                let hashes = segments.compactMap { $0["hash"] as? String }
+                if hashes.count == segments.count, !hashes.isEmpty {
+                    segmentHashes = hashes
+                }
+            }
+        }
+
         // Extract HLS-specific metadata
         guard let meta = json["meta"] as? [String: Any],
               let hlsInfo = meta["hls"] as? [String: Any],
@@ -367,7 +439,11 @@ public actor HLSTDFExtractor {
             kasURL: resolvedKASURL,
             policy: policy,
             policyBindingAlg: policyBindingAlg,
-            policyBindingHash: policyBindingHash
+            policyBindingHash: policyBindingHash,
+            segmentHashes: segmentHashes,
+            segmentHashAlg: segmentHashAlg,
+            rootSignatureAlg: rootSignatureAlg,
+            rootSignatureSig: rootSignatureSig
         )
     }
 }
@@ -439,6 +515,18 @@ public struct HLSManifest: Sendable {
     /// Policy binding hash (HMAC-SHA256 of policy)
     public let policyBindingHash: String?
 
+    /// Base64-encoded per-segment integrity hashes (GMAC or HS256)
+    public let segmentHashes: [String]?
+
+    /// Integrity hash algorithm for segments (e.g., "GMAC", "HS256")
+    public let segmentHashAlg: String?
+
+    /// Integrity root signature algorithm (e.g., "HS256")
+    public let rootSignatureAlg: String?
+
+    /// Base64-encoded root signature over concatenated raw segment hashes
+    public let rootSignatureSig: String?
+
     public init(
         assetID: String,
         wrappedKey: String,
@@ -450,7 +538,11 @@ public struct HLSManifest: Sendable {
         kasURL: URL,
         policy: String? = nil,
         policyBindingAlg: String? = nil,
-        policyBindingHash: String? = nil
+        policyBindingHash: String? = nil,
+        segmentHashes: [String]? = nil,
+        segmentHashAlg: String? = nil,
+        rootSignatureAlg: String? = nil,
+        rootSignatureSig: String? = nil
     ) {
         self.assetID = assetID
         self.wrappedKey = wrappedKey
@@ -463,6 +555,10 @@ public struct HLSManifest: Sendable {
         self.policy = policy
         self.policyBindingAlg = policyBindingAlg
         self.policyBindingHash = policyBindingHash
+        self.segmentHashes = segmentHashes
+        self.segmentHashAlg = segmentHashAlg
+        self.rootSignatureAlg = rootSignatureAlg
+        self.rootSignatureSig = rootSignatureSig
     }
 }
 

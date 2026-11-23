@@ -63,16 +63,13 @@ public struct HLSPlaylistGenerator {
         ]
 
         for segment in segments {
-            // For Standard TDF, use a custom key URL without cleartext PII or session identifiers
-            if let keyURL = generateKeyURL(assetID: assetID, segmentIndex: segment.index) {
+            // For Standard TDF, emit #EXT-X-KEY only when the segment carries a valid 16-byte AES-128 IV
+            // (RFC 8216 §4.3.2.4); omitting IV on METHOD=AES-128 would cause players to derive an IV from the
+            // media sequence number, which is invalid for 12-byte GCM nonces.
+            if segment.iv.count == 16, let keyURL = generateKeyURL(assetID: assetID, segmentIndex: segment.index) {
                 let sanitizedKeyURI = Self.sanitizedQuotedAttribute(keyURL.absoluteString)
-                // RFC 8216 §4.3.2.4: AES-128 IV must be 16 bytes (128-bit); omit non-16-byte IVs (e.g., 12-byte GCM nonces)
-                if segment.iv.count == 16 {
-                    let ivHex = segment.iv.map { String(format: "%02x", $0) }.joined()
-                    lines.append("#EXT-X-KEY:METHOD=AES-128,URI=\"\(sanitizedKeyURI)\",IV=0x\(ivHex)")
-                } else {
-                    lines.append("#EXT-X-KEY:METHOD=AES-128,URI=\"\(sanitizedKeyURI)\"")
-                }
+                let ivHex = segment.iv.map { String(format: "%02x", $0) }.joined()
+                lines.append("#EXT-X-KEY:METHOD=AES-128,URI=\"\(sanitizedKeyURI)\",IV=0x\(ivHex)")
             }
 
             // Add segment - note this points to a .tdf file, not raw .ts
@@ -95,12 +92,13 @@ public struct HLSPlaylistGenerator {
         variant: PlaylistVariant
     ) -> String {
         let maxDur = segments.map(\.duration).filter { $0.isFinite && $0 > 0 }.max() ?? 10.0
+        let safeCeil = min(ceil(maxDur), Double(Int.max / 2))
         return generateMediaPlaylist(
             segments: segments,
             assetID: assetID,
             userID: userID,
             sessionID: sessionID,
-            targetDuration: max(1, Int(ceil(maxDur)))
+            targetDuration: max(1, Int(safeCeil))
         )
     }
 

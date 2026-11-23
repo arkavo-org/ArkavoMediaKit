@@ -142,7 +142,10 @@ public actor MediaSessionManager {
             try? await endSession(sessionId: sessionId)
         }
 
-        stopHeartbeat()
+        // Only stop the heartbeat if no new session was started concurrently while ending prior sessions.
+        if activeSessions.isEmpty {
+            stopHeartbeat()
+        }
     }
 
     /// Get active session count
