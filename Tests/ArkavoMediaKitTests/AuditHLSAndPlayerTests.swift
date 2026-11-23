@@ -2,6 +2,7 @@ import AVFoundation
 import CryptoKit
 import Foundation
 import OpenTDFKit
+import Synchronization
 import Testing
 import ZIPFoundation
 @testable import ArkavoMediaKit
@@ -70,6 +71,93 @@ struct AuditHLSAndPlayerTests {
         #expect(HLSResourceLoaderDelegate.safeByteRange(requestedOffset: 200, requestedLength: 10, dataCount: 100) == 100 ..< 100)
         // Normal range
         #expect(HLSResourceLoaderDelegate.safeByteRange(requestedOffset: 10, requestedLength: 25, dataCount: 100) == 10 ..< 35)
+    }
+
+    @Test("HLSResourceLoaderDelegate coalesces concurrent onKeyRequest calls and retries after transient failure")
+    func resourceLoaderCoalescesConcurrentKeyRequests() async throws {
+        enum TransientKeyError: Error, Equatable { case unavailable }
+
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("audit-hls-coalesce-\(UUID().uuidString)")
+        let manifest = HLSManifest(
+            assetID: "asset-coalesce",
+            wrappedKey: "d2s=",
+            algorithm: "AES-256-GCM",
+            segmentIVs: [Data(repeating: 0x01, count: 12).base64EncodedString()],
+            segmentCount: 1,
+            totalDuration: 6.0,
+            encryptionMode: "GCM",
+            kasURL: URL(string: "https://kas.example.com")!
+        )
+        let localAsset = LocalHLSAsset(
+            playlistURL: tempDir.appendingPathComponent("playlist.m3u8"),
+            segmentURLs: [tempDir.appendingPathComponent("segments/0.enc")],
+            manifestURL: tempDir.appendingPathComponent("manifest.json"),
+            manifest: manifest,
+            outputDirectory: tempDir
+        )
+        let extractor = HLSTDFExtractor(kasURL: URL(string: "https://kas.example.com")!)
+        let delegate = HLSResourceLoaderDelegate(localAsset: localAsset, extractor: extractor)
+
+        let expectedKey = SymmetricKey(size: .bits256)
+        let expectedBytes = expectedKey.withUnsafeBytes { Data($0) }
+        let invocations = Mutex(0)
+        let entered = Mutex<CheckedContinuation<Void, Never>?>(nil)
+        let release = Mutex<CheckedContinuation<Void, Never>?>(nil)
+
+        delegate.onKeyRequest = { _ in
+            let attempt = invocations.withLock { count -> Int in
+                count += 1
+                return count
+            }
+            entered.withLock { $0.take() }?.resume()
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                release.withLock { $0 = cont }
+            }
+            if attempt == 1 {
+                throw TransientKeyError.unavailable
+            }
+            return expectedKey
+        }
+
+        // 1. First wave: 4 concurrent callers share one failing onKeyRequest invocation
+        let wave1 = (0 ..< 4).map { _ in
+            Task { try await delegate.resolveSymmetricKey() }
+        }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            entered.withLock { $0 = cont }
+        }
+        // Let other concurrent callers join the same in-flight task
+        try await Task.sleep(for: .milliseconds(25))
+        release.withLock { $0.take() }?.resume()
+
+        for task in wave1 {
+            await #expect(throws: TransientKeyError.unavailable) {
+                _ = try await task.value
+            }
+        }
+        #expect(invocations.withLock { $0 } == 1, "Concurrent callers before failure must coalesce onto 1 invocation")
+
+        // 2. Second wave: after transient failure clears the in-flight task, 5 concurrent callers retry and share 1 success
+        let wave2 = (0 ..< 5).map { _ in
+            Task { try await delegate.resolveSymmetricKey() }
+        }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            entered.withLock { $0 = cont }
+        }
+        try await Task.sleep(for: .milliseconds(25))
+        release.withLock { $0.take() }?.resume()
+
+        for task in wave2 {
+            let resolved = try await task.value
+            #expect(resolved.withUnsafeBytes { Data($0) } == expectedBytes)
+        }
+        #expect(invocations.withLock { $0 } == 2, "Retry wave must coalesce onto a single second invocation")
+
+        // 3. Cached key serves subsequent callers without invoking onKeyRequest again
+        let cached = try await delegate.resolveSymmetricKey()
+        #expect(cached.withUnsafeBytes { Data($0) } == expectedBytes)
+        #expect(invocations.withLock { $0 } == 2)
     }
 
     // MARK: - TDF3StreamingPlayer.waitForReadyToPlay KVO cancellation & synchronization

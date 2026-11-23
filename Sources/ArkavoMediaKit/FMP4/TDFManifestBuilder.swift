@@ -206,13 +206,20 @@ public final class TDFManifestBuilder: Sendable {
         request.cachePolicy = .reloadIgnoringLocalCacheData
 
         let session = urlSession ?? URLSession.shared
-        let (data, response) = try await session.data(for: request, delegate: RedirectRefusal())
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.boundedData(
+                for: request,
+                maxBytes: Self.maxPublicKeyResponseBytes,
+                delegate: RedirectRefusal()
+            )
+        } catch BoundedResponseError.responseTooLarge {
+            throw TDFError.invalidPublicKeyFormat
+        }
 
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw TDFError.publicKeyFetchFailed
-        }
-        guard data.count <= Self.maxPublicKeyResponseBytes else {
-            throw TDFError.invalidPublicKeyFormat
         }
 
         // Parse response - expects PEM or JSON with public key

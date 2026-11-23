@@ -203,16 +203,22 @@ public enum TDFProtectionCore {
         request.assumesHTTP3Capable = true
         request.timeoutInterval = 30
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        let (data, response) = try await session.data(for: request, delegate: RedirectRefusal())
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.boundedData(
+                for: request,
+                maxBytes: maxKASPublicKeyResponseBytes,
+                delegate: RedirectRefusal()
+            )
+        } catch BoundedResponseError.responseTooLarge {
+            throw TDFProtectionCoreError.invalidKASResponse
+        }
 
         guard let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode == 200
         else {
             throw TDFProtectionCoreError.kasKeyFetchFailed
-        }
-
-        guard data.count <= maxKASPublicKeyResponseBytes else {
-            throw TDFProtectionCoreError.invalidKASResponse
         }
 
         // Try both common key names in response

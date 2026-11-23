@@ -163,7 +163,35 @@ struct AuditFMP4AndConcurrencyTests {
             _ = try encryptor.encryptVideoSample(zeroLengthNAL, nalLengthSize: 4, sliceHeaders: sliceHeaders)
         }
 
-        // 4. AVCDecoderConfigurationRecord handles non-zero startIndex SPS slice safely
+        // 4. Invalid CBCS patterns throw invalidPattern from encryptVideoSample instead of trapping in init
+        for (badCrypt, badSkip) in [(0, 9), (-1, 9), (1, -1), (16, 0), (1, 16)] {
+            let badEncryptor = CBCSEncryptor(key: key, iv: iv, cryptBlocks: badCrypt, skipBlocks: badSkip)
+            #expect(throws: CBCSEncryptor.Failure.invalidPattern(cryptBlocks: badCrypt, skipBlocks: badSkip)) {
+                _ = try badEncryptor.encryptVideoSample(idrSample, nalLengthSize: 4, sliceHeaders: sliceHeaders)
+            }
+        }
+
+        // 5. FMP4RecordingProtectionService.checkParameterSets throws instead of trapping on oversized avcC counts
+        #expect(throws: FMP4ProtectionError.self) {
+            try FMP4RecordingProtectionService.checkParameterSets(
+                sps: Array(repeating: H264TestStream.sps, count: 32),
+                pps: [H264TestStream.pps]
+            )
+        }
+        #expect(throws: FMP4ProtectionError.self) {
+            try FMP4RecordingProtectionService.checkParameterSets(
+                sps: [H264TestStream.sps],
+                pps: Array(repeating: H264TestStream.pps, count: 256)
+            )
+        }
+        #expect(throws: FMP4ProtectionError.self) {
+            try FMP4RecordingProtectionService.checkParameterSets(
+                sps: [Data(repeating: 0x67, count: Int(UInt16.max) + 1)],
+                pps: [H264TestStream.pps]
+            )
+        }
+
+        // 6. AVCDecoderConfigurationRecord handles non-zero startIndex SPS slice safely
         let spsSlice = (Data([0xFF, 0xFF]) + H264TestStream.sps).dropFirst(2)
         #expect(spsSlice.startIndex == 2)
         let avcC = AVCDecoderConfigurationRecord(sps: [spsSlice], pps: [H264TestStream.pps])
@@ -364,6 +392,7 @@ struct AuditFMP4AndConcurrencyTests {
         let host = "msm-\(UUID().uuidString.lowercased()).example.com"
         let heartbeatEntered = Mutex<CheckedContinuation<Void, Never>?>(nil)
         let heartbeatRelease = Mutex<CheckedContinuation<Void, Never>?>(nil)
+        let deleteAttempts = Mutex(0)
 
         ConcurrencyStubURLProtocol.register(host: host) { req, _ in
             let url = req.url!
@@ -380,8 +409,13 @@ struct AuditFMP4AndConcurrencyTests {
                 let resp = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
                 return (resp, Data())
             }
-            // DELETE session returns 500 to also test local cleanup on failed server endSession
-            let resp = HTTPURLResponse(url: url, statusCode: 500, httpVersion: "HTTP/1.1", headerFields: nil)!
+            // First DELETE returns 500 (transient failure); retry returns 200
+            let attempt = deleteAttempts.withLock { count -> Int in
+                count += 1
+                return count
+            }
+            let status = attempt == 1 ? 500 : 200
+            let resp = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!
             return (resp, Data())
         }
         defer { ConcurrencyStubURLProtocol.unregister(host: host) }
@@ -425,6 +459,16 @@ struct AuditFMP4AndConcurrencyTests {
         heartbeatRelease.withLock { $0.take() }?.resume()
         await hbTask2.value
         #expect(await manager.activeSessionCount == 0, "In-flight heartbeat must not resurrect ended session")
+
+        // 2b. Retrying endSession after transient 500 succeeds on 200, then subsequent call throws SessionError
+        try await manager.endSession(sessionId: sid)
+        #expect(deleteAttempts.withLock { $0 } == 2, "Retry after 500 must re-issue server DELETE")
+        #expect(await manager.activeSessionCount == 0)
+
+        await #expect(throws: SessionError.self) {
+            try await manager.endSession(sessionId: sid)
+        }
+        #expect(deleteAttempts.withLock { $0 } == 2, "After successful server cleanup, endSession must throw SessionError without hitting server")
 
         // 3. Ending unknown non-UUID session throws sessionNotFoundWithID (not random UUID)
         await #expect(throws: SessionError.self) {
@@ -617,14 +661,22 @@ struct AuditFMP4AndConcurrencyTests {
 
     #if os(macOS)
     private static func testVideoGeneratorBinaryURL() -> URL? {
-        // Locate built TestVideoGenerator next to the running test bundle in SwiftPM's build directory
         let bundleURL = Bundle(for: AuditBundleLocator.self).bundleURL
         let buildProductsDir = bundleURL.deletingLastPathComponent()
-        let candidate = buildProductsDir.appendingPathComponent("TestVideoGenerator")
-        if FileManager.default.isExecutableFile(atPath: candidate.path) {
-            return candidate
-        }
-        return nil
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+
+        let candidates = [
+            buildProductsDir.appendingPathComponent("TestVideoGenerator"),
+            packageRoot.appendingPathComponent(".build/debug/TestVideoGenerator"),
+            packageRoot.appendingPathComponent(".build/arm64-apple-macosx/debug/TestVideoGenerator"),
+            packageRoot.appendingPathComponent(".build/x86_64-apple-macosx/debug/TestVideoGenerator"),
+            URL(fileURLWithPath: ".build/debug/TestVideoGenerator"),
+            URL(fileURLWithPath: ".build/arm64-apple-macosx/debug/TestVideoGenerator"),
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
     }
 
     @Test("TestVideoGenerator rejects --port 0, binds loopback-only, confines path traversal/symlinks, and encrypts B2")
@@ -700,6 +752,29 @@ struct AuditFMP4AndConcurrencyTests {
         let okResp = try #require(readyResponse, "Server should listen on 127.0.0.1:\(port)")
         #expect(okResp.contains("HTTP/1.1 200 OK"))
         #expect(!okResp.contains("Access-Control-Allow-Origin: *"), "Must not emit wildcard CORS header")
+
+        // Verify via lsof that the running server process listens strictly on 127.0.0.1:<port> (not 0.0.0.0 / *)
+        let lsofProc = Process()
+        let lsofPipe = Pipe()
+        lsofProc.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        lsofProc.arguments = ["-nP", "-a", "-p", "\(serverProc.processIdentifier)", "-iTCP:\(port)", "-sTCP:LISTEN"]
+        lsofProc.standardOutput = lsofPipe
+        lsofProc.standardError = FileHandle.nullDevice
+        try lsofProc.run()
+        let lsofData = lsofPipe.fileHandleForReading.readDataToEndOfFile()
+        lsofProc.waitUntilExit()
+        #expect(lsofProc.terminationStatus == 0, "lsof should inspect the listening TestVideoGenerator process")
+        let lsofOutput = String(decoding: lsofData, as: UTF8.self)
+        let listenLines = lsofOutput
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .filter { $0.contains("(LISTEN)") }
+        #expect(!listenLines.isEmpty, "Expected a TCP LISTEN socket on port \(port); lsof output:\n\(lsofOutput)")
+        for line in listenLines {
+            #expect(line.contains("127.0.0.1:\(port)"), "Server must bind strictly to 127.0.0.1:\(port), got: \(line)")
+            #expect(!line.contains("*:\(port)") && !line.contains("0.0.0.0:\(port)") && !line.contains("[::]:\(port)"),
+                    "Server must not bind to wildcard interface, got: \(line)")
+        }
 
         // Path traversal, percent-encoded traversal, and symlink escape must all be blocked (403)
         for attackPath in ["/../secret.txt", "/%2e%2e/secret.txt", "/escape.txt"] {

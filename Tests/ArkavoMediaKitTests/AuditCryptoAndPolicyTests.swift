@@ -234,6 +234,33 @@ struct AuditCryptoAndPolicyTests {
             )
         }
 
+        // Malformed purchasedAt metadata must fail closed instead of falling back to session.createdAt
+        for malformedDate in ["not-a-date", "", "2026-99-99T00:00:00Z"] {
+            let malformedSession = MediaSession(
+                userID: "u1", assetID: "a1",
+                metadata: ["purchasedAt": malformedDate, "subscriptionTier": "premium"]
+            )
+            #expect(throws: PolicyViolation.rentalWindowExpired) {
+                try rentalPolicy.validate(
+                    session: malformedSession, firstPlayTimestamp: nil, currentActiveStreams: 1,
+                    deviceInfo: DeviceInfo()
+                )
+            }
+        }
+
+        // Valid fractional-seconds ISO8601 purchasedAt within purchaseWindow passes
+        let fractionalFormatter = ISO8601DateFormatter()
+        fractionalFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let recentPurchase = fractionalFormatter.string(from: Date(timeIntervalSinceNow: -5))
+        let validFractionalSession = MediaSession(
+            userID: "u1", assetID: "a1",
+            metadata: ["purchasedAt": recentPurchase, "subscriptionTier": "premium"]
+        )
+        try rentalPolicy.validate(
+            session: validFractionalSession, firstPlayTimestamp: nil, currentActiveStreams: 1,
+            deviceInfo: DeviceInfo()
+        )
+
         let wrongTierSession = MediaSession(userID: "u1", assetID: "a1", metadata: ["subscriptionTier": "basic"])
         let tierPolicy = MediaDRMPolicy(requiredSubscriptionTier: "premium")
         #expect(throws: PolicyViolation.subscriptionRequired(tier: "premium")) {

@@ -32,6 +32,9 @@ public final class CBCSEncryptor: Sendable {
         case malformedSample
         /// The system's random source failed, with this status: there is no key.
         case randomBytesUnavailable(OSStatus)
+        /// The CBCS pattern (`cryptBlocks:skipBlocks`) is outside ISO/IEC 23001-7 limits
+        /// (`0...15` each, and `cryptBlocks == 0` is only valid with `skipBlocks == 0`).
+        case invalidPattern(cryptBlocks: Int, skipBlocks: Int)
     }
 
     /// Encryption result with subsample map
@@ -66,15 +69,23 @@ public final class CBCSEncryptor: Sendable {
     public init(key: Data, iv: Data, cryptBlocks: Int = 1, skipBlocks: Int = 9) {
         precondition(key.count == 16, "Key must be 16 bytes for AES-128")
         precondition(iv.count == 16, "IV must be 16 bytes")
-        precondition(cryptBlocks >= 0 && skipBlocks >= 0, "Pattern block counts must be non-negative")
-        precondition(cryptBlocks <= 15 && skipBlocks <= 15, "Pattern block counts must fit in 4-bit tenc fields (0...15)")
-        precondition(cryptBlocks > 0 || skipBlocks == 0, "Invalid CBCS pattern 0:\(skipBlocks): cryptBlocks=0 is only valid with skipBlocks=0")
 
         // Normalize into fresh contiguous zero-based Data so slices with non-zero startIndex are safe
         self.key = Data(key)
         self.iv = Data(iv)
         self.cryptBlocks = cryptBlocks
         self.skipBlocks = skipBlocks
+    }
+
+    /// Validates that the configured CBCS pattern fits in ISO/IEC 23001-7 4-bit `tenc` fields
+    /// and is not an unencrypted `0:N` (`N > 0`) pattern.
+    private func validatePattern() throws {
+        guard (0 ... 15).contains(cryptBlocks),
+              (0 ... 15).contains(skipBlocks),
+              cryptBlocks > 0 || skipBlocks == 0
+        else {
+            throw Failure.invalidPattern(cryptBlocks: cryptBlocks, skipBlocks: skipBlocks)
+        }
     }
 
     // MARK: - Video Encryption (H.264)
@@ -89,9 +100,10 @@ public final class CBCSEncryptor: Sendable {
     ///   - nalLengthSize: Size of NAL unit length field (must be 1, 2, or 4; typically 4)
     ///   - sliceHeaders: Measures slice headers, from the stream's parameter sets
     /// - Returns: Encrypted data and subsample map
-    /// - Throws: `Failure.malformedSample` or `H264SliceHeaderParser.Failure`
+    /// - Throws: `Failure.invalidPattern`, `Failure.malformedSample`, or `H264SliceHeaderParser.Failure`
     public func encryptVideoSample(_ sample: Data, nalLengthSize: Int = 4,
                                    sliceHeaders: H264SliceHeaderParser) throws -> EncryptionResult {
+        try validatePattern()
         let bytes = [UInt8](sample)
         let nalUnits = try parseNALUnits(bytes, lengthSize: nalLengthSize)
 
@@ -408,8 +420,12 @@ extension CBCSEncryptor {
 extension CBCSEncryptor.Failure: LocalizedError {
     public var errorDescription: String? {
         switch self {
-        case .malformedSample: "A video sample's NAL unit lengths do not match its size."
-        case let .randomBytesUnavailable(status): "The system's random source failed (status \(status))."
+        case .malformedSample:
+            "A video sample's NAL unit lengths do not match its size."
+        case let .randomBytesUnavailable(status):
+            "The system's random source failed (status \(status))."
+        case let .invalidPattern(cryptBlocks, skipBlocks):
+            "Invalid CBCS pattern \(cryptBlocks):\(skipBlocks) (expected 0...15 each, and cryptBlocks=0 only with skipBlocks=0)."
         }
     }
 }

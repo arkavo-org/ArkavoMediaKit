@@ -571,4 +571,129 @@ struct AuditSecurityNetworkTests {
             _ = try FairPlayComponents.componentIDs(ofManifestJSON: nonFinite)
         }
     }
+
+    @Test("Bounded streaming response reader rejects oversized bodies and oversized Content-Length headers")
+    func boundedStreamingResponseLimits() async throws {
+        let host = "bounded-\(UUID().uuidString.lowercased()).example.com"
+        AuditStubURLProtocol.register(host: host) { req, _ in
+            let url = req.url!
+            switch url.path {
+            case "/exact":
+                let resp = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+                return (resp, Data(repeating: 0x41, count: 16), nil)
+            case "/over-body":
+                // No Content-Length header; body exceeds limit while streaming
+                let resp = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+                return (resp, Data(repeating: 0x42, count: 17), nil)
+            case "/over-header":
+                // Oversized Content-Length header rejected upfront before body is buffered
+                let resp = HTTPURLResponse(
+                    url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Length": "1048576"]
+                )!
+                return (resp, Data([0x01]), nil)
+            case "/media/v1/certificate":
+                let resp = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+                return (resp, Data(repeating: 0x30, count: 64 * 1024 + 1), nil)
+            case "/kas/v2/kas_public_key":
+                let resp = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+                return (resp, Data(repeating: 0x43, count: 64 * 1024 + 1), nil)
+            case "/media/v1/envelope-key":
+                let resp = HTTPURLResponse(
+                    url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Length": "\(64 * 1024 + 1)"]
+                )!
+                return (resp, Data("{}".utf8), nil)
+            case "/.well-known/opentdf-configuration":
+                // Oversized well-known Content-Length (> 1 MiB) must be rejected without buffering
+                let resp = HTTPURLResponse(
+                    url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Length": "\(2 * 1024 * 1024)"]
+                )!
+                return (resp, Data("{}".utf8), nil)
+            case "/oversized-cert/media/v1/certificate":
+                let resp = HTTPURLResponse(
+                    url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Length": "\(256 * 1024 + 1)"]
+                )!
+                return (resp, Data([0x30]), nil)
+            default:
+                let resp = HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: nil)!
+                return (resp, Data(), nil)
+            }
+        }
+        defer { AuditStubURLProtocol.unregister(host: host) }
+
+        let session = AuditStubURLProtocol.session()
+        let baseURL = URL(string: "https://\(host)")!
+
+        // 1. Direct URLSession.boundedData boundary checks
+        let (exactData, _) = try await session.boundedData(
+            for: URLRequest(url: baseURL.appendingPathComponent("exact")),
+            maxBytes: 16,
+            delegate: RedirectRefusal()
+        )
+        #expect(exactData.count == 16)
+
+        await #expect(throws: BoundedResponseError.responseTooLarge(limit: 16)) {
+            _ = try await session.boundedData(
+                for: URLRequest(url: baseURL.appendingPathComponent("over-body")),
+                maxBytes: 16,
+                delegate: RedirectRefusal()
+            )
+        }
+
+        await #expect(throws: BoundedResponseError.responseTooLarge(limit: 16)) {
+            _ = try await session.boundedData(
+                for: URLRequest(url: baseURL.appendingPathComponent("over-header")),
+                maxBytes: 16,
+                delegate: RedirectRefusal()
+            )
+        }
+
+        // 2. FairPlayKeyClient, TDFProtectionCore, TDFManifestBuilder, and URLSessionFairPlayHTTP + FairPlayEnvelopeKey
+        let fpClient = FairPlayKeyClient(serverURL: baseURL, authToken: "tok", urlSession: session)
+        await #expect(throws: FairPlayKeyClient.FairPlayKeyError.certificateFetchFailed) {
+            _ = try await fpClient.fetchCertificate()
+        }
+
+        await #expect {
+            _ = try await TDFProtectionCore.fetchKASRSAPublicKey(kasURL: baseURL, session: session)
+        } throws: { error in
+            if case TDFProtectionCoreError.invalidKASResponse = error { return true }
+            return false
+        }
+
+        let manifestBuilder = TDFManifestBuilder(kasURL: baseURL, urlSession: session)
+        await #expect(throws: TDFManifestBuilder.TDFError.invalidPublicKeyFormat) {
+            _ = try await manifestBuilder.fetchKASPublicKey()
+        }
+
+        let stubConfig = URLSessionConfiguration.ephemeral
+        stubConfig.protocolClasses = [AuditStubURLProtocol.self]
+        let fpHTTP = URLSessionFairPlayHTTP(configuration: stubConfig)
+        await #expect(throws: FairPlayEnvelopeKeyError.invalidResponse("response exceeds size limit")) {
+            _ = try await FairPlayEnvelopeKey.fetch(kasURL: baseURL, http: fpHTTP)
+        }
+
+        // 3. TDFContentKeyDelegate rejects oversized certificate Content-Length via URLSessionFairPlayHTTP
+        let policy = Data(#"{"uuid":"3f1c9e2a-7b4d-4e8f-9a21-5c6d7e8f9a0b","body":{}}"#.utf8)
+        let manifest = try TDFContentKeyDelegateComponentTests.manifest(policy: policy, accesses: 1)
+        let delegate = TDFContentKeyDelegate(
+            manifest: manifest,
+            authToken: "tok",
+            serverURL: baseURL.appendingPathComponent("oversized-cert"),
+            http: fpHTTP
+        )
+        let certReq = FakeKeyRequest("skd://3f1c9e2a-7b4d-4e8f-9a21-5c6d7e8f9a0b")
+        await delegate.handle(certReq)
+        #expect(certReq.failures == 1)
+
+        // 4. StandardTDFKASKeyClient rejects oversized well-known Content-Length and falls back to Connect route
+        let kasClient = StandardTDFKASKeyClient(urlSession: session, allowedKASOrigins: ["https://\(host)"])
+        let kasManifest = Self.makeManifest(kasURL: "https://\(host)/kas")
+        await #expect(throws: (any Error).self) {
+            _ = try await kasClient.unwrapKey(manifest: kasManifest, authToken: "tok")
+        }
+    }
 }

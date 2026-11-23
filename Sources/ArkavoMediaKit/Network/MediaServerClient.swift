@@ -3,6 +3,9 @@ import os.log
 
 /// HTTP client for media server API endpoints
 public actor MediaServerClient {
+    /// Maximum allowed response size for media server API calls (1 MiB)
+    private static let maxResponseBytes = 1 * 1024 * 1024
+
     private let baseURL: URL
     private let session: URLSession
     private let ownsSession: Bool
@@ -60,6 +63,30 @@ public actor MediaServerClient {
         return url
     }
 
+    private func boundedRequest(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.boundedData(
+                for: request,
+                maxBytes: Self.maxResponseBytes,
+                delegate: RedirectRefusal()
+            )
+        } catch BoundedResponseError.responseTooLarge {
+            throw MediaServerError.invalidResponse
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw MediaServerError.invalidResponse
+        }
+
+        guard (200 ... 299).contains(httpResponse.statusCode) else {
+            throw MediaServerError.httpError(statusCode: httpResponse.statusCode)
+        }
+
+        return (data, httpResponse)
+    }
+
     /// Start a new playback session
     /// - Parameters:
     ///   - userID: User identifier
@@ -97,15 +124,7 @@ public actor MediaServerClient {
 
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await session.data(for: request, delegate: RedirectRefusal())
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw MediaServerError.invalidResponse
-        }
-
-        guard (200 ... 299).contains(httpResponse.statusCode) else {
-            throw MediaServerError.httpError(statusCode: httpResponse.statusCode)
-        }
+        let (data, _) = try await boundedRequest(request)
 
         let decoded = try decoder.decode(SessionStartResponse.self, from: data)
         try InputValidator.validateSessionID(decoded.sessionId)
@@ -141,15 +160,7 @@ public actor MediaServerClient {
 
         request.httpBody = try encoder.encode(body)
 
-        let (data, response) = try await session.data(for: request, delegate: RedirectRefusal())
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw MediaServerError.invalidResponse
-        }
-
-        guard (200 ... 299).contains(httpResponse.statusCode) else {
-            throw MediaServerError.httpError(statusCode: httpResponse.statusCode)
-        }
+        let (data, _) = try await boundedRequest(request)
 
         return try decoder.decode(KeyRequestResponse.self, from: data)
     }
@@ -173,15 +184,7 @@ public actor MediaServerClient {
         let body = HeartbeatRequest(state: state, position: position)
         request.httpBody = try encoder.encode(body)
 
-        let (_, response) = try await session.data(for: request, delegate: RedirectRefusal())
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw MediaServerError.invalidResponse
-        }
-
-        guard (200 ... 299).contains(httpResponse.statusCode) else {
-            throw MediaServerError.httpError(statusCode: httpResponse.statusCode)
-        }
+        _ = try await boundedRequest(request)
     }
 
     /// End playback session
@@ -192,15 +195,7 @@ public actor MediaServerClient {
         var request = URLRequest(url: url)
         request.httpMethod = "DELETE"
 
-        let (_, response) = try await session.data(for: request, delegate: RedirectRefusal())
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw MediaServerError.invalidResponse
-        }
-
-        guard (200 ... 299).contains(httpResponse.statusCode) else {
-            throw MediaServerError.httpError(statusCode: httpResponse.statusCode)
-        }
+        _ = try await boundedRequest(request)
     }
 }
 

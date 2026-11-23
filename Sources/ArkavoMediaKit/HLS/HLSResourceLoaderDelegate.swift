@@ -27,9 +27,16 @@ public final class HLSResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDel
         var cancelled = false
     }
 
+    private struct InFlightKeyRequest: Sendable {
+        let id: UInt64
+        let task: Task<SymmetricKey, Error>
+    }
+
     private struct State: Sendable {
         var symmetricKey: SymmetricKey?
         var onKeyRequest: KeyCallbackBox?
+        var inFlightKeyRequest: InFlightKeyRequest?
+        var nextKeyRequestID: UInt64 = 0
         var inFlightTasks: [ObjectIdentifier: InFlightSlot] = [:]
     }
 
@@ -65,7 +72,67 @@ public final class HLSResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDel
     ///
     /// Call this after obtaining the key from KAS or FairPlay
     public func setSymmetricKey(_ key: SymmetricKey) {
-        state.withLock { $0.symmetricKey = key }
+        state.withLock {
+            $0.symmetricKey = key
+            $0.inFlightKeyRequest = nil
+        }
+    }
+
+    /// Resolves the symmetric key, coalescing concurrent `onKeyRequest` lookups onto a single shared task.
+    /// Clears the in-flight task upon completion or failure so retries work after transient errors.
+    func resolveSymmetricKey() async throws -> SymmetricKey {
+        enum Resolution {
+            case cached(SymmetricKey)
+            case inFlight(Task<SymmetricKey, Error>)
+            case missing
+        }
+
+        let resolution: Resolution = state.withLock { state in
+            if let cached = state.symmetricKey {
+                return .cached(cached)
+            }
+            if let existing = state.inFlightKeyRequest {
+                return .inFlight(existing.task)
+            }
+            guard let callback = state.onKeyRequest else {
+                return .missing
+            }
+            state.nextKeyRequestID &+= 1
+            let requestID = state.nextKeyRequestID
+            let manifest = self.localAsset.manifest
+            let task = Task<SymmetricKey, Error> { [weak self] in
+                do {
+                    let key = try await callback.handler(manifest)
+                    self?.state.withLock { state in
+                        if state.symmetricKey == nil {
+                            state.symmetricKey = key
+                        }
+                        if state.inFlightKeyRequest?.id == requestID {
+                            state.inFlightKeyRequest = nil
+                        }
+                    }
+                    return key
+                } catch {
+                    self?.state.withLock { state in
+                        if state.inFlightKeyRequest?.id == requestID {
+                            state.inFlightKeyRequest = nil
+                        }
+                    }
+                    throw error
+                }
+            }
+            state.inFlightKeyRequest = InFlightKeyRequest(id: requestID, task: task)
+            return .inFlight(task)
+        }
+
+        switch resolution {
+        case let .cached(key):
+            return key
+        case let .inFlight(task):
+            return try await task.value
+        case .missing:
+            throw HLSResourceLoaderError.keyNotAvailable
+        }
     }
 
     // MARK: - URL Routing & Range Helpers
@@ -241,20 +308,9 @@ public final class HLSResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDel
                     return
                 }
 
-                // Obtain the symmetric key without blocking a dispatch queue
-                let (cachedKey, keyCallback) = state.withLock { ($0.symmetricKey, $0.onKeyRequest) }
-                let symmetricKey: SymmetricKey
-                if let cachedKey {
-                    symmetricKey = cachedKey
-                } else if let keyCallback {
-                    let fetched = try await keyCallback.handler(localAsset.manifest)
-                    try Task.checkCancellation()
-                    setSymmetricKey(fetched)
-                    symmetricKey = fetched
-                } else {
-                    finishOnQueue(requestBox, error: HLSResourceLoaderError.keyNotAvailable)
-                    return
-                }
+                // Obtain the symmetric key without blocking a dispatch queue, coalescing concurrent lookups
+                let symmetricKey = try await resolveSymmetricKey()
+                try Task.checkCancellation()
 
                 // Read and decrypt segment
                 let segmentURL = localAsset.segmentURLs[segmentIndex]

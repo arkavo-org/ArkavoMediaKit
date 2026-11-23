@@ -110,6 +110,7 @@ public actor FMP4RecordingProtectionService {
               let videoCodec = h264Params.sps.first.flatMap(FairPlayPackage.avc1Codec(sps:)) else {
             throw FMP4ProtectionError.noParameterSets
         }
+        try Self.checkParameterSets(sps: h264Params.sps, pps: h264Params.pps)
         // The init's avcC declares 4-byte NAL unit lengths, and the samples are written as the source has them.
         try Self.checkNALLengthSize(h264Params.nalLengthSize)
         // Every video sample byte is written: an archive that would hold more than a ZIP can is refused now, before
@@ -391,6 +392,23 @@ public actor FMP4RecordingProtectionService {
     }
 
     // MARK: - Safe Sample Buffer, Timing, and Dimension Helpers
+
+    /// Validates H.264 SPS/PPS counts and byte lengths against ISO/IEC 14496-15 `avcC` limits
+    /// before handing them to `FMP4Writer` / `AVCDecoderConfigurationRecord`.
+    static func checkParameterSets(sps: [Data], pps: [Data]) throws {
+        guard sps.count <= 31 else {
+            throw FMP4ProtectionError.packagingFailed("H.264 stream has \(sps.count) SPS entries (maximum 31)")
+        }
+        guard pps.count <= 255 else {
+            throw FMP4ProtectionError.packagingFailed("H.264 stream has \(pps.count) PPS entries (maximum 255)")
+        }
+        guard sps.allSatisfy({ $0.count <= Int(UInt16.max) }) else {
+            throw FMP4ProtectionError.packagingFailed("H.264 SPS entry exceeds 65535 bytes")
+        }
+        guard pps.allSatisfy({ $0.count <= Int(UInt16.max) }) else {
+            throw FMP4ProtectionError.packagingFailed("H.264 PPS entry exceeds 65535 bytes")
+        }
+    }
 
     /// Copies all bytes from a `CMBlockBuffer` safely via `CMBlockBufferCopyDataBytes`,
     /// handling non-contiguous buffers without heap buffer over-reads.

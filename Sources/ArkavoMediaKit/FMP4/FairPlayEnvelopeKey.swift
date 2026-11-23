@@ -36,14 +36,21 @@ struct FairPlayEnvelopeKey {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         // The license service advertises `alt-svc: h3`, as KAS does.
         request.assumesHTTP3Capable = true
-        let (data, response) = try await http.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await http.data(for: request, maxBytes: maxResponseBytes)
+        } catch BoundedResponseError.responseTooLarge {
+            throw FairPlayEnvelopeKeyError.invalidResponse("response exceeds size limit")
+        }
         guard let httpResponse = response as? HTTPURLResponse else {
             throw FairPlayEnvelopeKeyError.invalidResponse("not an HTTP response")
         }
         guard httpResponse.statusCode == 200 else {
             throw FairPlayEnvelopeKeyError.unexpectedStatus(httpResponse.statusCode)
         }
-        guard data.count <= maxResponseBytes else {
+        guard httpResponse.expectedContentLength <= Int64(maxResponseBytes),
+              data.count <= maxResponseBytes else {
             throw FairPlayEnvelopeKeyError.invalidResponse("response exceeds size limit")
         }
         return try parse(data, kasURL: kasURL)

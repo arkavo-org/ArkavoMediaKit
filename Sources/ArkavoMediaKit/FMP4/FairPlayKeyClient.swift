@@ -140,12 +140,22 @@ public final class FairPlayKeyClient: Sendable {
         request.httpMethod = "GET"
         prepareRequest(&request)
 
-        let (data, response) = try await urlSession.data(for: request, delegate: RedirectRefusal())
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await urlSession.boundedData(
+                for: request,
+                maxBytes: Self.maxCertificateBytes,
+                delegate: RedirectRefusal()
+            )
+        } catch BoundedResponseError.responseTooLarge {
+            throw FairPlayKeyError.certificateFetchFailed
+        }
 
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw FairPlayKeyError.certificateFetchFailed
         }
-        guard !data.isEmpty, data.count <= Self.maxCertificateBytes else {
+        guard !data.isEmpty else {
             throw FairPlayKeyError.certificateFetchFailed
         }
 
@@ -171,14 +181,21 @@ public final class FairPlayKeyClient: Sendable {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await urlSession.data(for: request, delegate: RedirectRefusal())
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await urlSession.boundedData(
+                for: request,
+                maxBytes: Self.maxJSONResponseBytes,
+                delegate: RedirectRefusal()
+            )
+        } catch BoundedResponseError.responseTooLarge {
+            throw FairPlayKeyError.invalidSessionResponse
+        }
 
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             throw FairPlayKeyError.sessionStartFailed("HTTP \(statusCode)")
-        }
-        guard data.count <= Self.maxJSONResponseBytes else {
-            throw FairPlayKeyError.invalidSessionResponse
         }
 
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -211,7 +228,16 @@ public final class FairPlayKeyClient: Sendable {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (_, response) = try await urlSession.data(for: request, delegate: RedirectRefusal())
+        let response: URLResponse
+        do {
+            (_, response) = try await urlSession.boundedData(
+                for: request,
+                maxBytes: Self.maxJSONResponseBytes,
+                delegate: RedirectRefusal()
+            )
+        } catch BoundedResponseError.responseTooLarge {
+            throw FairPlayKeyError.heartbeatFailed
+        }
 
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw FairPlayKeyError.heartbeatFailed
@@ -233,7 +259,16 @@ public final class FairPlayKeyClient: Sendable {
         let body: [String: Any] = ["userId": session.userId]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (_, response) = try await urlSession.data(for: request, delegate: RedirectRefusal())
+        let response: URLResponse
+        do {
+            (_, response) = try await urlSession.boundedData(
+                for: request,
+                maxBytes: Self.maxJSONResponseBytes,
+                delegate: RedirectRefusal()
+            )
+        } catch BoundedResponseError.responseTooLarge {
+            throw FairPlayKeyError.sessionEndFailed
+        }
 
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             throw FairPlayKeyError.sessionEndFailed
@@ -289,14 +324,21 @@ public final class FairPlayKeyClient: Sendable {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await urlSession.data(for: request, delegate: RedirectRefusal())
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await urlSession.boundedData(
+                for: request,
+                maxBytes: Self.maxJSONResponseBytes,
+                delegate: RedirectRefusal()
+            )
+        } catch BoundedResponseError.responseTooLarge {
+            throw FairPlayKeyError.invalidCKCResponse
+        }
 
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             throw FairPlayKeyError.ckcRequestFailed("HTTP \(statusCode)")
-        }
-        guard data.count <= Self.maxJSONResponseBytes else {
-            throw FairPlayKeyError.invalidCKCResponse
         }
 
         // Parse CKC response (reject empty CKC)
@@ -333,14 +375,21 @@ public final class FairPlayKeyClient: Sendable {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await urlSession.data(for: request, delegate: RedirectRefusal())
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await urlSession.boundedData(
+                for: request,
+                maxBytes: Self.maxJSONResponseBytes,
+                delegate: RedirectRefusal()
+            )
+        } catch BoundedResponseError.responseTooLarge {
+            throw FairPlayKeyError.invalidCKCResponse
+        }
 
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             throw FairPlayKeyError.ckcRequestFailed("HTTP \(statusCode)")
-        }
-        guard data.count <= Self.maxJSONResponseBytes else {
-            throw FairPlayKeyError.invalidCKCResponse
         }
 
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],

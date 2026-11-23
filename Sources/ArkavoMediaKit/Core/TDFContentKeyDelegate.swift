@@ -470,14 +470,21 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
 
         FairPlayDebug.logRequest("POST", url: url, body: nil)
 
-        let (data, response) = try await http.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await http.data(for: request, maxBytes: Self.maxSessionResponseBytes)
+        } catch BoundedResponseError.responseTooLarge {
+            throw FairPlayError.sessionStartFailed("Invalid session response")
+        }
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
         FairPlayDebug.log("← HTTP \(statusCode): \(data.count) bytes")
 
         guard (200 ... 299).contains(statusCode) else {
             throw FairPlayError.sessionStartFailed("HTTP \(statusCode)")
         }
-        guard data.count <= Self.maxSessionResponseBytes,
+        guard response.expectedContentLength <= Int64(Self.maxSessionResponseBytes),
+              data.count <= Self.maxSessionResponseBytes,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let sessionId = json["sessionId"] as? String,
               (try? InputValidator.validateSessionID(sessionId)) != nil
@@ -497,7 +504,7 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
         var request = URLRequest(url: url)
         request.httpMethod = "DELETE"
         prepareRequest(&request)
-        let status = ((try? await http.data(for: request))?.1 as? HTTPURLResponse)?.statusCode ?? 0
+        let status = ((try? await http.data(for: request, maxBytes: Self.maxSessionResponseBytes))?.1 as? HTTPURLResponse)?.statusCode ?? 0
         FairPlayDebug.log("← session end HTTP \(status)")
     }
 
@@ -510,14 +517,23 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
 
         FairPlayDebug.logRequest("GET", url: url, body: nil)
 
-        let (data, response) = try await http.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await http.data(for: request, maxBytes: Self.maxBinaryResponseBytes)
+        } catch BoundedResponseError.responseTooLarge {
+            throw FairPlayError.certificateFetchFailed("Invalid certificate data size")
+        }
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
         FairPlayDebug.log("← HTTP \(statusCode): \(data.count) bytes (certificate binary)")
 
         guard (200 ... 299).contains(statusCode) else {
             throw FairPlayError.certificateFetchFailed("HTTP \(statusCode)")
         }
-        guard !data.isEmpty, data.count <= Self.maxBinaryResponseBytes else {
+        guard !data.isEmpty,
+              response.expectedContentLength <= Int64(Self.maxBinaryResponseBytes),
+              data.count <= Self.maxBinaryResponseBytes
+        else {
             throw FairPlayError.certificateFetchFailed("Invalid certificate data size")
         }
         return data
@@ -550,7 +566,13 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
 
         FairPlayDebug.log("→ POST \(url.absoluteString) for \(target.uri): SPC \(spcData.count) bytes")
 
-        let (data, response) = try await http.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await http.data(for: request, maxBytes: Self.maxBinaryResponseBytes)
+        } catch BoundedResponseError.responseTooLarge {
+            throw FairPlayError.invalidCKCResponse("Response exceeds size limit")
+        }
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
         FairPlayDebug.log("← HTTP \(statusCode): \(data.count) bytes")
 
@@ -558,7 +580,8 @@ public final class TDFContentKeyDelegate<Manifest: FairPlayManifestProtocol>: NS
             // A refusal carries an error and a message, never a CKC; neither is kept.
             throw FairPlayError.ckcRequestFailed("HTTP \(statusCode)")
         }
-        guard data.count <= Self.maxBinaryResponseBytes,
+        guard response.expectedContentLength <= Int64(Self.maxBinaryResponseBytes),
+              data.count <= Self.maxBinaryResponseBytes,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
             throw FairPlayError.invalidCKCResponse("Response is not valid JSON")

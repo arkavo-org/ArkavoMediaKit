@@ -9,6 +9,9 @@ public actor MediaSessionManager {
     /// Active sessions mapped by server-assigned sessionId
     private var activeSessions: [String: ActiveSession] = [:]
 
+    /// Sessions already removed locally whose server-side end notification failed and can be retried
+    private var pendingServerEnd: Set<String> = []
+
     /// Heartbeat task for periodic updates
     private var heartbeatTask: Task<Void, Never>?
 
@@ -87,6 +90,7 @@ public actor MediaSessionManager {
             position: nil
         )
 
+        pendingServerEnd.remove(response.sessionId)
         activeSessions[response.sessionId] = session
 
         // Start heartbeat task if not already running
@@ -117,12 +121,18 @@ public actor MediaSessionManager {
     /// End a session
     /// - Parameter sessionId: Session identifier
     public func endSession(sessionId: String) async throws {
-        guard activeSessions.removeValue(forKey: sessionId) != nil else {
+        let removedActive = activeSessions.removeValue(forKey: sessionId) != nil
+        let isPendingRetry = pendingServerEnd.contains(sessionId)
+
+        guard removedActive || isPendingRetry else {
             if let uuid = UUID(uuidString: sessionId) {
                 throw SessionError.sessionNotFound(sessionID: uuid)
             }
             throw SessionError.sessionNotFoundWithID(sessionId)
         }
+
+        // Keep session eligible for server-side cleanup retries until DELETE succeeds
+        pendingServerEnd.insert(sessionId)
 
         // Stop heartbeat immediately if no active sessions remain so a failed server
         // notification cannot leak the local session or let heartbeats resurrect it.
@@ -130,13 +140,14 @@ public actor MediaSessionManager {
             stopHeartbeat()
         }
 
-        // Notify server (best-effort cleanup already completed locally)
+        // Notify server; leave in pendingServerEnd on failure so callers can retry
         try await client.endSession(sessionId: sessionId)
+        pendingServerEnd.remove(sessionId)
     }
 
-    /// End all active sessions
+    /// End all active sessions (and retry any pending server-side cleanups)
     public func endAllSessions() async {
-        let sessionIds = Array(activeSessions.keys)
+        let sessionIds = Array(Set(activeSessions.keys).union(pendingServerEnd))
 
         for sessionId in sessionIds {
             try? await endSession(sessionId: sessionId)

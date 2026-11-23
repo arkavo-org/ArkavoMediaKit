@@ -218,15 +218,22 @@ public struct StandardTDFKASKeyClient: Sendable {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.addValue("application/json", forHTTPHeaderField: "Accept")
 
-        let (data, response) = try await urlSession.data(for: request, delegate: RedirectRefusal())
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await urlSession.boundedData(
+                for: request,
+                maxBytes: Self.maxWellKnownBytes,
+                delegate: RedirectRefusal()
+            )
+        } catch BoundedResponseError.responseTooLarge {
+            throw KASDiscoveryError.invalidResponse("Well-known response exceeds size limit")
+        }
         guard let http = response as? HTTPURLResponse else {
             throw KASDiscoveryError.invalidResponse("Non-HTTP response from \(urlString)")
         }
         guard (200 ..< 300).contains(http.statusCode) else {
             throw KASDiscoveryError.httpError(http.statusCode, "GET \(urlString): HTTP \(http.statusCode)")
-        }
-        guard data.count <= Self.maxWellKnownBytes else {
-            throw KASDiscoveryError.invalidResponse("Well-known response exceeds size limit")
         }
         do {
             return try JSONDecoder().decode(OpenTDFConfiguration.self, from: data)

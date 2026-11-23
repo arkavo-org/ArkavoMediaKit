@@ -105,9 +105,10 @@ public struct MediaDRMPolicy: Sendable {
         // Check rental window (both purchase window and playback window)
         if let rentalWindow {
             let purchaseDate: Date
-            if let purchasedAtString = session.metadata["purchasedAt"],
-               let parsed = ISO8601DateFormatter().date(from: purchasedAtString)
-            {
+            if let purchasedAtString = session.metadata["purchasedAt"] {
+                guard let parsed = Self.parseISO8601Date(purchasedAtString) else {
+                    throw PolicyViolation.rentalWindowExpired
+                }
                 purchaseDate = parsed
             } else {
                 purchaseDate = session.createdAt
@@ -174,6 +175,16 @@ public struct MediaDRMPolicy: Sendable {
                 throw PolicyViolation.subscriptionRequired(tier: requiredTier)
             }
         }
+    }
+
+    private static func parseISO8601Date(_ string: String) -> Date? {
+        let standard = ISO8601DateFormatter()
+        if let date = standard.date(from: string) {
+            return date
+        }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from: string)
     }
 }
 

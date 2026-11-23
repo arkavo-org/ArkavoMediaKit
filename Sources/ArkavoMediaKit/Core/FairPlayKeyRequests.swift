@@ -69,6 +69,17 @@ struct AVFoundationKeyRequest: FairPlayKeyRequesting {
 /// The delegate's HTTP, and the packager's for the envelope key: URLSession, or a test's.
 protocol FairPlayHTTP: Sendable {
     func data(for request: URLRequest) async throws -> (Data, URLResponse)
+    func data(for request: URLRequest, maxBytes: Int) async throws -> (Data, URLResponse)
+}
+
+extension FairPlayHTTP {
+    func data(for request: URLRequest, maxBytes: Int) async throws -> (Data, URLResponse) {
+        let (data, response) = try await data(for: request)
+        if response.expectedContentLength > Int64(maxBytes) || data.count > maxBytes {
+            throw BoundedResponseError.responseTooLarge(limit: maxBytes)
+        }
+        return (data, response)
+    }
 }
 
 /// URLSession, never following a redirect. Every request the delegate makes carries the bearer token, and the key
@@ -76,6 +87,9 @@ protocol FairPlayHTTP: Sendable {
 /// another server. Refused, the 3xx is the answer, which the delegate treats as a failure like any other non-2xx.
 /// The packager's envelope-key fetch fails on one too: the key it wraps to comes from the KAS server and nowhere else.
 final class URLSessionFairPlayHTTP: FairPlayHTTP {
+    /// Default maximum response size when callers do not pass a tighter per-endpoint limit (1 MiB).
+    static let defaultMaxResponseBytes = 1 * 1024 * 1024
+
     /// The session every delegate shares. Ephemeral (no disk cache or persistent cookies), with explicit timeouts,
     /// and never following redirects.
     private static let shared: URLSession = {
@@ -110,7 +124,11 @@ final class URLSessionFairPlayHTTP: FairPlayHTTP {
     }
 
     func data(for request: URLRequest) async throws -> (Data, URLResponse) {
-        try await session.data(for: request)
+        try await session.boundedData(for: request, maxBytes: Self.defaultMaxResponseBytes)
+    }
+
+    func data(for request: URLRequest, maxBytes: Int) async throws -> (Data, URLResponse) {
+        try await session.boundedData(for: request, maxBytes: maxBytes)
     }
 }
 
